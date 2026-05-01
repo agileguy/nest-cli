@@ -9,6 +9,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.0.1] - 2026-05-01
 
+### Fixed
+
+- Commit `uv.lock` so GitHub Actions `setup-uv@v3` cache restoration succeeds
+  (the default `cache-dependency-glob: **/uv.lock` was failing against an
+  ignored lockfile and breaking CI on every push).
+- Move the CI credentials guard to the FIRST workflow step so a malicious
+  transitive dependency cannot read secret env vars during `uv sync` before
+  the guard fires. Broaden it from one variable to three:
+  `NEST_CLI_TEST_OAUTH_CREDENTIALS`, `GOOGLE_APPLICATION_CREDENTIALS`,
+  `NEST_CLI_TEST_FOYER_TOKEN`.
+- `scripts/smoke-cam.py`: register `assignee` (mapped to `ASSIGNEE_PATH`) in
+  the redaction registry. Real SDM `devices.get` responses include
+  `assignee: enterprises/{project_id}/structures/{structure_id}/rooms/{room_id}`,
+  which the post-scan veto was hard-failing on — blocking every operator
+  fixture-capture run.
+- `scripts/smoke-wifi.py`: comprehensive redaction overhaul.
+  - Snake_case / kebab-case / camelCase key normalization in `_classify`
+    so `friendly_name`, `friendly-name`, and `friendlyName` all hit the
+    same rule.
+  - Replace bare `id` substring matcher with a curated exact-match
+    registry plus a separator-bounded endswith regex
+    (`(?:_id|-id|[a-z]Id)$`) — catches `group_id`, `device-id`, `groupId`
+    without over-firing on `paid`, `solid`, `valid`, `width`, `guidance`.
+  - Add LAN-topology classes (`subnet`, `gateway`, `dhcp_range_start`,
+    `dhcp_range_end`, `dns_servers`, `dns`, `wan_ip_address`).
+  - Mirror cam-script's post-scan veto: `_LEAK_PATTERNS` for MAC,
+    email, IPv4 (with `0.0.0.0`/`127.0.0.1`/`255.255.255.255` allowlist),
+    UUID. `_write_fixture` raises `RedactionError` on any hit; `main`
+    returns exit code 4.
+  - Distinguish exception categories in `main` — network errors,
+    upstream-shape errors (Foyer rotation), and redaction errors each
+    print a category-specific message instead of a single bare blanket.
+  - Validate that `--master-token` flag value is non-empty / non-whitespace
+    (previously only the stdin path checked).
+  - List-of-strings under a classified key (e.g. `dns_servers: ["8.8.8.8",
+    "1.1.1.1"]`) now redact every element instead of slipping through.
+- README v0.0.1-honest scope: status block now reflects skeleton state,
+  install command points at git+https, Quick start codeblock prefaced
+  with a "Coming in v0.1.0" warning.
+
 ### Added
 
 - Initial repo skeleton, dependency pinning, CI baseline.
