@@ -1,0 +1,116 @@
+"""Tests for ``nest_cli.cli.config_cmd`` — config show/validate.
+
+Covers FR-16c.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+from click.testing import CliRunner
+
+# Import submodules explicitly so monkeypatch can resolve string paths
+# like "nest_cli.cli.config_cmd.default_config_path". The package init
+# re-exports the Click command object under the same name, which would
+# otherwise shadow the submodule.
+import nest_cli.cli.cam_cmd  # noqa: F401
+import nest_cli.cli.config_cmd  # noqa: F401
+import nest_cli.cli.list_cmd  # noqa: F401
+from nest_cli.cli import cli as cli_root
+
+
+@pytest.fixture
+def fake_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Path]:
+    config_path = tmp_path / "config.toml"
+
+    def _fake_config_path() -> Path:
+        return config_path
+
+    monkeypatch.setattr("nest_cli.config.default_config_path", _fake_config_path)
+    monkeypatch.setattr("nest_cli.cli.config_cmd.default_config_path", _fake_config_path)
+
+    return {"config": config_path}
+
+
+class TestConfigShow:
+    def test_shows_empty_config_when_file_missing(self, fake_paths: dict[str, Path]) -> None:
+        runner = CliRunner()
+        result = runner.invoke(cli_root, ["config", "show", "--json"])
+        assert result.exit_code == 0
+        payload = json.loads(result.output)
+        assert payload["aliases"] == {}
+        assert payload["groups"] == {}
+        assert payload["exists"] is False
+
+    def test_shows_resolved_config(self, fake_paths: dict[str, Path]) -> None:
+        fake_paths["config"].write_text(
+            '[aliases]\nfront-door = "enterprises/proj/devices/abc"\n'
+            '[groups]\nall = ["front-door"]\n',
+            encoding="utf-8",
+        )
+        runner = CliRunner()
+        result = runner.invoke(cli_root, ["config", "show", "--json"])
+        assert result.exit_code == 0
+        payload = json.loads(result.output)
+        assert payload["aliases"] == {"front-door": "enterprises/proj/devices/abc"}
+        assert payload["groups"] == {"all": ["front-door"]}
+        assert payload["exists"] is True
+
+
+class TestConfigValidate:
+    def test_valid_config_exits_zero(self, fake_paths: dict[str, Path]) -> None:
+        fake_paths["config"].write_text(
+            '[aliases]\nfront-door = "enterprises/proj/devices/abc"\n',
+            encoding="utf-8",
+        )
+        runner = CliRunner()
+        result = runner.invoke(cli_root, ["config", "validate", "--json"])
+        assert result.exit_code == 0
+        payload = json.loads(result.output)
+        assert payload["status"] == "ok"
+        assert payload["alias_count"] == 1
+
+    def test_invalid_toml_exits_6(self, fake_paths: dict[str, Path]) -> None:
+        fake_paths["config"].write_text(
+            "this is [ not valid toml\n",
+            encoding="utf-8",
+        )
+        runner = CliRunner()
+        result = runner.invoke(cli_root, ["config", "validate", "--json"])
+        assert result.exit_code == 6
+
+    def test_unknown_section_exits_6(self, fake_paths: dict[str, Path]) -> None:
+        fake_paths["config"].write_text(
+            "[some_unknown_section]\nkey = 'v'\n",
+            encoding="utf-8",
+        )
+        runner = CliRunner()
+        result = runner.invoke(cli_root, ["config", "validate", "--json"])
+        assert result.exit_code == 6
+
+    def test_group_member_not_in_aliases_exits_6(self, fake_paths: dict[str, Path]) -> None:
+        fake_paths["config"].write_text(
+            '[aliases]\nfront-door = "enterprises/proj/devices/abc"\n'
+            '[groups]\ngrp = ["front-door", "missing-alias"]\n',
+            encoding="utf-8",
+        )
+        runner = CliRunner()
+        result = runner.invoke(cli_root, ["config", "validate", "--json"])
+        assert result.exit_code == 6
+
+    def test_explicit_path_argument(self, tmp_path: Path) -> None:
+        # Validate accepts a positional path argument independent of
+        # the default-path resolution.
+        target = tmp_path / "elsewhere.toml"
+        target.write_text(
+            '[aliases]\nfront-door = "enterprises/proj/devices/abc"\n',
+            encoding="utf-8",
+        )
+        runner = CliRunner()
+        result = runner.invoke(
+            cli_root,
+            ["config", "validate", str(target), "--json"],
+        )
+        assert result.exit_code == 0
