@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `nest_cli/cli/auth_cmd.py` — rebased onto the shared `add_output_options`
+  decorator and `emit()`/`exit_on_structured_error` infrastructure. Every
+  `auth` verb now honors `--json`, `--jsonl`, `--quiet`, and `--output`
+  uniformly with the rest of the CLI. The local `_emit`,
+  `_exit_with_credential_error`, and `_OUTPUT_*` helpers were removed.
+  Error envelopes no longer carry a `family` discriminator (not in SRD
+  §11.2); the discriminator surfaces in the `auth status` payload only.
+- `nest_cli/cli/auth_cmd.py` — `auth status` emits a JSON array per
+  FR-CRED-10 (`v0.1.0` ships one element for the cam family; Phase 3 will
+  add the wifi element).
+- `nest_cli/cli/config_cmd.py` — `config show` text mode emits TOML per
+  FR-16c (round-trips through `tomllib`); JSON modes continue to emit
+  the structured-record dict.
+- `nest_cli/auth/types.py`, `nest_cli/sdm/types.py`, `nest_cli/output.py`
+  — datetime fields now serialize as RFC 3339 UTC with the literal `Z`
+  suffix per FR-22, both via Pydantic `field_serializer` and through the
+  shared `_to_jsonable` / `_pydantic_default` paths.
+- `nest_cli/auth/credentials.py` — `EXIT_*` constants now imported from
+  `nest_cli.errors` (single source of truth, SRD §11.1). The lock-file
+  open path was hardened against a symlink-substitution race
+  (`O_CREAT|O_EXCL|O_NOFOLLOW` first, `O_NOFOLLOW` fallback); a
+  pre-existing symlink at `<creds>.lock` is rejected with a structured
+  auth error.
+
+### Fixed
+
+- Re-sort the stdlib import block in `nest_cli/auth/credentials.py` so
+  ruff I001 stops failing CI (`random` and `time` had been inserted out
+  of alphabetical order by the lock-jitter fix).
+
+## [0.1.0] - 2026-05-01
+
 ### Added
 
 - `nest_cli/errors.py` — SRD §11.1 `EXIT_*` constants and the `StructuredError`
