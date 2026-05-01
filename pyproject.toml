@@ -1,6 +1,6 @@
 [project]
 name = "nest-cli"
-version = "0.0.1"
+version = "0.1.0"
 description = "Deterministic CLI for Google Nest cameras (SDM) and Nest Wi-Fi (experimental, Foyer)."
 readme = "README.md"
 license = {text = "MIT"}
@@ -31,6 +31,10 @@ dependencies = [
     "google-cloud-pubsub>=2.36,<3",
     "click>=8.1,<9",
     "pydantic>=2.5,<3",
+    # Used by nest_cli.sdm.client for HTTPS calls to smartdevicemanagement.googleapis.com.
+    # `requests` is a transitive dep via google-auth-oauthlib but we pin it
+    # explicitly so the SDM client does not couple to a transitive's version.
+    "requests>=2.31,<3",
 ]
 
 [project.optional-dependencies]
@@ -49,6 +53,8 @@ dev = [
     "ruff>=0.4",
     "mypy>=1.10",
     "responses>=0.25",
+    # Type stubs for the explicit ``requests`` dep added in Phase 1B.
+    "types-requests>=2.31",
 ]
 
 [project.scripts]

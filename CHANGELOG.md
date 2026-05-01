@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `nest_cli/errors.py` — SRD §11.1 `EXIT_*` constants and the `StructuredError`
+  dataclass with a stderr emitter that honors text vs JSON output mode.
+- `nest_cli/output.py` — `add_output_options` decorator (`--json`, `--jsonl`,
+  `--quiet`, `--output`) plus a mode-aware `emit()` function. Mutually
+  exclusive flag combinations exit 64 with a structured error.
+- `nest_cli/config.py` — `tomllib`-based TOML parser for the local config
+  with `[aliases]` and `[groups]` sections (extra="forbid"), plus
+  `default_config_path()` honoring `XDG_CONFIG_HOME`.
+- `nest_cli/sdm/types.py` — Pydantic `Camera` and `CameraTrait` records per
+  SRD §10.1, normalizing the SDM API's trait-dict into a list of name-keyed
+  records.
+- `nest_cli/sdm/client.py` — `SdmClient` thin wrapper around `requests`
+  with auto-refresh on 401 and structured-error mapping for 4xx/5xx and
+  network failures.
+- `nest_cli/cli/list_cmd.py` — `list` (FR-1, FR-1a, FR-1b, FR-1c, FR-1d) and
+  `discover` (FR-2, FR-2a) commands.
+- `nest_cli/cli/cam_cmd.py` — `cam` subgroup with `list`/`info`/`capabilities`
+  (FR-CAM-1, FR-CAM-2, FR-CAM-28).
+- `nest_cli/cli/config_cmd.py` — `config` subgroup with `show`/`validate`
+  (FR-16c).
+- `nest_cli/cli/__init__.py` — root Click group `cli` wiring all subgroups.
+- `requests>=2.31,<3` as an explicit dependency (was previously transitive
+  via `google-auth-oauthlib`).
+- Comprehensive mocked test coverage: `tests/test_errors.py`,
+  `tests/test_output.py`, `tests/test_config.py`, `tests/sdm/test_client.py`,
+  `tests/test_cli_list.py`, `tests/test_cli_cam.py`, `tests/test_cli_config.py`.
+
+### Changed
+
+- `nest_cli/__main__.py` — replaced the Phase 0 stub with a thin
+  `from nest_cli.cli import cli as main` entry point.
+- `nest_cli/__init__.py` — `__version__` bumped to `0.1.0`.
+- `pyproject.toml` — `version` bumped to `0.1.0`.
+- `tests/test_skeleton.py` — version assertions updated to `0.1.0`.
+
 ## [0.0.1] - 2026-05-01
 
 ### Fixed
