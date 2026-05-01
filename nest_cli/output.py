@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import sys
 from collections.abc import Callable
+from datetime import UTC, datetime
 from typing import Any, Literal, TypeVar, cast
 
 import click
@@ -168,11 +169,25 @@ def _resolve_output_mode(
 # ---------------------------------------------------------------------------
 
 
+def _format_rfc3339_z(dt: datetime) -> str:
+    """Render ``dt`` as RFC 3339 UTC with the literal ``Z`` suffix (FR-22).
+
+    Pydantic v2's default JSON datetime serializer emits ``+00:00``; this
+    helper canonicalizes to ``Z`` so every nest-cli stdout payload that
+    carries a datetime (whether through a Pydantic model serializer or a
+    raw dict passed to ``emit``) stays on the same wire format.
+    """
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+
 def _pydantic_default(obj: Any) -> Any:
-    """JSON encoder fallback that handles Pydantic models, datetimes, paths."""
+    """JSON encoder fallback for Pydantic models, datetimes, and paths."""
     if isinstance(obj, BaseModel):
         return obj.model_dump(mode="json")
-    # datetime, Path, etc. — fall back to str().
+    if isinstance(obj, datetime):
+        return _format_rfc3339_z(obj)
     return str(obj)
 
 
@@ -180,6 +195,8 @@ def _to_jsonable(value: Any) -> Any:
     """Recursively normalize Pydantic models into plain JSON-able structures."""
     if isinstance(value, BaseModel):
         return value.model_dump(mode="json")
+    if isinstance(value, datetime):
+        return _format_rfc3339_z(value)
     if isinstance(value, list):
         return [_to_jsonable(v) for v in value]
     if isinstance(value, dict):
@@ -279,11 +296,14 @@ def _emit_text_record(record: dict[str, Any]) -> None:
 
     Bool values render lowercase (``true`` / ``false``) so text-mode output
     is consistent with the JSON-mode rendering and matches the SRD-style
-    boolean serialization.
+    boolean serialization. Datetime values render as RFC 3339 UTC ``Z``
+    per FR-22.
     """
     for key, value in record.items():
         if isinstance(value, bool):
             click.echo(f"{key}: {'true' if value else 'false'}")
+        elif isinstance(value, datetime):
+            click.echo(f"{key}: {_format_rfc3339_z(value)}")
         elif isinstance(value, dict | list):
             click.echo(f"{key}: {json.dumps(_to_jsonable(value), default=_pydantic_default)}")
         else:

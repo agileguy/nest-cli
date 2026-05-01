@@ -7,9 +7,9 @@ mechanism that turns "unknown additional keys" into a config-validation error
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_serializer
 
 
 class CamCredentials(BaseModel):
@@ -34,3 +34,14 @@ class CamCredentials(BaseModel):
     refresh_token: str = Field(..., min_length=1)
     access_token: str = Field(..., min_length=1)
     expires_at: datetime
+
+    @field_serializer("expires_at", when_used="json")
+    def _serialize_expires_at(self, dt: datetime) -> str:
+        """Render ``expires_at`` as RFC 3339 UTC with the literal ``Z`` suffix.
+
+        Pydantic v2's default JSON datetime serializer emits ``+00:00``;
+        SRD FR-22 mandates the literal ``Z`` form. Apply explicitly.
+        """
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        return dt.astimezone(UTC).isoformat().replace("+00:00", "Z")

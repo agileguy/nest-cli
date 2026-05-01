@@ -17,10 +17,10 @@ dropped.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_serializer
 
 
 class CameraTrait(BaseModel):
@@ -59,6 +59,20 @@ class Camera(BaseModel):
     signal_strength: int | None = None
     firmware_version: str | None = None
     last_event_ts: datetime | None = None
+
+    @field_serializer("last_event_ts", when_used="json")
+    def _serialize_last_event_ts(self, dt: datetime | None) -> str | None:
+        """Render ``last_event_ts`` as RFC 3339 UTC with the literal ``Z`` suffix.
+
+        Pydantic v2's default JSON datetime serializer emits ``+00:00``;
+        SRD FR-22 mandates the literal ``Z`` form. ``None`` is preserved
+        because the field is optional (no recent events).
+        """
+        if dt is None:
+            return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        return dt.astimezone(UTC).isoformat().replace("+00:00", "Z")
 
     def has_trait(self, trait_name: str) -> bool:
         """Return True if ``trait_name`` is in this camera's trait list."""
