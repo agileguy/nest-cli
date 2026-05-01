@@ -38,6 +38,8 @@ not change.
 from __future__ import annotations
 
 import contextlib
+import random
+import time
 import fcntl
 import json
 import os
@@ -156,7 +158,6 @@ def _file_lock(path: Path, *, timeout_s: int = HTTP_TIMEOUT_S) -> Iterator[None]
     _ensure_parent_dir(lock_path)
     # ``LOCK_NB`` so we can implement a poll-with-timeout loop. ``flock``'s
     # blocking variant has no timeout knob.
-    import time
 
     deadline = time.monotonic() + timeout_s
     fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
@@ -172,7 +173,9 @@ def _file_lock(path: Path, *, timeout_s: int = HTTP_TIMEOUT_S) -> Iterator[None]
                         exit_code=EXIT_NETWORK_ERROR,
                         hint="Another nest-cli process is refreshing credentials; retry shortly.",
                     ) from None
-                time.sleep(0.1)
+                # Add jitter to prevent thundering herd under high contention.
+                # Base sleep 50-150ms (100ms ± 50ms jitter).
+                time.sleep(0.05 + random.uniform(0, 0.1))
         try:
             yield
         finally:
