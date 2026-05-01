@@ -45,6 +45,11 @@ secrets/
 # Generated fixtures from real hardware (smoke scripts) — sanitized fixtures live in tests/fixtures/
 .smoke-output/
 
+# Operator-captured smoke output. Smoke scripts redact PII before writing here, but
+# captured/ is also gitignored as defense-in-depth — see tests/fixtures/README.md.
+tests/fixtures/sdm/captured/
+tests/fixtures/foyer/captured/
+
 # pyenv (per-checkout Python version pin)
 .python-version
 
