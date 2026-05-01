@@ -79,6 +79,12 @@ from typing import Any
 # case-sensitive substring containment against the dict key. Order matters
 # only insofar as the placeholder class name is taken from the FIRST match.
 _REDACTION_KEYS: tuple[tuple[str, str], ...] = (
+    # SDM devices.get returns ``assignee`` at the device root containing
+    # ``enterprises/{project_id}/structures/{structure_id}/rooms/{room_id}``.
+    # Listed first so substring containment never has to choose between
+    # ``assignee`` and ``name`` (defensive ordering — they don't overlap
+    # today, but any future class added between them inherits the safety).
+    ("assignee", "ASSIGNEE_PATH"),
     # SDM device.name is the full path "enterprises/{proj}/devices/{id}".
     # Redact wholesale at the top level. Sub-walkers also catch nested.
     ("name", "DEVICE_NAME"),
