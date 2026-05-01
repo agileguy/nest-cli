@@ -6,6 +6,7 @@ Covers FR-16c.
 from __future__ import annotations
 
 import json
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -57,6 +58,61 @@ class TestConfigShow:
         assert payload["aliases"] == {"front-door": "enterprises/proj/devices/abc"}
         assert payload["groups"] == {"all": ["front-door"]}
         assert payload["exists"] is True
+
+    def test_text_mode_emits_toml(self, fake_paths: dict[str, Path]) -> None:
+        """FR-16c: text-mode ``config show`` emits TOML, not key:value lines."""
+        fake_paths["config"].write_text(
+            '[aliases]\nfront-door = "enterprises/proj/devices/abc"\n',
+            encoding="utf-8",
+        )
+        runner = CliRunner()
+        result = runner.invoke(cli_root, ["config", "show"])
+        assert result.exit_code == 0
+        # The output is a TOML document, not human-prose key/value lines.
+        assert "[aliases]" in result.output
+        assert 'front-door = "enterprises/proj/devices/abc"' in result.output
+
+    def test_text_mode_round_trips_via_tomllib(self, fake_paths: dict[str, Path]) -> None:
+        """The text-mode TOML output round-trips through ``tomllib.loads``.
+
+        Covers tricky escapes (backslash and double-quote inside a value)
+        so the serializer's basic-string handling stays honest.
+        """
+        original_aliases = {
+            "plain": "enterprises/proj/devices/abc",
+            "needs-quote": 'has "quote" inside',
+            "needs-backslash": r"a\b\c",
+        }
+        original_groups = {
+            "all": ["plain", "needs-quote"],
+        }
+        with fake_paths["config"].open("w", encoding="utf-8") as fh:
+            fh.write("[aliases]\n")
+            for k, v in original_aliases.items():
+                escaped = v.replace("\\", "\\\\").replace('"', '\\"')
+                fh.write(f'{k} = "{escaped}"\n')
+            fh.write("[groups]\n")
+            for k, members in original_groups.items():
+                quoted = ", ".join(f'"{m}"' for m in members)
+                fh.write(f"{k} = [{quoted}]\n")
+
+        runner = CliRunner()
+        result = runner.invoke(cli_root, ["config", "show"])
+        assert result.exit_code == 0
+        # Round-trip the emitted TOML back through tomllib.
+        parsed = tomllib.loads(result.output)
+        assert parsed["aliases"] == original_aliases
+        assert parsed["groups"] == original_groups
+
+    def test_text_mode_empty_config(self, fake_paths: dict[str, Path]) -> None:
+        """An empty config file emits an empty (but well-formed) text payload."""
+        # File doesn't exist — load_config returns an empty Config.
+        runner = CliRunner()
+        result = runner.invoke(cli_root, ["config", "show"])
+        assert result.exit_code == 0
+        # Empty config has no sections; TOML output is at most a trailing
+        # newline.
+        assert result.output.strip() == ""
 
 
 class TestConfigValidate:
