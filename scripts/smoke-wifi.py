@@ -22,14 +22,33 @@ What it does
 
 This script is **standalone**. It does NOT import the ``nest_cli`` package.
 
-Redaction
----------
-Every string field whose key matches one of the registered PII classes
-(``id``, ``mac``, ``serialNumber``, ``displayName``, ``friendlyName``,
-``email``, ``psk``, ``passphrase``, ``wanIpAddress``) is replaced with a
-deterministic placeholder of the form ``{{REDACTED_<KEY>_<N>}}``. The same
-input value always maps to the same placeholder within a run, so fixture
-diffs across runs are stable and per-fixture cross-references survive.
+Redaction rules (defense-in-depth)
+----------------------------------
+The captured JSON has every real identifier scrubbed before it touches disk.
+Two layers:
+
+1. **Key-driven walk:** any string value whose surrounding key matches one
+   of the registered PII classes is replaced with a deterministic
+   placeholder of the form ``{{REDACTED_<CLASS>_<N>}}``. Keys are normalized
+   (lowercased, ``_`` and ``-`` stripped) before comparison so ``friendlyName``
+   and ``friendly_name`` and ``friendly-name`` all hit the same rule.
+   Two rule families:
+
+   - ``_REDACTION_EXACT`` — normalized key must EQUAL the needle. Used for
+     specific PII fields (``ssid``, ``mac``, ``passphrase``, ``serialnumber``,
+     ``wanipaddress``, plus LAN-topology classes like ``subnet``, ``gateway``,
+     ``dnsservers``, ``dhcprangestart``).
+   - Endswith for ID-like keys — uses a regex against the ORIGINAL (not
+     normalized) key requiring a separator boundary: ``_id`` / ``-id`` /
+     a ``[a-z]Id`` camelCase transition. This catches ``group_id``,
+     ``device-id``, ``groupId`` while leaving ``paid``, ``solid``, ``valid``,
+     ``width``, ``guidance`` un-redacted.
+
+2. **Post-scan veto:** after the walk, the serialized output is regex-scanned
+   for any residual MAC address, email address, IPv4 address (with a small
+   allowlist for ``0.0.0.0`` / ``127.0.0.1`` / ``255.255.255.255``), or UUID.
+   If anything matches, the script fails loud (exit 4, ``RedactionError``)
+   rather than write a fixture that might leak.
 
 Operator security note
 ----------------------
@@ -43,9 +62,10 @@ instead and pipe the token in:
 Exit codes
 ----------
 - 0  success
-- 1  upstream library error (Foyer rotation, etc.)
+- 1  upstream library error (Foyer rotation, network, malformed shape)
 - 2  ImportError on ``glocaltokens`` / ``googlewifi`` (operator must install
      the optional ``[wifi]`` extra)
+- 4  Redaction veto (post-scan caught a residual real id)
 - 64 Usage error (bad args)
 """
 
@@ -53,31 +73,85 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Any
 
-# Substring matches against the dict KEY (case-insensitive). Order is
-# significant only for the placeholder class name in the output: the FIRST
-# match wins. Put the more-specific matches first.
-_REDACTION_KEYS: tuple[str, ...] = (
-    "wanIpAddress",
-    "passphrase",
-    "psk",
-    "serialNumber",
-    "displayName",
-    "friendlyName",
-    "email",
-    "mac",
-    "id",
+# --- Redaction --------------------------------------------------------------
+
+# Exact-match needles, evaluated against the NORMALIZED key
+# (lowercased, ``_`` and ``-`` stripped). The first matching needle wins.
+_REDACTION_EXACT: tuple[tuple[str, str], ...] = (
+    # SSIDs
+    ("ssid", "SSID"),
+    ("guestssid", "SSID"),
+    # Hardware addresses
+    ("mac", "MAC"),
+    ("macaddress", "MAC"),
+    ("bssid", "MAC"),
+    # Identity
+    ("email", "EMAIL"),
+    # Pre-shared keys / passphrases
+    ("psk", "PSK"),
+    ("passphrase", "PSK"),
+    ("presharedkey", "PSK"),
+    # Hardware identifiers
+    ("serialnumber", "SERIAL"),
+    # Display names
+    ("displayname", "NAME"),
+    ("friendlyname", "NAME"),
+    # WAN / LAN topology — all redacted as LANNET / WANIP class.
+    ("wanipaddress", "WANIP"),
+    ("lansubnet", "LANNET"),
+    ("subnet", "LANNET"),
+    ("gateway", "LANNET"),
+    ("dhcprangestart", "LANNET"),
+    ("dhcprangeend", "LANNET"),
+    ("dnsservers", "LANNET"),
+    ("dns", "LANNET"),
+    # Bare ``id`` key (keys like literally ``id`` after normalization).
+    ("id", "ID"),
 )
+
+# Regex applied to the ORIGINAL key (not normalized) to catch ID-like
+# suffixes that have a real separator boundary. Picks up ``group_id``,
+# ``device-id``, ``stationId`` — but NOT ``paid``, ``solid``, ``valid``,
+# ``width``, ``guidance``, ``android``.
+_ID_SUFFIX_RE = re.compile(r"(?:_id|-id|[a-z]Id)$")
+
+
+class RedactionError(RuntimeError):
+    """Raised when the post-redaction scan finds a residual real identifier."""
+
+
+# Defense-in-depth: after redaction, the serialized JSON must NOT contain
+# any of these patterns. If it does, the redaction registry has a gap.
+_LEAK_PATTERNS: tuple[tuple[str, str], ...] = (
+    (r"\b(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}\b", "MAC address"),
+    (r"\b[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+\b", "email address"),
+    # IPv4 — allowlist common safe placeholders below.
+    (
+        r"(?<![0-9])(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}"
+        r"(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)(?![0-9])",
+        "IPv4 address",
+    ),
+    # UUIDs (Foyer device / group ids).
+    (
+        r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b",
+        "UUID",
+    ),
+)
+
+# Allow obvious placeholder octets in IPv4 hits.
+_IP_ALLOWLIST = frozenset(("0.0.0.0", "127.0.0.1", "255.255.255.255"))
 
 
 class _Redactor:
     """Deterministic key-driven redactor for Foyer-style payloads.
 
     ``redact(obj)`` returns a deep-copied ``obj`` with PII replaced by
-    ``{{REDACTED_<KEY>_<N>}}`` placeholders. Same input always maps to
+    ``{{REDACTED_<CLASS>_<N>}}`` placeholders. Same input always maps to
     the same placeholder within a run.
     """
 
@@ -86,10 +160,20 @@ class _Redactor:
         self._counters: dict[str, int] = {}
 
     def _classify(self, key: str) -> str | None:
-        lowered = key.lower()
-        for needle in _REDACTION_KEYS:
-            if needle.lower() in lowered:
-                return needle.upper()
+        """Return the redaction class for ``key``, or ``None`` if not PII.
+
+        Comparison is two-pass:
+          1. Normalize the key (lowercase, strip ``_`` / ``-``) and check
+             against ``_REDACTION_EXACT`` for an equality hit.
+          2. Apply ``_ID_SUFFIX_RE`` to the ORIGINAL key for separator-
+             bounded ID suffixes.
+        """
+        normalized = key.lower().replace("_", "").replace("-", "")
+        for needle, cls in _REDACTION_EXACT:
+            if normalized == needle:
+                return cls
+        if _ID_SUFFIX_RE.search(key):
+            return "ID"
         return None
 
     def _placeholder(self, class_name: str, original: str) -> str:
@@ -111,9 +195,30 @@ class _Redactor:
 
     def _redact_value(self, key: str, value: Any) -> Any:
         cls = self._classify(key)
-        if cls is not None and isinstance(value, str):
-            return self._placeholder(cls, value)
+        if cls is not None:
+            if isinstance(value, str):
+                return self._placeholder(cls, value)
+            if isinstance(value, list):
+                # ``dns_servers``-style: list of bare strings, all of the
+                # parent class. Redact each string element; recurse for
+                # any nested structure.
+                return [
+                    self._placeholder(cls, item) if isinstance(item, str) else self.redact(item)
+                    for item in value
+                ]
         return self.redact(value)
+
+
+def _scan_for_leaks(serialized: str) -> list[str]:
+    """Return human-readable reasons the serialized output is unsafe."""
+    failures: list[str] = []
+    for pattern, description in _LEAK_PATTERNS:
+        for match in re.finditer(pattern, serialized):
+            value = match.group(0)
+            if description == "IPv4 address" and value in _IP_ALLOWLIST:
+                continue
+            failures.append(f"{description}: matched {value!r}")
+    return failures
 
 
 def _to_jsonable(obj: Any) -> Any:
@@ -134,8 +239,12 @@ def _to_jsonable(obj: Any) -> Any:
 
 
 def _write_fixture(path: Path, payload: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    """Serialize ``payload`` to ``path`` after a leak scan. Raises on leak."""
     serialized = json.dumps(payload, indent=2, sort_keys=True)
+    leaks = _scan_for_leaks(serialized)
+    if leaks:
+        raise RedactionError("post-redaction leak scan failed:\n  - " + "\n  - ".join(leaks))
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(serialized + "\n", encoding="utf-8")
 
 
@@ -188,7 +297,14 @@ def _resolve_master_token(args: argparse.Namespace) -> str:
             )
             raise SystemExit(64)
         return token
-    return str(args.master_token)
+    flag_value = "" if args.master_token is None else str(args.master_token).strip()
+    if not flag_value:
+        print(
+            "error: --master-token was supplied but is empty or whitespace only.",
+            file=sys.stderr,
+        )
+        raise SystemExit(64)
+    return flag_value
 
 
 def _import_wifi_libraries() -> tuple[Any, Any]:
@@ -229,23 +345,39 @@ def main(argv: list[str] | None = None) -> int:
         groups = wifi.get_groups()
         access_points = wifi.get_access_points()
         devices = wifi.get_devices()
-    except Exception as exc:  # noqa: BLE001 — operator-facing, want full surface
+    except (ConnectionError, TimeoutError, OSError) as exc:
         print(
-            f"error: upstream wifi library raised: {type(exc).__name__}: {exc}\n"
+            f"error: network error talking to Foyer: {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        return 1
+    except (KeyError, AttributeError, TypeError) as exc:
+        print(
+            f"error: googlewifi returned unexpected shape: {type(exc).__name__}: {exc}\n"
             "       this is the documented Foyer rotation risk (SRD §3.2.3).\n"
             "       check googlewifi / glocaltokens issue trackers for current state.",
             file=sys.stderr,
         )
         return 1
+    except Exception as exc:  # noqa: BLE001 — operator-facing, want full surface
+        print(
+            f"error: unexpected error from upstream wifi library: {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        raise
 
     redactor = _Redactor()
     redacted_groups = redactor.redact(_to_jsonable(groups))
     redacted_aps = redactor.redact(_to_jsonable(access_points))
     redacted_devices = redactor.redact(_to_jsonable(devices))
 
-    _write_fixture(args.fixtures_dir / "groups.json", redacted_groups)
-    _write_fixture(args.fixtures_dir / "access_points.json", redacted_aps)
-    _write_fixture(args.fixtures_dir / "devices.json", redacted_devices)
+    try:
+        _write_fixture(args.fixtures_dir / "groups.json", redacted_groups)
+        _write_fixture(args.fixtures_dir / "access_points.json", redacted_aps)
+        _write_fixture(args.fixtures_dir / "devices.json", redacted_devices)
+    except RedactionError as exc:
+        print(f"error: redaction veto: {exc}", file=sys.stderr)
+        return 4
 
     group_count = len(redacted_groups) if isinstance(redacted_groups, list) else 1
     ap_count = len(redacted_aps) if isinstance(redacted_aps, list) else 1
