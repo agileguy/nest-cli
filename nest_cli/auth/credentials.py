@@ -38,13 +38,13 @@ not change.
 from __future__ import annotations
 
 import contextlib
-import random
-import time
 import fcntl
 import json
 import os
+import random
 import stat
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
