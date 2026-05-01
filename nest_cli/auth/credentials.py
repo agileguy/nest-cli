@@ -23,16 +23,13 @@ already in the tree and adding it would touch ``pyproject.toml``, which is
 out of Engineer A's scope this phase. Two POST calls do not justify a new
 dependency.
 
-Exit-code coupling (TODO)
--------------------------
+Exit-code coupling
+------------------
 
 SRD §11.1 names exit codes 2 (auth), 3 (network), and 6 (config). The
-canonical home for these constants is ``nest_cli/errors.py`` (Engineer B's
-file). Until that lands, we redefine them here as module-level constants
-matching the SRD numbers and store them on each ``CredentialError``
-instance. Engineer B's PR will move the constants and have this module
-import them; the ``.exit_code`` member contract on ``CredentialError`` does
-not change.
+canonical home for these constants is ``nest_cli/errors.py``; we import
+the SRD-numbered constants from there and attach them to each
+``CredentialError`` via the ``.exit_code`` member.
 """
 
 from __future__ import annotations
@@ -55,13 +52,29 @@ from pathlib import Path
 from pydantic import ValidationError
 
 from nest_cli.auth.types import CamCredentials
+from nest_cli.errors import (
+    EXIT_AUTH_ERROR,
+    EXIT_CONFIG_ERROR,
+    EXIT_NETWORK_ERROR,
+    EXIT_USAGE_ERROR,
+)
 
-# TODO(engineer-b): move to nest_cli.errors and import from there. Numbers
-# are pinned to SRD §11.1 so the swap is a pure import change.
-EXIT_AUTH_ERROR = 2
-EXIT_NETWORK_ERROR = 3
-EXIT_CONFIG_ERROR = 6
-EXIT_USAGE_ERROR = 64
+__all__ = [
+    "EXIT_AUTH_ERROR",
+    "EXIT_CONFIG_ERROR",
+    "EXIT_NETWORK_ERROR",
+    "EXIT_USAGE_ERROR",
+    "GOOGLE_OAUTH_REVOKE_URL",
+    "GOOGLE_OAUTH_TOKEN_URL",
+    "CredentialError",
+    "default_credentials_path",
+    "default_token_cache_dir",
+    "enforce_credentials_chmod",
+    "load_credentials",
+    "refresh_access_token_if_needed",
+    "revoke_refresh_token",
+    "save_credentials",
+]
 
 # Refresh window: re-mint the access token if it expires within this many
 # seconds (FR-CRED-6 says 60s).
