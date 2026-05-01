@@ -7,37 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed
+### Documentation
 
-- `nest_cli/cli/auth_cmd.py` — rebased onto the shared `add_output_options`
-  decorator and `emit()`/`exit_on_structured_error` infrastructure. Every
-  `auth` verb now honors `--json`, `--jsonl`, `--quiet`, and `--output`
-  uniformly with the rest of the CLI. The local `_emit`,
-  `_exit_with_credential_error`, and `_OUTPUT_*` helpers were removed.
-  Error envelopes no longer carry a `family` discriminator (not in SRD
-  §11.2); the discriminator surfaces in the `auth status` payload only.
-- `nest_cli/cli/auth_cmd.py` — `auth status` emits a JSON array per
-  FR-CRED-10 (`v0.1.0` ships one element for the cam family; Phase 3 will
-  add the wifi element).
-- `nest_cli/cli/config_cmd.py` — `config show` text mode emits TOML per
-  FR-16c (round-trips through `tomllib`); JSON modes continue to emit
-  the structured-record dict.
-- `nest_cli/auth/types.py`, `nest_cli/sdm/types.py`, `nest_cli/output.py`
-  — datetime fields now serialize as RFC 3339 UTC with the literal `Z`
-  suffix per FR-22, both via Pydantic `field_serializer` and through the
-  shared `_to_jsonable` / `_pydantic_default` paths.
-- `nest_cli/auth/credentials.py` — `EXIT_*` constants now imported from
-  `nest_cli.errors` (single source of truth, SRD §11.1). The lock-file
-  open path was hardened against a symlink-substitution race
-  (`O_CREAT|O_EXCL|O_NOFOLLOW` first, `O_NOFOLLOW` fallback); a
-  pre-existing symlink at `<creds>.lock` is rejected with a structured
-  auth error.
-
-### Fixed
-
-- Re-sort the stdlib import block in `nest_cli/auth/credentials.py` so
-  ruff I001 stops failing CI (`random` and `time` had been inserted out
-  of alphabetical order by the lock-jitter fix).
+- `README.md` — status block updated to v0.1.0-shipped reality; quick-start
+  examples now reflect verbs that actually work; added a link to the
+  operator runbook.
+- `docs/ONBOARDING.md` (new) — operator runbook: Google Cloud + Device
+  Access setup, OAuth client creation, `auth setup` walkthrough,
+  smoke-test flow, troubleshooting, where credentials live.
+- `docs/ARCHITECTURE.md` — added a Phase 1 implementation map: module
+  layout, request flow for cam verbs, output/error contract, threat
+  model excerpt, what v0.1.0 deliberately does NOT include.
+- `docs/SECURITY.md` — replaced the pre-release contact-email TODO with
+  a GitHub Security Advisory link; updated supported-versions table.
 
 ## [0.1.0] - 2026-05-01
 
@@ -77,6 +59,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `nest_cli/__init__.py` — `__version__` bumped to `0.1.0`.
 - `pyproject.toml` — `version` bumped to `0.1.0`.
 - `tests/test_skeleton.py` — version assertions updated to `0.1.0`.
+- `nest_cli/cli/auth_cmd.py` — rebased onto the shared `add_output_options`
+  decorator and `emit()`/`exit_on_structured_error` infrastructure. Every
+  `auth` verb now honors `--json`, `--jsonl`, `--quiet`, and `--output`
+  uniformly with the rest of the CLI. The local `_emit`,
+  `_exit_with_credential_error`, and `_OUTPUT_*` helpers were removed.
+  Error envelopes no longer carry a `family` discriminator (not in SRD
+  §11.2); the discriminator surfaces in the `auth status` payload only.
+- `nest_cli/cli/auth_cmd.py` — `auth status` emits a JSON array per
+  FR-CRED-10 (one element for the cam family; Phase 3 will add the wifi
+  element).
+- `nest_cli/cli/config_cmd.py` — `config show` text mode emits TOML per
+  FR-16c (round-trips through `tomllib`); JSON modes continue to emit
+  the structured-record dict.
+- `nest_cli/auth/types.py`, `nest_cli/sdm/types.py`, `nest_cli/output.py`
+  — datetime fields now serialize as RFC 3339 UTC with the literal `Z`
+  suffix per FR-22, both via Pydantic `field_serializer` and through the
+  shared `_to_jsonable` / `_pydantic_default` paths.
+- `nest_cli/auth/credentials.py` — `EXIT_*` constants now imported from
+  `nest_cli.errors` (single source of truth, SRD §11.1). The lock-file
+  open path was hardened against a symlink-substitution race
+  (`O_CREAT|O_EXCL|O_NOFOLLOW` first, `O_NOFOLLOW` fallback); a
+  pre-existing symlink at `<creds>.lock` is rejected with a structured
+  auth error.
+
+### Fixed
+
+- Re-sort the stdlib import block in `nest_cli/auth/credentials.py` so
+  ruff I001 stops failing CI (`random` and `time` had been inserted out
+  of alphabetical order by the lock-jitter fix).
 
 ## [0.0.1] - 2026-05-01
 
