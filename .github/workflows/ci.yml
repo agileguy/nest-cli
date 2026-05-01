@@ -11,6 +11,17 @@ jobs:
         python-version: ["3.11", "3.12"]
 
     steps:
+      - name: Guard against real credentials in CI
+        shell: bash
+        run: |
+          if [ -n "${NEST_CLI_TEST_OAUTH_CREDENTIALS:-}" ] || \
+             [ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" ] || \
+             [ -n "${NEST_CLI_TEST_FOYER_TOKEN:-}" ]; then
+            echo "::error::Real credentials must NOT be present in CI."
+            exit 1
+          fi
+          echo "Credential guard passed (no real-credential env vars present)."
+
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -26,11 +37,6 @@ jobs:
 
       - name: Install dependencies
         run: uv sync --all-extras --dev
-
-      - name: Guard against real OAuth credentials in CI
-        shell: bash
-        run: |
-          if [ -n "${NEST_CLI_TEST_OAUTH_CREDENTIALS:-}" ]; then echo "::error::Real OAuth credentials must NOT be present in CI."; exit 1; fi
 
       - name: Lint (ruff check)
         run: uv run ruff check .
