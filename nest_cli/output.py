@@ -275,9 +275,16 @@ def _emit_text(result: Any) -> None:
 
 
 def _emit_text_record(record: dict[str, Any]) -> None:
-    """Emit a single dict as ``key: value`` lines."""
+    """Emit a single dict as ``key: value`` lines.
+
+    Bool values render lowercase (``true`` / ``false``) so text-mode output
+    is consistent with the JSON-mode rendering and matches the SRD-style
+    boolean serialization.
+    """
     for key, value in record.items():
-        if isinstance(value, dict | list):
+        if isinstance(value, bool):
+            click.echo(f"{key}: {'true' if value else 'false'}")
+        elif isinstance(value, dict | list):
             click.echo(f"{key}: {json.dumps(_to_jsonable(value), default=_pydantic_default)}")
         else:
             click.echo(f"{key}: {value}")

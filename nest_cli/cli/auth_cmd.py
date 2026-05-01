@@ -11,8 +11,8 @@ Verbs (per SRD §5.5.1):
 Public surface
 --------------
 
-``auth_group`` is a ``click.Group`` named ``auth``. Engineer B's root
-CLI module imports it directly::
+``auth_group`` is a ``click.Group`` named ``auth``. The root CLI module
+imports it directly::
 
     from nest_cli.cli.auth_cmd import auth_group
     main.add_command(auth_group)
@@ -24,20 +24,18 @@ avoid a circular import (``nest_cli.auth`` → ``nest_cli.cli.auth_cmd`` →
 Output mode
 -----------
 
-For v0.1.0 we honor ``--output text|json``. SRD FR-11..15 will eventually
-unify this with ``--quiet`` and ``--jsonl`` across the whole CLI;
-Engineer B's shared ``output.py`` is the canonical home for that logic.
-The ``auth`` verbs use a minimal local helper for now and will rebase to
-the shared formatter once it lands.
+Every verb stacks the standard ``add_output_options`` decorator from
+``nest_cli.output``, so ``--json``, ``--jsonl``, ``--quiet``, and
+``--output text|json|jsonl|quiet`` are all honored uniformly across the
+CLI (FR-11..15). Failure paths are emitted via the SRD §11.2 envelope
+through ``exit_on_structured_error``.
 """
 
 from __future__ import annotations
 
-import json
-import sys
-from datetime import UTC, datetime
+import os
+import tempfile
 from pathlib import Path
-from typing import Any
 
 import click
 
@@ -50,42 +48,13 @@ from nest_cli.auth.credentials import (
     save_credentials,
 )
 from nest_cli.auth.oauth import run_oauth_flow
-
-# ---------------------------------------------------------------------------
-# Output helpers (local for v0.1.0; will rebase to nest_cli.output)
-# ---------------------------------------------------------------------------
-
-_OUTPUT_TEXT = "text"
-_OUTPUT_JSON = "json"
-_OUTPUT_CHOICES = (_OUTPUT_TEXT, _OUTPUT_JSON)
-
-
-def _emit(payload: dict[str, Any], *, output: str, text_lines: list[str]) -> None:
-    """Render ``payload`` per ``--output`` mode.
-
-    Text mode emits the human-readable lines passed in. JSON mode emits the
-    raw payload as pretty JSON. The two modes share no string formatting —
-    they are independent renderings of the same underlying record (FR-25).
-    """
-    if output == _OUTPUT_JSON:
-        click.echo(json.dumps(payload, indent=2, sort_keys=True, default=str))
-    else:
-        for line in text_lines:
-            click.echo(line)
-
-
-def _exit_with_credential_error(exc: CredentialError) -> None:
-    """Print a structured error to stderr and exit with the SRD-mapped code."""
-    error_record = {
-        "error": "auth_failed" if exc.exit_code == 2 else "config_error",
-        "exit_code": exc.exit_code,
-        "family": "cam",
-        "message": str(exc),
-    }
-    if exc.hint:
-        error_record["hint"] = exc.hint
-    click.echo(json.dumps(error_record), err=True)
-    sys.exit(exc.exit_code)
+from nest_cli.cli._shared import exit_on_structured_error
+from nest_cli.errors import (
+    EXIT_AUTH_ERROR,
+    EXIT_USAGE_ERROR,
+    StructuredError,
+)
+from nest_cli.output import OutputMode, add_output_options, emit
 
 
 def _redact_client_id(client_id: str) -> str:
@@ -93,6 +62,20 @@ def _redact_client_id(client_id: str) -> str:
     if len(client_id) <= 8:
         return "***"
     return "***" + client_id[-8:]
+
+
+def _credential_error_to_structured(exc: CredentialError) -> StructuredError:
+    """Convert a CredentialError into the SRD §11.2 StructuredError envelope.
+
+    The ``family`` discriminator does not belong in the §11.2 error
+    envelope (the closed enum + exit_code carry the disambiguation). It
+    surfaces in the ``auth status`` payload instead.
+    """
+    return StructuredError(
+        code=exc.exit_code,
+        message=str(exc),
+        hint=exc.hint,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -126,18 +109,12 @@ auth_group = click.Group(
     default=False,
     help="Print the consent URL on stderr instead of trying to open a browser.",
 )
-@click.option(
-    "--output",
-    type=click.Choice(_OUTPUT_CHOICES),
-    default=_OUTPUT_TEXT,
-    show_default=True,
-    help="Output format.",
-)
+@add_output_options
 def cmd_setup(
     callback_port: int,
     overwrite: bool,
     no_browser: bool,
-    output: str,
+    output_mode: OutputMode,
 ) -> None:
     """Run the interactive OAuth Desktop flow and persist credentials.
 
@@ -151,22 +128,17 @@ def cmd_setup(
     creds_path = default_credentials_path()
     if creds_path.exists() and not overwrite:
         # FR-CRED-2: refuse to clobber.
-        click.echo(
-            json.dumps(
-                {
-                    "error": "auth_failed",
-                    "exit_code": 2,
-                    "family": "cam",
-                    "message": f"credentials already exist at {creds_path}",
-                    "hint": (
-                        "Pass --overwrite to replace them, or run `nest-cli auth revoke` "
-                        "first to revoke at Google's end."
-                    ),
-                }
+        exit_on_structured_error(
+            StructuredError(
+                code=EXIT_AUTH_ERROR,
+                message=f"credentials already exist at {creds_path}",
+                hint=(
+                    "Pass --overwrite to replace them, or run `nest-cli auth revoke` "
+                    "first to revoke at Google's end."
+                ),
             ),
-            err=True,
+            output_mode,
         )
-        sys.exit(2)
 
     # Interactive prompts. ``hide_input`` masks the secret; ``confirmation_prompt``
     # is off because the operator pasted from the console JSON and a typo would
@@ -189,34 +161,20 @@ def cmd_setup(
         )
         save_credentials(creds_path, creds)
     except CredentialError as exc:
-        _exit_with_credential_error(exc)
-        return  # unreachable; for type-checkers
+        exit_on_structured_error(_credential_error_to_structured(exc), output_mode)
 
     payload = {
         "status": "ok",
         "credentials_path": str(creds_path),
         "project_id": creds.google_cloud_project_id,
-        "expires_at": creds.expires_at.astimezone(UTC).isoformat().replace("+00:00", "Z"),
+        "expires_at": creds.expires_at,
     }
-    _emit(
-        payload,
-        output=output,
-        text_lines=[
-            f"OAuth setup complete. Credentials saved to {creds_path} (chmod 0600).",
-            f"Access token expires at {payload['expires_at']}.",
-        ],
-    )
+    emit(payload, output_mode)
 
 
 @auth_group.command("refresh")
-@click.option(
-    "--output",
-    type=click.Choice(_OUTPUT_CHOICES),
-    default=_OUTPUT_TEXT,
-    show_default=True,
-    help="Output format.",
-)
-def cmd_refresh(output: str) -> None:
+@add_output_options
+def cmd_refresh(output_mode: OutputMode) -> None:
     """Force-refresh the access token using the stored refresh token.
 
     Implements FR-CRED-4. Useful for testing, debugging, and recovering
@@ -228,18 +186,13 @@ def cmd_refresh(output: str) -> None:
         creds = load_credentials(creds_path)
         rotated = refresh_access_token_if_needed(creds, creds_path, force=True)
     except CredentialError as exc:
-        _exit_with_credential_error(exc)
-        return  # unreachable
+        exit_on_structured_error(_credential_error_to_structured(exc), output_mode)
 
     payload = {
         "status": "ok",
-        "expires_at": rotated.expires_at.astimezone(UTC).isoformat().replace("+00:00", "Z"),
+        "expires_at": rotated.expires_at,
     }
-    _emit(
-        payload,
-        output=output,
-        text_lines=[f"Access token rotated. New expiry: {payload['expires_at']}"],
-    )
+    emit(payload, output_mode)
 
 
 @auth_group.command("revoke")
@@ -249,14 +202,8 @@ def cmd_refresh(output: str) -> None:
     default=False,
     help="Skip the interactive confirmation prompt (required in non-tty contexts).",
 )
-@click.option(
-    "--output",
-    type=click.Choice(_OUTPUT_CHOICES),
-    default=_OUTPUT_TEXT,
-    show_default=True,
-    help="Output format.",
-)
-def cmd_revoke(yes: bool, output: str) -> None:
+@add_output_options
+def cmd_revoke(yes: bool, output_mode: OutputMode) -> None:
     """Revoke the cam OAuth refresh token at Google and scrub the local file.
 
     Implements FR-CRED-5. After this verb succeeds, all ``cam`` verbs exit
@@ -284,28 +231,22 @@ def cmd_revoke(yes: bool, output: str) -> None:
                 default=False,
             )
         except click.exceptions.Abort:
-            click.echo(
-                json.dumps(
-                    {
-                        "error": "usage_error",
-                        "exit_code": 64,
-                        "family": "cam",
-                        "message": "auth revoke requires --yes when no stdin is attached",
-                    }
+            exit_on_structured_error(
+                StructuredError(
+                    code=EXIT_USAGE_ERROR,
+                    message="auth revoke requires --yes when no stdin is attached",
                 ),
-                err=True,
+                output_mode,
             )
-            sys.exit(64)
         if not confirmed:
             click.echo("Aborted.", err=True)
-            sys.exit(0)
+            return
 
     try:
         creds = load_credentials(creds_path)
         revoke_refresh_token(creds)
     except CredentialError as exc:
-        _exit_with_credential_error(exc)
-        return  # unreachable
+        exit_on_structured_error(_credential_error_to_structured(exc), output_mode)
 
     # Scrub local file: atomic-replace with an empty stub. We bypass
     # ``save_credentials`` here because the stub deliberately fails the
@@ -313,15 +254,7 @@ def cmd_revoke(yes: bool, output: str) -> None:
     _scrub_credentials(creds_path)
 
     payload = {"status": "revoked", "credentials_path": str(creds_path)}
-    _emit(
-        payload,
-        output=output,
-        text_lines=[
-            "Cam OAuth refresh token revoked at Google.",
-            f"Local credentials scrubbed at {creds_path}.",
-            "Run `nest-cli auth setup` to re-authorize.",
-        ],
-    )
+    emit(payload, output_mode)
 
 
 def _scrub_credentials(path: Path) -> None:
@@ -331,9 +264,6 @@ def _scrub_credentials(path: Path) -> None:
     rename + chmod 0600) so the post-revoke state is indistinguishable
     from any other write at the filesystem layer.
     """
-    import os
-    import tempfile
-
     if not path.parent.exists():
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     fd, tmp = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=str(path.parent))
@@ -350,19 +280,13 @@ def _scrub_credentials(path: Path) -> None:
 
 
 @auth_group.command("status")
-@click.option(
-    "--output",
-    type=click.Choice(_OUTPUT_CHOICES),
-    default=_OUTPUT_TEXT,
-    show_default=True,
-    help="Output format.",
-)
-def cmd_status(output: str) -> None:
+@add_output_options
+def cmd_status(output_mode: OutputMode) -> None:
     """Print the cam credentials status with secrets redacted.
 
-    Implements the cam-only subset of FR-CRED-10. Engineer B's full
-    ``auth status`` (with both cam and wifi rows) lives in a different
-    module; this verb reports only the cam family.
+    Implements the cam-only subset of FR-CRED-10. Output is a JSON array
+    in ``--json`` mode (FR-CRED-10): v0.1.0 emits one element (cam family);
+    Phase 3 will add the wifi element to the same array.
 
     Redaction (FR-CRED-10, §6.7): the refresh token, access token, and
     OAuth client secret are NEVER emitted. ``oauth_client_id`` is
@@ -370,20 +294,15 @@ def cmd_status(output: str) -> None:
     """
     creds_path = default_credentials_path()
     if not creds_path.exists():
-        payload = {
-            "family": "cam",
-            "configured": False,
-            "credentials_path": str(creds_path),
-        }
-        _emit(
-            payload,
-            output=output,
-            text_lines=[
-                "family: cam",
-                "configured: false",
-                f"credentials_path: {creds_path}",
-                "(run `nest-cli auth setup` to configure)",
+        emit(
+            [
+                {
+                    "family": "cam",
+                    "configured": False,
+                    "credentials_path": str(creds_path),
+                }
             ],
+            output_mode,
         )
         return
 
@@ -393,67 +312,51 @@ def cmd_status(output: str) -> None:
     try:
         raw = creds_path.read_text(encoding="utf-8")
     except OSError as exc:
-        click.echo(
-            json.dumps(
-                {
-                    "error": "config_error",
-                    "exit_code": 6,
-                    "family": "cam",
-                    "message": f"could not read {creds_path}: {exc}",
-                }
+        exit_on_structured_error(
+            StructuredError(
+                code=EXIT_AUTH_ERROR,
+                message=f"could not read {creds_path}: {exc}",
             ),
-            err=True,
+            output_mode,
         )
-        sys.exit(6)
 
     if raw.strip() in ("{}", ""):
-        payload = {
-            "family": "cam",
-            "configured": False,
-            "credentials_path": str(creds_path),
-            "note": "credentials previously revoked",
-        }
-        _emit(
-            payload,
-            output=output,
-            text_lines=[
-                "family: cam",
-                "configured: false",
-                f"credentials_path: {creds_path}",
-                "note: credentials previously revoked",
+        emit(
+            [
+                {
+                    "family": "cam",
+                    "configured": False,
+                    "credentials_path": str(creds_path),
+                    "note": "credentials previously revoked",
+                }
             ],
+            output_mode,
         )
         return
 
     try:
         creds = load_credentials(creds_path)
     except CredentialError as exc:
-        _exit_with_credential_error(exc)
-        return  # unreachable
+        exit_on_structured_error(_credential_error_to_structured(exc), output_mode)
 
-    expires_at_iso = creds.expires_at.astimezone(UTC).isoformat().replace("+00:00", "Z")
+    # ``time_until_expiry_seconds`` is computed at emit time so the
+    # operator sees a fresh delta even if the file was written long ago.
+    from datetime import UTC, datetime
+
     now = datetime.now(UTC)
     seconds_until_expiry = int((creds.expires_at.astimezone(UTC) - now).total_seconds())
 
-    payload = {
-        "family": "cam",
-        "configured": True,
-        "credentials_path": str(creds_path),
-        "google_cloud_project_id": creds.google_cloud_project_id,
-        "oauth_client_id_redacted": _redact_client_id(creds.oauth_client_id),
-        "expires_at": expires_at_iso,
-        "time_until_expiry_seconds": seconds_until_expiry,
-    }
-    _emit(
-        payload,
-        output=output,
-        text_lines=[
-            "family: cam",
-            "configured: true",
-            f"credentials_path: {creds_path}",
-            f"google_cloud_project_id: {creds.google_cloud_project_id}",
-            f"oauth_client_id (redacted): {_redact_client_id(creds.oauth_client_id)}",
-            f"expires_at: {expires_at_iso}",
-            f"time_until_expiry_seconds: {seconds_until_expiry}",
+    emit(
+        [
+            {
+                "family": "cam",
+                "configured": True,
+                "credentials_path": str(creds_path),
+                "google_cloud_project_id": creds.google_cloud_project_id,
+                "oauth_client_id_redacted": _redact_client_id(creds.oauth_client_id),
+                "expires_at": creds.expires_at,
+                "time_until_expiry_seconds": seconds_until_expiry,
+            }
         ],
+        output_mode,
     )

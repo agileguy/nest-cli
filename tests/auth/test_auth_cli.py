@@ -187,13 +187,25 @@ def test_refresh_rotates_token(isolated_xdg: Path, monkeypatch: pytest.MonkeyPat
 def test_refresh_propagates_exit_2_on_4xx(
     isolated_xdg: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A revoked refresh token surfaces as exit 2 with a structured stderr."""
+    """A revoked refresh token surfaces as exit 2 with a structured stderr.
+
+    In ``--json`` mode the SRD §11.2 envelope carries the ``auth_failed``
+    enum string. Text mode emits a human-readable line with no enum
+    keyword (reserved for the JSON envelope).
+    """
     save_credentials(isolated_xdg, _make_creds())
     _stub_post_form(monkeypatch, {GOOGLE_OAUTH_TOKEN_URL: (400, b'{"error":"invalid_grant"}')})
     runner = CliRunner()
-    result = runner.invoke(auth_group, ["refresh"])
+    result = runner.invoke(auth_group, ["refresh", "--json"])
     assert result.exit_code == 2, result.output
-    assert "auth_failed" in (result.stderr or "")
+    stderr = result.stderr or ""
+    assert "auth_failed" in stderr
+    envelope = json.loads(stderr.strip().splitlines()[-1])
+    assert envelope["error"] == "auth_failed"
+    assert envelope["exit_code"] == 2
+    # FR-CRED-10 cleanup: the ``family`` discriminator does NOT belong in
+    # the §11.2 error envelope (reserved for the auth status payload).
+    assert "family" not in envelope
 
 
 # ---------------------------------------------------------------------------
@@ -248,7 +260,11 @@ def test_revoke_aborts_on_confirmation_no(
 def test_status_json_redacts_client_id(
     isolated_xdg: Path,
 ) -> None:
-    """JSON output emits redacted client_id; never the secret/refresh/access tokens."""
+    """JSON output emits redacted client_id; never the secret/refresh/access tokens.
+
+    FR-CRED-10: ``auth status --json`` emits a JSON array. v0.1.0 holds one
+    element (cam family); Phase 3 will append a wifi element.
+    """
     save_credentials(
         isolated_xdg,
         _make_creds(client_id="abcdefgh12345678.apps.googleusercontent.com"),
@@ -257,10 +273,13 @@ def test_status_json_redacts_client_id(
     result = runner.invoke(auth_group, ["status", "--output", "json"])
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
-    assert payload["family"] == "cam"
-    assert payload["configured"] is True
+    assert isinstance(payload, list), "FR-CRED-10: --json output must be an array"
+    assert len(payload) == 1
+    record = payload[0]
+    assert record["family"] == "cam"
+    assert record["configured"] is True
     # Client id ends in the trailing 8 chars of the input.
-    assert payload["oauth_client_id_redacted"].endswith(
+    assert record["oauth_client_id_redacted"].endswith(
         "abcdefgh12345678.apps.googleusercontent.com"[-8:]
     )
     # Critical: never leak the real secrets in the rendered output.
@@ -290,8 +309,11 @@ def test_status_no_credentials(isolated_xdg: Path) -> None:
     result = runner.invoke(auth_group, ["status", "--output", "json"])
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
-    assert payload["family"] == "cam"
-    assert payload["configured"] is False
+    assert isinstance(payload, list)
+    assert len(payload) == 1
+    record = payload[0]
+    assert record["family"] == "cam"
+    assert record["configured"] is False
 
 
 def test_status_after_revoke_reads_empty_stub(
@@ -305,8 +327,39 @@ def test_status_after_revoke_reads_empty_stub(
     result = runner.invoke(auth_group, ["status", "--output", "json"])
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
-    assert payload["configured"] is False
-    assert "revoked" in payload.get("note", "")
+    assert isinstance(payload, list)
+    record = payload[0]
+    assert record["configured"] is False
+    assert "revoked" in record.get("note", "")
+
+
+def test_status_jsonl_emits_one_object_per_line(isolated_xdg: Path) -> None:
+    """``--jsonl`` mode emits the array elements one per line.
+
+    Newly enabled by the migration to ``add_output_options``; the previous
+    local Click choice rejected this flag entirely.
+    """
+    save_credentials(isolated_xdg, _make_creds())
+    runner = CliRunner()
+    result = runner.invoke(auth_group, ["status", "--jsonl"])
+    assert result.exit_code == 0, result.output
+    lines = [line for line in result.output.strip().splitlines() if line]
+    assert len(lines) == 1
+    record = json.loads(lines[0])
+    assert record["family"] == "cam"
+    assert record["configured"] is True
+
+
+def test_status_quiet_suppresses_stdout(isolated_xdg: Path) -> None:
+    """``--quiet`` mode emits no stdout; exit code is the only signal.
+
+    Newly enabled by the migration to ``add_output_options``.
+    """
+    save_credentials(isolated_xdg, _make_creds())
+    runner = CliRunner()
+    result = runner.invoke(auth_group, ["status", "--quiet"])
+    assert result.exit_code == 0, result.output
+    assert result.output == ""
 
 
 def test_status_loose_chmod_exits_2(isolated_xdg: Path) -> None:
