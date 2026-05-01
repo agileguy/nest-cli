@@ -44,3 +44,15 @@ secrets/
 
 # Generated fixtures from real hardware (smoke scripts) — sanitized fixtures live in tests/fixtures/
 .smoke-output/
+
+# pyenv (per-checkout Python version pin)
+.python-version
+
+# Type-checker / stub backups
+*.pyi.bak
+.dmypy.json
+dmypy.json
+
+# pip-tools / pipenv / poetry leftovers (in case anyone strays)
+Pipfile.lock
+poetry.lock
