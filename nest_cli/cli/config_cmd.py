@@ -13,15 +13,16 @@ honors the standard output-mode flags so it's pipeable into ``jq``.
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 
 import click
 
+from nest_cli.cli._shared import exit_on_structured_error
 from nest_cli.config import default_config_path, load_config
 from nest_cli.errors import (
     EXIT_CONFIG_ERROR,
     EXIT_OK,
     StructuredError,
-    emit_structured_error_to_stderr,
 )
 from nest_cli.output import OutputMode, add_output_options, emit
 
@@ -48,14 +49,11 @@ def config_show(config_path: str | None, output_mode: OutputMode) -> None:
     Per FR-16d, the v0.1.0 schema (``[aliases]``, ``[groups]``) does
     not contain secrets, so no redaction is needed.
     """
-    from pathlib import Path
-
     target_path = Path(config_path) if config_path else default_config_path()
     try:
         cfg = load_config(target_path)
     except StructuredError as exc:
-        emit_structured_error_to_stderr(exc, output_mode)
-        sys.exit(exc.code)
+        exit_on_structured_error(exc, output_mode)
 
     emit(
         {
@@ -87,14 +85,11 @@ def config_validate(config_path: str | None, output_mode: OutputMode) -> None:
     - Alias values are non-empty strings.
     - Group values are lists of strings.
     """
-    from pathlib import Path
-
     target_path = Path(config_path) if config_path else default_config_path()
     try:
         cfg = load_config(target_path)
     except StructuredError as exc:
-        emit_structured_error_to_stderr(exc, output_mode)
-        sys.exit(exc.code)
+        exit_on_structured_error(exc, output_mode)
 
     # Additional cross-reference checks: every member of every group
     # SHOULD resolve to a configured alias. Unknown-member references
@@ -103,16 +98,17 @@ def config_validate(config_path: str | None, output_mode: OutputMode) -> None:
     for group_name, members in cfg.groups.items():
         for member in members:
             if member not in cfg.aliases:
-                err = StructuredError(
-                    code=EXIT_CONFIG_ERROR,
-                    message=(
-                        f"group {group_name!r} references unknown alias "
-                        f"{member!r}; add it to [aliases] or remove it from the group"
+                exit_on_structured_error(
+                    StructuredError(
+                        code=EXIT_CONFIG_ERROR,
+                        message=(
+                            f"group {group_name!r} references unknown alias "
+                            f"{member!r}; add it to [aliases] or remove it from the group"
+                        ),
+                        details={"group": group_name, "missing_alias": member},
                     ),
-                    details={"group": group_name, "missing_alias": member},
+                    output_mode,
                 )
-                emit_structured_error_to_stderr(err, output_mode)
-                sys.exit(err.code)
 
     emit(
         {

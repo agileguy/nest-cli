@@ -20,22 +20,20 @@ pointing at FR-WIFI-0 — the wifi surface is gated behind
 
 from __future__ import annotations
 
-import sys
 from typing import Any
 
 import click
 
-from nest_cli.auth.credentials import (
-    CredentialError,
-    default_credentials_path,
-    load_credentials,
-    refresh_access_token_if_needed,
+from nest_cli.cli._shared import (
+    exit_on_structured_error,
+    family_for_target,
+    filter_aliases_by_family,
+    load_credentials_or_exit,
 )
 from nest_cli.config import default_config_path, load_config
 from nest_cli.errors import (
     EXIT_UNSUPPORTED_FEATURE,
     StructuredError,
-    emit_structured_error_to_stderr,
 )
 from nest_cli.output import OutputMode, add_output_options, emit
 from nest_cli.sdm.client import SdmClient
@@ -88,17 +86,16 @@ def list_cmd(
     try:
         config = load_config(default_config_path())
     except StructuredError as exc:
-        emit_structured_error_to_stderr(exc, output_mode)
-        sys.exit(exc.code)
+        exit_on_structured_error(exc, output_mode)
 
     if groups_flag:
         # FR-1b: groups view ignores --probe, --family, --online-only.
         emit({k: list(v) for k, v in config.groups.items()}, output_mode)
         return
 
-    aliases = _filter_aliases_by_family(config.aliases, family)
+    aliases = filter_aliases_by_family(config.aliases, family)
     records = [
-        {"name": name, "target": target, "family": _family_for_target(target)}
+        {"name": name, "target": target, "family": family_for_target(target)}
         for name, target in aliases.items()
     ]
 
@@ -128,38 +125,24 @@ def discover_cmd(family: str, output_mode: OutputMode) -> None:
     behind ``--experimental-wifi`` and ships in Phase 3.
     """
     if family == "wifi":
-        err = StructuredError(
-            code=EXIT_UNSUPPORTED_FEATURE,
-            message="discover --family wifi requires the experimental wifi surface",
-            hint=(
-                "The wifi surface is gated behind --experimental-wifi and "
-                "ships in Phase 3 (FR-WIFI-0)."
+        exit_on_structured_error(
+            StructuredError(
+                code=EXIT_UNSUPPORTED_FEATURE,
+                message="discover --family wifi requires the experimental wifi surface",
+                hint=(
+                    "The wifi surface is gated behind --experimental-wifi and "
+                    "ships in Phase 3 (FR-WIFI-0)."
+                ),
             ),
+            output_mode,
         )
-        emit_structured_error_to_stderr(err, output_mode)
-        sys.exit(err.code)
 
-    try:
-        creds = load_credentials(default_credentials_path())
-        creds = refresh_access_token_if_needed(creds, default_credentials_path())
-    except CredentialError as exc:
-        err = StructuredError(
-            code=exc.exit_code,
-            message=str(exc),
-            hint=exc.hint,
-        )
-        emit_structured_error_to_stderr(err, output_mode)
-        sys.exit(err.code)
-    except StructuredError as exc:
-        emit_structured_error_to_stderr(exc, output_mode)
-        sys.exit(exc.code)
-
+    creds = load_credentials_or_exit(output_mode)
     client = SdmClient(creds)
     try:
         cameras = client.list_devices(creds.google_cloud_project_id)
     except StructuredError as exc:
-        emit_structured_error_to_stderr(exc, output_mode)
-        sys.exit(exc.code)
+        exit_on_structured_error(exc, output_mode)
 
     if not cameras:
         # FR-3: zero-result with no error exits 0 with empty output and a
@@ -167,33 +150,6 @@ def discover_cmd(family: str, output_mode: OutputMode) -> None:
         click.echo("no devices found", err=True)
 
     emit(cameras, output_mode)
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
-def _filter_aliases_by_family(aliases: dict[str, str], family: str | None) -> dict[str, str]:
-    """Return the subset of ``aliases`` whose targets match ``family``.
-
-    Heuristic: cam targets start with ``enterprises/`` (the SDM device
-    path); wifi targets start with ``wifi:``. ``None`` means no filter.
-    """
-    if family is None:
-        return dict(aliases)
-    return {
-        name: target for name, target in aliases.items() if _family_for_target(target) == family
-    }
-
-
-def _family_for_target(target: str) -> str:
-    """Classify a target string as ``cam`` or ``wifi``.
-
-    A target starting with ``wifi:`` is wifi; everything else is cam
-    (the SDM ``enterprises/...`` path is the dominant cam form).
-    """
-    return "wifi" if target.startswith("wifi:") else "cam"
 
 
 def _probe_records(
@@ -209,18 +165,7 @@ def _probe_records(
     if not cam_targets:
         return records
 
-    try:
-        creds = load_credentials(default_credentials_path())
-        creds = refresh_access_token_if_needed(creds, default_credentials_path())
-    except CredentialError as exc:
-        err = StructuredError(
-            code=exc.exit_code,
-            message=str(exc),
-            hint=exc.hint,
-        )
-        emit_structured_error_to_stderr(err, output_mode)
-        sys.exit(err.code)
-
+    creds = load_credentials_or_exit(output_mode)
     client = SdmClient(creds)
     enriched: list[dict[str, Any]] = []
     for record in records:

@@ -54,17 +54,19 @@ def fake_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Pat
     def _fake_creds_path() -> Path:
         return credentials_path
 
+    # Patch every import-time binding of ``default_config_path`` and
+    # ``default_credentials_path`` so each verb module sees the tmp paths.
+    # The canonical home for the credentials path is now
+    # ``nest_cli.cli._shared`` (the shared helper used by every verb).
     monkeypatch.setattr("nest_cli.config.default_config_path", _fake_config_path)
     monkeypatch.setattr("nest_cli.cli.list_cmd.default_config_path", _fake_config_path)
     monkeypatch.setattr("nest_cli.cli.cam_cmd.default_config_path", _fake_config_path)
-    monkeypatch.setattr("nest_cli.cli.list_cmd.default_credentials_path", _fake_creds_path)
-    monkeypatch.setattr("nest_cli.cli.cam_cmd.default_credentials_path", _fake_creds_path)
+    monkeypatch.setattr("nest_cli.cli._shared.default_credentials_path", _fake_creds_path)
 
     def _fake_refresh(creds: CamCredentials, path: Path, *, force: bool = False) -> CamCredentials:
         return creds
 
-    monkeypatch.setattr("nest_cli.cli.list_cmd.refresh_access_token_if_needed", _fake_refresh)
-    monkeypatch.setattr("nest_cli.cli.cam_cmd.refresh_access_token_if_needed", _fake_refresh)
+    monkeypatch.setattr("nest_cli.cli._shared.refresh_access_token_if_needed", _fake_refresh)
     monkeypatch.setattr("nest_cli.sdm.client.refresh_access_token_if_needed", _fake_refresh)
     monkeypatch.setattr("nest_cli.sdm.client.save_credentials", lambda p, c: None)
 

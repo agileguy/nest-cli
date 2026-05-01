@@ -31,21 +31,16 @@ longer exists → exit 4 from the SDM 404 path with a hint pointing at
 
 from __future__ import annotations
 
-import sys
-
 import click
 
-from nest_cli.auth.credentials import (
-    CredentialError,
-    default_credentials_path,
-    load_credentials,
-    refresh_access_token_if_needed,
+from nest_cli.cli._shared import (
+    exit_on_structured_error,
+    filter_aliases_by_family,
+    load_credentials_or_exit,
 )
+from nest_cli.cli.list_cmd import _probe_records
 from nest_cli.config import default_config_path, load_config, resolve_alias
-from nest_cli.errors import (
-    StructuredError,
-    emit_structured_error_to_stderr,
-)
+from nest_cli.errors import StructuredError
 from nest_cli.output import OutputMode, add_output_options, emit
 from nest_cli.sdm.client import SdmClient
 from nest_cli.sdm.types import Camera
@@ -109,17 +104,12 @@ def cam_list(probe: bool, online_only: bool, output_mode: OutputMode) -> None:
 
     Implements FR-CAM-1.
     """
-    # Delay import to avoid a circular reference; ``list_cmd`` imports
-    # from ``output`` which we already imported here.
-    from nest_cli.cli.list_cmd import _filter_aliases_by_family, _probe_records
-
     try:
         config = load_config(default_config_path())
     except StructuredError as exc:
-        emit_structured_error_to_stderr(exc, output_mode)
-        sys.exit(exc.code)
+        exit_on_structured_error(exc, output_mode)
 
-    aliases = _filter_aliases_by_family(config.aliases, "cam")
+    aliases = filter_aliases_by_family(config.aliases, "cam")
     records = [
         {"name": name, "target": target, "family": "cam"} for name, target in aliases.items()
     ]
@@ -204,26 +194,13 @@ def _fetch_camera(target: str, output_mode: OutputMode) -> Camera:
     try:
         config = load_config(default_config_path())
     except StructuredError as exc:
-        emit_structured_error_to_stderr(exc, output_mode)
-        sys.exit(exc.code)
+        exit_on_structured_error(exc, output_mode)
 
     resolved = resolve_alias(config, target)
-
-    try:
-        creds = load_credentials(default_credentials_path())
-        creds = refresh_access_token_if_needed(creds, default_credentials_path())
-    except CredentialError as exc:
-        err = StructuredError(
-            code=exc.exit_code,
-            message=str(exc),
-            hint=exc.hint,
-        )
-        emit_structured_error_to_stderr(err, output_mode)
-        sys.exit(err.code)
-
+    creds = load_credentials_or_exit(output_mode)
     client = SdmClient(creds)
     try:
         return client.get_device(resolved)
     except StructuredError as exc:
-        emit_structured_error_to_stderr(exc, output_mode)
-        sys.exit(exc.code)
+        exit_on_structured_error(exc, output_mode)
+        raise  # unreachable — for type-checkers
