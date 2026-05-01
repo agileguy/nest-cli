@@ -442,3 +442,24 @@ def test_lock_timeout_maps_to_exit_3(creds_path: Path) -> None:
     finally:
         holder_release.set()
         t.join(timeout=2)
+
+
+def test_lock_refuses_symlink_at_lock_path(creds_path: Path, tmp_path: Path) -> None:
+    """A pre-existing symlink at ``<path>.lock`` is a credential-substitution
+    attack vector and must be rejected with a structured auth error.
+
+    The hardened ``_file_lock`` opens with ``O_NOFOLLOW`` on both the
+    create and the existing-file paths so an attacker cannot redirect
+    the lock to a file they control.
+    """
+    creds_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    lock_path = creds_path.with_suffix(creds_path.suffix + ".lock")
+    decoy = tmp_path / "decoy"
+    decoy.write_text("attacker-controlled")
+    lock_path.symlink_to(decoy)
+
+    with pytest.raises(CredentialError) as exc_info, _file_lock(creds_path, timeout_s=1):
+        pass
+    assert exc_info.value.exit_code == EXIT_AUTH_ERROR
+    # Decoy must remain untouched — we refused before ever opening it.
+    assert decoy.read_text() == "attacker-controlled"

@@ -166,14 +166,42 @@ def _file_lock(path: Path, *, timeout_s: int = HTTP_TIMEOUT_S) -> Iterator[None]
     file. POSIX ``flock`` is fine for v0.1.0 (Linux + macOS only per SRD
     §13.2). On lock timeout we raise ``CredentialError`` mapped to exit 3
     (network — FR-CRED-13 explicitly maps lock-acquisition timeout to 3).
+
+    Symlink-race hardening: we open the lock file with ``O_CREAT|O_EXCL|
+    O_NOFOLLOW`` first. If the lock file already exists from a prior run
+    we re-open with ``O_NOFOLLOW`` only — both paths refuse to follow a
+    symlink at the lock path. An attacker who pre-creates a symlink at
+    ``<path>.lock`` pointing elsewhere would cause us to lock the wrong
+    file (or worse, write to it on a future schema change). Refusing to
+    follow makes that race a hard error mapped to exit 2 (auth) — the
+    operator sees a clean failure, not a silent compromise.
     """
     lock_path = path.with_suffix(path.suffix + ".lock")
     _ensure_parent_dir(lock_path)
-    # ``LOCK_NB`` so we can implement a poll-with-timeout loop. ``flock``'s
-    # blocking variant has no timeout knob.
+
+    flags_create = os.O_CREAT | os.O_EXCL | os.O_RDWR | os.O_NOFOLLOW
+    flags_open = os.O_RDWR | os.O_NOFOLLOW
+    try:
+        fd = os.open(lock_path, flags_create, 0o600)
+    except FileExistsError:
+        try:
+            fd = os.open(lock_path, flags_open)
+        except OSError as exc:
+            # ``O_NOFOLLOW`` returns ELOOP on a symlink, which surfaces
+            # as ``OSError`` with errno 62 on Linux / 62 on macOS. Map
+            # any open failure here to a structured auth error rather
+            # than letting the operator see an opaque OSError.
+            raise CredentialError(
+                f"refusing to lock credentials at {lock_path}: "
+                "lock file is a symlink, unreadable, or otherwise unsafe",
+                exit_code=EXIT_AUTH_ERROR,
+                hint=(
+                    f"Inspect {lock_path}; if you trust the path, remove it and retry. "
+                    "A symlink at this path can indicate a credential-substitution attack."
+                ),
+            ) from exc
 
     deadline = time.monotonic() + timeout_s
-    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
     try:
         while True:
             try:
