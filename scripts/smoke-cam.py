@@ -73,7 +73,6 @@ import sys
 from pathlib import Path
 from typing import Any
 
-
 # --- Redaction --------------------------------------------------------------
 
 # Keys whose VALUE (a string) must be redacted. Match is done with
@@ -184,9 +183,7 @@ def _write_fixture(path: Path, payload: Any) -> None:
     serialized = json.dumps(payload, indent=2, sort_keys=True)
     leaks = _scan_for_leaks(serialized)
     if leaks:
-        raise RedactionError(
-            "post-redaction leak scan failed:\n  - " + "\n  - ".join(leaks)
-        )
+        raise RedactionError("post-redaction leak scan failed:\n  - " + "\n  - ".join(leaks))
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(serialized + "\n", encoding="utf-8")
 

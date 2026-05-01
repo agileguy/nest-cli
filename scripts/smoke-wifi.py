@@ -57,7 +57,6 @@ import sys
 from pathlib import Path
 from typing import Any
 
-
 # Substring matches against the dict KEY (case-insensitive). Order is
 # significant only for the placeholder class name in the output: the FIRST
 # match wins. Put the more-specific matches first.
@@ -213,7 +212,7 @@ def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     master_token = _resolve_master_token(args)
 
-    GLocalAuthenticationTokens, GoogleWifi = _import_wifi_libraries()
+    GLocalAuthenticationTokens, GoogleWifi = _import_wifi_libraries()  # noqa: N806 — class objects, not regular variables
 
     try:
         # Derive a Foyer-usable token. The exact attribute we need from
