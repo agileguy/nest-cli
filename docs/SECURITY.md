@@ -2,7 +2,7 @@
 
 ## Reporting a vulnerability
 
-Report security issues **privately** to <!-- TODO: replace with security contact email before v0.1.0 release --> rather than opening a public GitHub issue.
+Report security issues **privately** by opening a [GitHub Security Advisory](https://github.com/agileguy/nest-cli/security/advisories/new) on this repository, rather than opening a public issue. Maintainer triages reports within 7 days.
 
 This is especially important for any vulnerability touching:
 
@@ -19,4 +19,9 @@ See [`docs/SRD-nest-cli.md`](SRD-nest-cli.md) §4.7 for the full threat model, i
 
 ## Supported versions
 
-Until v0.1.0 ships, only the latest tagged release receives security fixes. The support matrix will be expanded once the project reaches a stable version.
+| Version | Supported |
+|---------|-----------|
+| 0.1.x   | ✓ (current) |
+| 0.0.x   | ✗ (skeleton releases — superseded by 0.1.0) |
+
+Pre-1.0 releases follow a "latest minor only" policy. Once 1.0 ships, supported-version policy will move to "current and previous minor."
