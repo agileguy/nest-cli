@@ -7,6 +7,77 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `nest_cli/cli/auth_cmd.py` — rebased onto the shared `add_output_options`
+  decorator and `emit()`/`exit_on_structured_error` infrastructure. Every
+  `auth` verb now honors `--json`, `--jsonl`, `--quiet`, and `--output`
+  uniformly with the rest of the CLI. The local `_emit`,
+  `_exit_with_credential_error`, and `_OUTPUT_*` helpers were removed.
+  Error envelopes no longer carry a `family` discriminator (not in SRD
+  §11.2); the discriminator surfaces in the `auth status` payload only.
+- `nest_cli/cli/auth_cmd.py` — `auth status` emits a JSON array per
+  FR-CRED-10 (`v0.1.0` ships one element for the cam family; Phase 3 will
+  add the wifi element).
+- `nest_cli/cli/config_cmd.py` — `config show` text mode emits TOML per
+  FR-16c (round-trips through `tomllib`); JSON modes continue to emit
+  the structured-record dict.
+- `nest_cli/auth/types.py`, `nest_cli/sdm/types.py`, `nest_cli/output.py`
+  — datetime fields now serialize as RFC 3339 UTC with the literal `Z`
+  suffix per FR-22, both via Pydantic `field_serializer` and through the
+  shared `_to_jsonable` / `_pydantic_default` paths.
+- `nest_cli/auth/credentials.py` — `EXIT_*` constants now imported from
+  `nest_cli.errors` (single source of truth, SRD §11.1). The lock-file
+  open path was hardened against a symlink-substitution race
+  (`O_CREAT|O_EXCL|O_NOFOLLOW` first, `O_NOFOLLOW` fallback); a
+  pre-existing symlink at `<creds>.lock` is rejected with a structured
+  auth error.
+
+### Fixed
+
+- Re-sort the stdlib import block in `nest_cli/auth/credentials.py` so
+  ruff I001 stops failing CI (`random` and `time` had been inserted out
+  of alphabetical order by the lock-jitter fix).
+
+## [0.1.0] - 2026-05-01
+
+### Added
+
+- `nest_cli/errors.py` — SRD §11.1 `EXIT_*` constants and the `StructuredError`
+  dataclass with a stderr emitter that honors text vs JSON output mode.
+- `nest_cli/output.py` — `add_output_options` decorator (`--json`, `--jsonl`,
+  `--quiet`, `--output`) plus a mode-aware `emit()` function. Mutually
+  exclusive flag combinations exit 64 with a structured error.
+- `nest_cli/config.py` — `tomllib`-based TOML parser for the local config
+  with `[aliases]` and `[groups]` sections (extra="forbid"), plus
+  `default_config_path()` honoring `XDG_CONFIG_HOME`.
+- `nest_cli/sdm/types.py` — Pydantic `Camera` and `CameraTrait` records per
+  SRD §10.1, normalizing the SDM API's trait-dict into a list of name-keyed
+  records.
+- `nest_cli/sdm/client.py` — `SdmClient` thin wrapper around `requests`
+  with auto-refresh on 401 and structured-error mapping for 4xx/5xx and
+  network failures.
+- `nest_cli/cli/list_cmd.py` — `list` (FR-1, FR-1a, FR-1b, FR-1c, FR-1d) and
+  `discover` (FR-2, FR-2a) commands.
+- `nest_cli/cli/cam_cmd.py` — `cam` subgroup with `list`/`info`/`capabilities`
+  (FR-CAM-1, FR-CAM-2, FR-CAM-28).
+- `nest_cli/cli/config_cmd.py` — `config` subgroup with `show`/`validate`
+  (FR-16c).
+- `nest_cli/cli/__init__.py` — root Click group `cli` wiring all subgroups.
+- `requests>=2.31,<3` as an explicit dependency (was previously transitive
+  via `google-auth-oauthlib`).
+- Comprehensive mocked test coverage: `tests/test_errors.py`,
+  `tests/test_output.py`, `tests/test_config.py`, `tests/sdm/test_client.py`,
+  `tests/test_cli_list.py`, `tests/test_cli_cam.py`, `tests/test_cli_config.py`.
+
+### Changed
+
+- `nest_cli/__main__.py` — replaced the Phase 0 stub with a thin
+  `from nest_cli.cli import cli as main` entry point.
+- `nest_cli/__init__.py` — `__version__` bumped to `0.1.0`.
+- `pyproject.toml` — `version` bumped to `0.1.0`.
+- `tests/test_skeleton.py` — version assertions updated to `0.1.0`.
+
 ## [0.0.1] - 2026-05-01
 
 ### Fixed
