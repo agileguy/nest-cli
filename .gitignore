@@ -27,7 +27,6 @@ ENV/
 
 # uv
 .uv/
-uv.lock
 
 # Editors / OS
 .vscode/
@@ -44,3 +43,20 @@ secrets/
 
 # Generated fixtures from real hardware (smoke scripts) — sanitized fixtures live in tests/fixtures/
 .smoke-output/
+
+# Operator-captured smoke output. Smoke scripts redact PII before writing here, but
+# captured/ is also gitignored as defense-in-depth — see tests/fixtures/README.md.
+tests/fixtures/sdm/captured/
+tests/fixtures/foyer/captured/
+
+# pyenv (per-checkout Python version pin)
+.python-version
+
+# Type-checker / stub backups
+*.pyi.bak
+.dmypy.json
+dmypy.json
+
+# pip-tools / pipenv / poetry leftovers (in case anyone strays)
+Pipfile.lock
+poetry.lock

@@ -1,0 +1,30 @@
+{
+  "name": "enterprises/{{PROJECT_ID}}/devices/{{DEVICE_ID}}",
+  "type": "sdm.devices.types.DOORBELL",
+  "assignee": "enterprises/{{PROJECT_ID}}/structures/{{STRUCTURE_ID}}/rooms/{{ROOM_ID}}",
+  "traits": {
+    "sdm.devices.traits.Info": {
+      "customName": "{{CUSTOM_NAME}}"
+    },
+    "sdm.devices.traits.CameraLiveStream": {
+      "maxVideoResolution": {
+        "width": 1600,
+        "height": 1200
+      },
+      "videoCodecs": ["H264"],
+      "audioCodecs": ["AAC", "OPUS"],
+      "supportedProtocols": ["WEB_RTC"]
+    },
+    "sdm.devices.traits.CameraEventImage": {},
+    "sdm.devices.traits.DoorbellChime": {},
+    "sdm.devices.traits.CameraMotion": {},
+    "sdm.devices.traits.CameraPerson": {},
+    "sdm.devices.traits.CameraSound": {}
+  },
+  "parentRelations": [
+    {
+      "parent": "enterprises/{{PROJECT_ID}}/structures/{{STRUCTURE_ID}}/rooms/{{ROOM_ID}}",
+      "displayName": "{{ROOM_NAME}}"
+    }
+  ]
+}
