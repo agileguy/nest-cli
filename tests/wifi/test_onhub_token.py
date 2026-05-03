@@ -354,6 +354,89 @@ class TestOnHubTokenRefresh:
         # Four POSTs total: full chain on both calls.
         assert session.post.call_count == 4
 
+    # ------------------------------------------------------------------
+    # PR #9 review fix #4 — secret redaction in error messages
+    # ------------------------------------------------------------------
+
+    def test_step1_failure_redacts_refresh_token_in_message(
+        self, v3_client: FoyerClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Step 1 4xx body containing the refresh_token is redacted in stderr."""
+        # The v3_creds fixture sets refresh_token to "1//09abc-DEF_xyz".
+        # Have Step 1 echo the refresh_token in its error body to simulate
+        # the worst case (Google's error responses can echo bearer headers).
+        leaky_body = "invalid_grant: refresh_token=1//09abc-DEF_xyz was rejected by upstream"
+        session = MagicMock()
+        session.post.side_effect = [
+            _mock_response(400, text=leaky_body),
+        ]
+        monkeypatch.setattr(v3_client, "_get_rest_session", lambda: session)
+
+        with pytest.raises(StructuredError) as exc_info:
+            v3_client._refresh_onhub_access_token()
+        msg = exc_info.value.message
+        # Redaction sentinel present.
+        assert "<redacted-refresh-token>" in msg
+        # Actual refresh token absent.
+        assert "1//09abc-DEF_xyz" not in msg
+
+    def test_step1_missing_access_token_redacts(
+        self, v3_client: FoyerClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Step 1 success-but-malformed body containing the refresh_token is redacted."""
+        # Status 200 but body is non-JSON / missing the access_token key.
+        leaky_body = "ok-but-also: 1//09abc-DEF_xyz leaked here"
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.text = leaky_body
+        resp.content = b"not json"
+        resp.json.side_effect = ValueError("not JSON")
+        session = MagicMock()
+        session.post.side_effect = [resp]
+        monkeypatch.setattr(v3_client, "_get_rest_session", lambda: session)
+
+        with pytest.raises(StructuredError) as exc_info:
+            v3_client._refresh_onhub_access_token()
+        msg = exc_info.value.message
+        assert "<redacted-refresh-token>" in msg
+        assert "1//09abc-DEF_xyz" not in msg
+
+    def test_step2_failure_redacts_web_token_in_message(
+        self, v3_client: FoyerClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Step 2 4xx body containing the cached web token is redacted."""
+        # First Step 1 succeeds and caches "ya29.SECRET-WEB-TOKEN".
+        # Then Step 2 echoes the bearer header back in its 401 body.
+        leaky_body = "Unauthorized: Bearer ya29.SECRET-WEB-TOKEN"
+        session = MagicMock()
+        session.post.side_effect = [
+            _mock_response(200, {"access_token": "ya29.SECRET-WEB-TOKEN", "expires_in": 3600}),
+            _mock_response(401, text=leaky_body),
+        ]
+        monkeypatch.setattr(v3_client, "_get_rest_session", lambda: session)
+
+        with pytest.raises(StructuredError) as exc_info:
+            v3_client._refresh_onhub_access_token()
+        msg = exc_info.value.message
+        assert "<redacted-web-token>" in msg
+        assert "ya29.SECRET-WEB-TOKEN" not in msg
+
+    def test_redact_secrets_preserves_non_secret_text(self, v3_client: FoyerClient) -> None:
+        """The redactor leaves diagnostic text untouched outside the token spans."""
+        v3_client._step1_web_token = "ya29.WEB"
+        v3_client._onhub_token = "OH-TOKEN"
+        sample = (
+            "HTTP 503 upstream busy; correlation_id=abc123; "
+            "refresh_token=1//09abc-DEF_xyz; bearer=ya29.WEB; onhub=OH-TOKEN"
+        )
+        out = v3_client._redact_secrets(sample)
+        assert "<redacted-refresh-token>" in out
+        assert "<redacted-web-token>" in out
+        assert "<redacted-onhub-token>" in out
+        # Non-secret context preserved.
+        assert "correlation_id=abc123" in out
+        assert "HTTP 503 upstream busy" in out
+
     def test_concurrent_refresh_serializes(
         self, v3_client: FoyerClient, monkeypatch: pytest.MonkeyPatch
     ) -> None:

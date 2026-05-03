@@ -787,6 +787,38 @@ class FoyerClient:
     # Internals — Phase C: OnHub OAuth + REST transport
     # ------------------------------------------------------------------
 
+    def _redact_secrets(self, text: str) -> str:
+        """Best-effort redaction of credentials before they touch error messages.
+
+        Google's OAuth error responses can echo back the bearer header or
+        the refresh_token under some upstream conditions. Before any
+        Google-supplied error body is included in a ``StructuredError``
+        message, run it through this method so the operator's tokens
+        never leak to stderr / structured-error JSON / shell history.
+
+        Replaces the refresh token, the cached Step 1 web token, and
+        the cached OnHub token with stable redaction sentinels so the
+        rest of the diagnostic body remains useful (HTTP status text,
+        upstream error codes, etc.).
+        """
+        redacted = text
+        if self._creds.refresh_token:
+            redacted = redacted.replace(
+                self._creds.refresh_token,
+                "<redacted-refresh-token>",
+            )
+        if self._step1_web_token:
+            redacted = redacted.replace(
+                self._step1_web_token,
+                "<redacted-web-token>",
+            )
+        if self._onhub_token:
+            redacted = redacted.replace(
+                self._onhub_token,
+                "<redacted-onhub-token>",
+            )
+        return redacted
+
     def _refresh_onhub_access_token(self) -> str:
         """Mint a fresh OnHub-scoped access token via the two-step OAuth chain.
 
@@ -861,11 +893,12 @@ class FoyerClient:
                         family=WIFI_FAMILY,
                     ) from exc
                 if step1.status_code >= 400:
+                    body_excerpt = self._redact_secrets(step1.text[:200])
                     raise StructuredError(
                         code=EXIT_AUTH_ERROR,
                         message=(
                             "oauth2/v4/token rejected the refresh token "
-                            f"(HTTP {step1.status_code}): {step1.text[:200]}"
+                            f"(HTTP {step1.status_code}): {body_excerpt}"
                         ),
                         hint=(
                             "The OAuth refresh token is invalid, expired, or "
@@ -880,11 +913,11 @@ class FoyerClient:
                     web_token = str(step1_body["access_token"])
                     step1_expires_in = int(step1_body.get("expires_in", ACCESS_TOKEN_DURATION_S))
                 except (ValueError, KeyError) as exc:
+                    body_excerpt = self._redact_secrets(step1.text[:200])
                     raise StructuredError(
                         code=EXIT_AUTH_ERROR,
                         message=(
-                            "oauth2/v4/token response missing access_token "
-                            f"(body={step1.text[:200]})"
+                            f"oauth2/v4/token response missing access_token (body={body_excerpt})"
                         ),
                         family=WIFI_FAMILY,
                     ) from exc
@@ -917,11 +950,12 @@ class FoyerClient:
                     family=WIFI_FAMILY,
                 ) from exc
             if step2.status_code >= 400:
+                body_excerpt = self._redact_secrets(step2.text[:200])
                 raise StructuredError(
                     code=EXIT_AUTH_ERROR,
                     message=(
                         "issuetoken rejected the OnHub mint request "
-                        f"(HTTP {step2.status_code}): {step2.text[:200]}"
+                        f"(HTTP {step2.status_code}): {body_excerpt}"
                     ),
                     hint=(
                         "The web access token from Step 1 lacks the right "
@@ -936,9 +970,10 @@ class FoyerClient:
                 onhub_token: str = str(body["token"])
                 expires_in_s = int(body.get("expiresIn", ACCESS_TOKEN_DURATION_S))
             except (ValueError, KeyError) as exc:
+                body_excerpt = self._redact_secrets(step2.text[:200])
                 raise StructuredError(
                     code=EXIT_AUTH_ERROR,
-                    message=(f"issuetoken response missing token (body={step2.text[:200]})"),
+                    message=(f"issuetoken response missing token (body={body_excerpt})"),
                     family=WIFI_FAMILY,
                 ) from exc
 
