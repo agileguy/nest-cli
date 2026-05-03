@@ -7,11 +7,83 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-05-03
+
+### Added
+
+Phase 2 ships the full cam control surface beyond v0.1.0's read-only verbs
+(SRD §16.2 / FR-CAM-3..16, FR-CAM-19..27).
+
+- `nest_cli/sdm/client.py:execute_command()` — public POST wrapper for SDM
+  `:executeCommand` with auth-refresh + 401-retry + status mapping that
+  mirrors `_get_with_refresh`. Used by every command-issuing verb.
+- `nest_cli/sdm/stream_types.py` — typed result records for the stream
+  surface (`Stream`, `RtspStreamResult`, `WebRtcStreamResult`).
+- `nest_cli/sdm/event_types.py` — typed result records and
+  `parse_pubsub_event()` for the events surface.
+- `nest_cli/cli/cam_stream_cmd.py` — `cam stream`, `cam stream-extend`,
+  `cam stream-stop` verbs (RTSP and WebRTC variants).
+- `nest_cli/cli/cam_events_cmd.py` — `cam events` one-shot Pub/Sub drain.
+- `cam snapshot <target>` — two-tier fallback (CameraImage →
+  CameraEventImage). FR-CAM-3..5, FR-CAM-4a tier-1 auth short-circuit.
+- `cam stream <target>` — RTSP variant emits directly-usable URL +
+  extension token; WebRTC variant requires `--offer-sdp <path-or-stdin>`
+  and emits answer SDP + media session id (Decision 6: operator owns
+  SDP generation in v1).
+- `cam stream-extend / stream-stop` — RTSP session lifecycle.
+- `cam chime <target>` — DoorbellChime invocation; non-doorbells exit 5
+  with a hint listing chime-capable aliases.
+- `cam battery <target>` / `cam signal <target>` — predicate-gated on
+  Camera-record presence (SDM has no public `Battery` / `RSSI` trait).
+- `cam events [<target>]` one-shot drain — `--follow` deferred to
+  Phase 2.1 (FR-CAM-21..23). Emits §10.3 Event records as JSONL.
+- 71 new tests (138 → 209 passing) covering each verb, the
+  `executeCommand` wrapper, stream-result parsers, Pub/Sub event
+  shaping, and reviewer-flagged edge cases.
+
+### Changed
+
+- `nest_cli/cli/cam_cmd.py:_TRAIT_TO_VERBS` — extended for Phase 2 verbs.
+  `DoorbellChime` widened to `["chime", "events"]` since the trait
+  gates both verbs.
+- `nest_cli/cli/cam_cmd.py:_PREDICATE_VERBS` — new companion table for
+  verbs gated on parsed-record presence (battery, signal).
+- `nest_cli/cli/_shared.py` — `exit_on_structured_error` annotated as
+  `NoReturn`, fixing mypy narrowing across all callers.
+
+### Fixed
+
+Multi-reviewer feedback on PR #4 addressed in 9 fix commits:
+
+- Snapshot tier-1 failure now correctly advances to tier 2 per FR-CAM-4
+  (previously only advanced on missing-trait, contrary to spec).
+  `EXIT_AUTH_ERROR` continues to short-circuit per FR-CAM-4a.
+- `cam events <target>` no longer ack-leaks events for OTHER cameras —
+  ack ids are appended after the target filter, not before, so events
+  for non-matching targets remain in the subscription for a future
+  drain.
+- Snapshot error envelopes no longer include token-bearing SDM result
+  dicts. `_parse_image_url_and_token` emits `result_keys` instead;
+  `_download_snapshot_bytes` redacts URL query strings before logging.
+- Pub/Sub ack failures now surface as a stderr warning instead of being
+  silently suppressed; the narrower exception family is caught
+  (`google.api_core.exceptions.GoogleAPICallError`, `OSError`,
+  `TimeoutError`).
+- `--offer-sdp` capped at 64KB and required to start with `v=0`
+  (RFC 4566 protocol-version line).
+- Stream protocol detection now distinguishes "trait absent" (exit 5)
+  from "trait present, protocols unrecognized" (exit 1) instead of
+  silently defaulting to webrtc.
+- `cam snapshot --output -` paired with `--quiet` now exits 64 (the
+  combination would silence the only output channel).
+- Hardcoded `code=3` literal in `cam_events_cmd.py` replaced with
+  `EXIT_NETWORK_ERROR` constant.
+
 ### Documentation
 
-- `README.md` — status block updated to v0.1.0-shipped reality; quick-start
-  examples now reflect verbs that actually work; added a link to the
-  operator runbook.
+- `README.md` — status block updated to v0.1.0-shipped reality;
+  quick-start examples now reflect verbs that actually work; added a
+  link to the operator runbook.
 - `docs/ONBOARDING.md` (new) — operator runbook: Google Cloud + Device
   Access setup, OAuth client creation, `auth setup` walkthrough,
   smoke-test flow, troubleshooting, where credentials live.
@@ -20,6 +92,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   model excerpt, what v0.1.0 deliberately does NOT include.
 - `docs/SECURITY.md` — replaced the pre-release contact-email TODO with
   a GitHub Security Advisory link; updated supported-versions table.
+
+### Deferred
+
+- `cam events --follow` long-poll mode → Phase 2.1.
+- `auth setup --pubsub` topic + subscription provisioning → Phase 5+.
+  Operator manually creates the subscription and grants
+  `roles/pubsub.publisher` to Google's SDM service account.
+- WebRTC `mediaSessionId`-keyed `stream-extend` / `stream-stop` (RTSP
+  form ships in v0.2.0; WebRTC form uses a different flag).
+- ffmpeg-from-RTSP snapshot tier 3 fallback.
 
 ## [0.1.0] - 2026-05-01
 
