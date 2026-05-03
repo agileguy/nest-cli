@@ -706,6 +706,152 @@ def cmd_reboot_group(
     )
 
 
+# ---------------------------------------------------------------------------
+# wifi network <group-id> (FR-WIFI-13)
+# ---------------------------------------------------------------------------
+
+
+@wifi_group.command("network")
+@click.argument("group_id", metavar="<group-id>")
+@click.option(
+    "--experimental-wifi",
+    is_flag=True,
+    default=False,
+    help="Required acknowledgement that the wifi side is experimental (FR-WIFI-0).",
+)
+@add_output_options
+def cmd_network(group_id: str, experimental_wifi: bool, output_mode: OutputMode) -> None:
+    """Emit the §10.10 WifiNetwork record for a mesh group (FR-WIFI-13).
+
+    Output: ``{group_id, ssid, guest_ssid, guest_enabled, ipv4: {wan,
+    lan_subnet, dhcp_range_start, dhcp_range_end}, ipv6: {enabled, wan,
+    prefix_len}, dns_servers}``. Group not found → exit 4.
+    """
+    experimental_wifi_gate_or_exit(experimental_wifi, output_mode, verb="wifi network")
+    master_token = _load_wifi_creds_or_exit(output_mode)
+    try:
+        client = FoyerClient(master_token=master_token)
+        net = client.get_network_info(group_id)
+    except StructuredError as exc:
+        exit_on_structured_error(exc, output_mode)
+    emit(net, output_mode)
+
+
+# ---------------------------------------------------------------------------
+# wifi guest enable|disable <group-id> (FR-WIFI-14)
+# ---------------------------------------------------------------------------
+
+
+def _guest_toggle(
+    *, group_id: str, enabled: bool, experimental_wifi: bool, output_mode: OutputMode
+) -> None:
+    """Shared body for ``wifi guest enable`` / ``wifi guest disable``.
+
+    The CLI surface ships even though the upstream ``googlewifi``
+    library does not currently expose a guest-network setter. The
+    FoyerClient.set_guest_enabled raises EXIT_UNSUPPORTED_FEATURE
+    with a hint pointing at the upstream gap; once a setter method
+    lands upstream, this verb starts succeeding without an interface
+    change.
+    """
+    experimental_wifi_gate_or_exit(
+        experimental_wifi,
+        output_mode,
+        verb=f"wifi guest {'enable' if enabled else 'disable'}",
+    )
+    master_token = _load_wifi_creds_or_exit(output_mode)
+    try:
+        client = FoyerClient(master_token=master_token)
+        client.set_guest_enabled(group_id, enabled=enabled)
+    except StructuredError as exc:
+        exit_on_structured_error(exc, output_mode)
+    # Unreachable in v0.3.1 (set_guest_enabled always raises). Kept so
+    # that the future success-path emits the SRD-aligned envelope.
+    emit(
+        {
+            "group_id": group_id,
+            "action": "guest-enable" if enabled else "guest-disable",
+            "guest_enabled": enabled,
+            "result": "ok",
+        },
+        output_mode,
+    )
+
+
+@guest_group.command("enable")
+@click.argument("group_id", metavar="<group-id>")
+@click.option(
+    "--experimental-wifi",
+    is_flag=True,
+    default=False,
+    help="Required acknowledgement that the wifi side is experimental (FR-WIFI-0).",
+)
+@add_output_options
+def cmd_guest_enable(group_id: str, experimental_wifi: bool, output_mode: OutputMode) -> None:
+    """Enable the guest network on ``group_id`` (FR-WIFI-14).
+
+    Phase 3.1 status: exits 5 (unsupported_feature, family=wifi) because
+    upstream googlewifi does not yet expose a guest-network setter.
+    """
+    _guest_toggle(
+        group_id=group_id,
+        enabled=True,
+        experimental_wifi=experimental_wifi,
+        output_mode=output_mode,
+    )
+
+
+@guest_group.command("disable")
+@click.argument("group_id", metavar="<group-id>")
+@click.option(
+    "--experimental-wifi",
+    is_flag=True,
+    default=False,
+    help="Required acknowledgement that the wifi side is experimental (FR-WIFI-0).",
+)
+@add_output_options
+def cmd_guest_disable(group_id: str, experimental_wifi: bool, output_mode: OutputMode) -> None:
+    """Disable the guest network on ``group_id`` (FR-WIFI-14)."""
+    _guest_toggle(
+        group_id=group_id,
+        enabled=False,
+        experimental_wifi=experimental_wifi,
+        output_mode=output_mode,
+    )
+
+
+# ---------------------------------------------------------------------------
+# wifi point-health <point-id> (FR-WIFI-15)
+# ---------------------------------------------------------------------------
+
+
+@wifi_group.command("point-health")
+@click.argument("point_id", metavar="<point-id>")
+@click.option(
+    "--experimental-wifi",
+    is_flag=True,
+    default=False,
+    help="Required acknowledgement that the wifi side is experimental (FR-WIFI-0).",
+)
+@add_output_options
+def cmd_point_health(point_id: str, experimental_wifi: bool, output_mode: OutputMode) -> None:
+    """Emit the §10.11 WifiPointHealth record for a single point (FR-WIFI-15).
+
+    Output: ``{id, online, uptime_s, signal_to_upstream_dbm,
+    connected_clients_count, mesh_role}``. Unknown point id → exit 4.
+    Master point's ``signal_to_upstream_dbm`` is always None (no upstream
+    node to measure against).
+    """
+    experimental_wifi_gate_or_exit(experimental_wifi, output_mode, verb="wifi point-health")
+    master_token = _load_wifi_creds_or_exit(output_mode)
+    try:
+        client = FoyerClient(master_token=master_token)
+        health = client.get_point_health(point_id)
+    except StructuredError as exc:
+        exit_on_structured_error(exc, output_mode)
+    emit(health, output_mode)
+
+
 # Re-export helpers for the test modules — keeps the public surface
 # (which is just ``wifi_group``) clean while still letting tests poke
 # at the gate / cred loader without importing private names.
