@@ -111,10 +111,9 @@ class TestChimeUnsupported:
     ) -> None:
         """FR-CAM-16: hint lists cameras in the operator's config that DO support chime.
 
-        Implementation: the verb walks the ``[aliases]`` table, calls
-        ``devices.get`` for each, and the hint enumerates the alias names
-        whose camera carries DoorbellChime. To keep this test fast and
-        free of N+1 SDM calls, we mock both alias lookups.
+        The hint resolves aliases against a single ``devices.list`` call
+        (not N+1 ``devices.get`` calls), so the test mocks one list
+        response carrying both fixtures.
         """
         write_creds(fake_paths["credentials"])
         fake_paths["config"].write_text(
@@ -123,17 +122,18 @@ class TestChimeUnsupported:
             'living-room = "enterprises/proj/devices/indoor-1"\n',
             encoding="utf-8",
         )
+        # cam_chime first does a devices.get on the failing target.
         responses.add(
             responses.GET,
             f"{SDM_API_ROOT}/enterprises/proj/devices/indoor-1",
             json=indoor_payload,
             status=200,
         )
-        # The hint walk needs to inspect each alias.
+        # The hint walks one devices.list call and filters locally.
         responses.add(
             responses.GET,
-            f"{SDM_API_ROOT}/enterprises/proj/devices/doorbell-1",
-            json=doorbell_payload,
+            f"{SDM_API_ROOT}/enterprises/proj/devices",
+            json={"devices": [doorbell_payload, indoor_payload]},
             status=200,
         )
 
@@ -143,10 +143,5 @@ class TestChimeUnsupported:
             ["cam", "chime", "living-room", "--json"],
         )
         assert result.exit_code == 5
-        # Structured error envelope on stderr.
-        stderr = result.stderr if hasattr(result, "stderr") else ""
-        # Click's CliRunner mixes stderr into ``output`` by default; the
-        # structured error shows up there. We check that the hint mentions
-        # the doorbell-capable alias.
-        combined = result.output + stderr
+        combined = result.output + (result.stderr if hasattr(result, "stderr") else "")
         assert "front-door" in combined

@@ -32,6 +32,7 @@ longer exists → exit 4 from the SDM 404 path with a hint pointing at
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 from typing import Any
 
 import click
@@ -51,7 +52,12 @@ from nest_cli.errors import (
     EXIT_USAGE_ERROR,
     StructuredError,
 )
-from nest_cli.output import OutputMode, add_output_options, emit
+from nest_cli.output import (
+    OutputMode,
+    _resolve_output_mode,
+    add_output_options,
+    emit,
+)
 from nest_cli.sdm.client import SdmClient
 from nest_cli.sdm.types import Camera
 
@@ -370,7 +376,18 @@ def cam_snapshot(
     convenience flags ``--json`` / ``--jsonl`` / ``--quiet`` cover the
     envelope-format dimension.
     """
-    output_mode = _resolve_snapshot_output_mode(json_flag, jsonl_flag, quiet_flag)
+    # Resolve the JSON/JSONL/quiet → OutputMode using the shared helper.
+    # Snapshot omits the global ``--output text|json|jsonl|quiet`` knob
+    # because its own ``--output <path>`` argument owns that flag name.
+    try:
+        output_mode = _resolve_output_mode(
+            output_explicit=None,
+            json_flag=json_flag,
+            jsonl_flag=jsonl_flag,
+            quiet_flag=quiet_flag,
+        )
+    except StructuredError as exc:
+        exit_on_structured_error(exc, "text")
 
     if output_path == "-" and output_mode in ("json", "jsonl"):
         err = StructuredError(
@@ -388,65 +405,28 @@ def cam_snapshot(
     creds = load_credentials_or_exit(output_mode)
     client = SdmClient(creds)
 
-    # Tier selection — auth-rejection short-circuits FR-CAM-4a.
     try:
         jpeg_bytes, mechanism = _try_snapshot_tiers(client, camera)
     except StructuredError as exc:
         exit_on_structured_error(exc, output_mode)
 
-    # Write the bytes.
     if output_path == "-":
         sys.stdout.buffer.write(jpeg_bytes)
         sys.stdout.buffer.flush()
-    else:
-        from pathlib import Path
+        return
 
-        out = Path(output_path)
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_bytes(jpeg_bytes)
-
-    # Emit the SnapshotResult envelope (skipped for --output -).
-    if output_path != "-":
-        result_payload: dict[str, Any] = {
+    out = Path(output_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_bytes(jpeg_bytes)
+    emit(
+        {
             "target": target,
             "output": output_path,
             "mechanism": mechanism,
             "bytes": len(jpeg_bytes),
-        }
-        emit(result_payload, output_mode)
-
-
-def _resolve_snapshot_output_mode(
-    json_flag: bool,
-    jsonl_flag: bool,
-    quiet_flag: bool,
-) -> OutputMode:
-    """Pick a snapshot-specific OutputMode from the three convenience flags.
-
-    Snapshot can't use ``add_output_options`` because the SRD-mandated
-    ``--output <path>`` flag would collide with the global mode flag's
-    name. Two convenience flags together exit 64; default is ``"text"``.
-    """
-    selected: list[OutputMode] = []
-    if json_flag:
-        selected.append("json")
-    if jsonl_flag:
-        selected.append("jsonl")
-    if quiet_flag:
-        selected.append("quiet")
-
-    if len(selected) > 1:
-        err = StructuredError(
-            code=EXIT_USAGE_ERROR,
-            message=(
-                "Snapshot output flags conflict: "
-                + ", ".join(sorted(set(selected)))
-                + " name different modes."
-            ),
-            hint="Pass at most one of --json, --jsonl, --quiet.",
-        )
-        exit_on_structured_error(err, "text")
-    return selected[0] if selected else "text"
+        },
+        output_mode,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -503,43 +483,45 @@ def _fetch_camera(target: str, output_mode: OutputMode) -> Camera:
         raise  # unreachable — for type-checkers
 
 
+_GENERIC_DOORBELL_HINT = (
+    "Run `nest-cli cam capabilities <target>` against your other "
+    "cameras to find one with DoorbellChime."
+)
+
+
 def _doorbell_capable_hint(failing_target: str, output_mode: OutputMode) -> str:
     """Return the FR-CAM-16 hint enumerating doorbell-capable aliases.
 
-    Walks the ``[aliases]`` table and queries each cam target to see
-    which carry the ``DoorbellChime`` trait. Aliases that fail to fetch
-    (404, network, etc.) are silently skipped so a single broken alias
-    doesn't block the hint. ``failing_target`` is excluded from the
-    result (we already know it isn't doorbell-capable). If no aliases
-    are doorbell-capable (or there's no config), return a generic hint.
+    Resolves the operator's [aliases] against a single SDM ``devices.list``
+    call (one HTTP roundtrip, not N+1) and reports which aliases point
+    at cameras carrying ``DoorbellChime``. ``failing_target`` is excluded
+    from the result. Falls back to a generic hint when config or
+    credentials aren't usable, or when no aliases match.
     """
     try:
         config = load_config(default_config_path())
     except StructuredError:
-        return (
-            "Run `nest-cli cam capabilities <target>` against your other "
-            "cameras to find one with DoorbellChime."
-        )
+        return _GENERIC_DOORBELL_HINT
 
     cam_aliases = filter_aliases_by_family(config.aliases, "cam")
     if not cam_aliases:
-        return (
-            "Run `nest-cli cam capabilities <target>` against your other "
-            "cameras to find one with DoorbellChime."
-        )
+        return _GENERIC_DOORBELL_HINT
 
     creds = load_credentials_or_exit(output_mode)
     client = SdmClient(creds)
-    capable: list[str] = []
-    for alias_name, alias_target in sorted(cam_aliases.items()):
-        if alias_name == failing_target or alias_target == failing_target:
-            continue
-        try:
-            cam = client.get_device(alias_target)
-        except StructuredError:
-            continue
-        if cam.has_trait(_TRAIT_DOORBELL_CHIME):
-            capable.append(alias_name)
+    try:
+        cameras = client.list_devices(creds.google_cloud_project_id)
+    except StructuredError:
+        return _GENERIC_DOORBELL_HINT
+
+    doorbell_target_ids = {c.target_id for c in cameras if c.has_trait(_TRAIT_DOORBELL_CHIME)}
+    capable = sorted(
+        alias_name
+        for alias_name, alias_target in cam_aliases.items()
+        if alias_name != failing_target
+        and alias_target != failing_target
+        and alias_target in doorbell_target_ids
+    )
 
     if not capable:
         return (
