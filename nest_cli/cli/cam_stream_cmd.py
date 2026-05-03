@@ -89,17 +89,14 @@ def cam_stream(
     output is the operator's input to a downstream consumer
     (ffmpeg/mpv for RTSP; a WebRTC-capable peer for WebRTC).
     """
-    camera = _fetch_camera(target, output_mode)
+    camera, client = _fetch_camera(target, output_mode)
     protocol = _detect_stream_protocol(camera)
-    client = _make_client(output_mode)
+
+    # FR-CAM-7 does not forbid --offer-sdp on RTSP cameras; we ignore
+    # it silently rather than rejecting the operator's harmless mistake.
 
     try:
         if protocol == "rtsp":
-            if offer_sdp_source is not None:
-                # Defensive: --offer-sdp on an RTSP camera is harmless
-                # but probably an operator mistake. Keep silent (FR-CAM-7
-                # does not forbid the flag); the verb still proceeds.
-                pass
             rtsp = client.generate_rtsp_stream(camera.target_id)
             stream = Stream.from_rtsp_result(target=target, result=rtsp)
         else:  # webrtc
@@ -142,8 +139,7 @@ def cam_stream_extend(
             output_mode,
         )
 
-    camera = _fetch_camera(target, output_mode)
-    client = _make_client(output_mode)
+    camera, client = _fetch_camera(target, output_mode)
     try:
         rtsp = client.extend_stream(camera.target_id, extension_token=extension_token)
     except StructuredError as exc:
@@ -180,8 +176,7 @@ def cam_stream_stop(
             output_mode,
         )
 
-    camera = _fetch_camera(target, output_mode)
-    client = _make_client(output_mode)
+    camera, client = _fetch_camera(target, output_mode)
     try:
         client.stop_stream(camera.target_id, extension_token=extension_token)
     except StructuredError as exc:
@@ -196,12 +191,14 @@ def cam_stream_stop(
 # ---------------------------------------------------------------------------
 
 
-def _fetch_camera(target: str, output_mode: OutputMode) -> Camera:
-    """Resolve ``target`` against config + SDM, returning the Camera record.
+def _fetch_camera(target: str, output_mode: OutputMode) -> tuple[Camera, SdmClient]:
+    """Resolve ``target`` against config + SDM, returning ``(Camera, SdmClient)``.
 
-    Mirrors ``cam_cmd._fetch_camera`` but lives here to avoid the
-    cross-module import-cycle risk during Phase 2 parallel
-    development. The function is internal to this module.
+    Returns the client alongside the camera record so the verb body
+    can issue the follow-up stream command on the same client (one
+    credential load, one client instance per invocation). Mirrors
+    ``cam_cmd._fetch_camera`` but lives here to keep the merge surface
+    minimal during Phase 2 parallel development.
     """
     try:
         config = load_config(default_config_path())
@@ -212,16 +209,11 @@ def _fetch_camera(target: str, output_mode: OutputMode) -> Camera:
     creds = load_credentials_or_exit(output_mode)
     client = SdmClient(creds)
     try:
-        return client.get_device(resolved)
+        camera = client.get_device(resolved)
     except StructuredError as exc:
         exit_on_structured_error(exc, output_mode)
         raise  # unreachable
-
-
-def _make_client(output_mode: OutputMode) -> SdmClient:
-    """Build an SdmClient with credentials loaded for the second-call path."""
-    creds = load_credentials_or_exit(output_mode)
-    return SdmClient(creds)
+    return camera, client
 
 
 def _detect_stream_protocol(camera: Camera) -> str:
