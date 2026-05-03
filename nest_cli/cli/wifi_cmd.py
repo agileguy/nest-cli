@@ -43,6 +43,7 @@ in ARCHITECTURE.md).
 from __future__ import annotations
 
 import sys
+from collections.abc import Callable
 
 import click
 
@@ -51,10 +52,15 @@ from nest_cli.auth.wifi_credentials import (
     default_wifi_credentials_path,
     load_wifi_credentials,
 )
+from nest_cli.cli._fanout import FanOutResult, fan_out_verb
 from nest_cli.cli._shared import (
+    ResolvedTarget,
     exit_on_structured_error,
     experimental_wifi_gate_or_exit,
+    is_group_target,
+    resolve_target_or_group,
 )
+from nest_cli.config import default_config_path, load_config
 from nest_cli.errors import EXIT_USAGE_ERROR, StructuredError
 from nest_cli.output import OutputMode, add_output_options, emit
 from nest_cli.wifi.client import FoyerClient
@@ -304,20 +310,45 @@ def cmd_list_clients(group_id: str, experimental_wifi: bool, output_mode: Output
 @wifi_group.command("pause")
 @click.argument("client_id", metavar="<client-id>")
 @click.option(
+    "--concurrency",
+    "concurrency",
+    type=click.IntRange(1, 32),
+    default=None,
+    help="Override the default fan-out concurrency cap (3) for group targets.",
+)
+@click.option(
     "--experimental-wifi",
     is_flag=True,
     default=False,
     help="Required acknowledgement that the wifi side is experimental (FR-WIFI-0).",
 )
 @add_output_options
-def cmd_pause(client_id: str, experimental_wifi: bool, output_mode: OutputMode) -> None:
+def cmd_pause(
+    client_id: str,
+    concurrency: int | None,
+    experimental_wifi: bool,
+    output_mode: OutputMode,
+) -> None:
     """Pause a single client by station id (FR-WIFI-4).
 
     Idempotent — pausing an already-paused client returns OK with no
     error. Unknown client_id → exit 4 (family=wifi). Output on success
     is ``{"client_id": ..., "action": "pause", "result": "ok"}``.
+
+    Group fan-out (FR-6/FR-7): ``@group-name`` resolves to the group's
+    member alias list and fans out at the default concurrency=3 cap.
+    Per-target results emit as FR-9a JSONL envelopes in resolved order.
     """
     experimental_wifi_gate_or_exit(experimental_wifi, output_mode, verb="wifi pause")
+    if is_group_target(client_id):
+        _wifi_action_fanout(
+            client_id,
+            action_name="pause",
+            verb=lambda foyer, sid: foyer.pause_station(sid),
+            concurrency=concurrency,
+            output_mode=output_mode,
+        )
+        return
     master_token = _load_wifi_creds_or_exit(output_mode)
     try:
         client = FoyerClient(master_token=master_token)
@@ -325,6 +356,79 @@ def cmd_pause(client_id: str, experimental_wifi: bool, output_mode: OutputMode) 
     except StructuredError as exc:
         exit_on_structured_error(exc, output_mode)
     emit({"client_id": client_id, "action": "pause", "result": "ok"}, output_mode)
+
+
+def _strip_wifi_prefix(target: str) -> str:
+    """Strip the ``wifi:`` prefix from a resolved target.
+
+    The on-config form is ``wifi:sta-foo`` (or ``wifi:groups/...``);
+    the FoyerClient methods take the bare upstream id. The group
+    fan-out helper passes the post-strip id to the per-verb callable.
+    """
+    return target[len("wifi:") :] if target.startswith("wifi:") else target
+
+
+def _wifi_action_fanout(
+    target: str,
+    *,
+    action_name: str,
+    verb: Callable[[FoyerClient, str], None],
+    concurrency: int | None,
+    output_mode: OutputMode,
+) -> None:
+    """Generic group fan-out for single-arg wifi action verbs.
+
+    ``verb`` is a callable ``(FoyerClient, str) -> None`` that performs
+    the side-effect (e.g. ``foyer.pause_station(sid)``) and raises
+    ``StructuredError`` on failure. Each per-target call produces an
+    FR-9a envelope; the helper computes the FR-8a aggregate exit code
+    and ``sys.exit``s with it.
+    """
+    try:
+        config = load_config(default_config_path())
+    except StructuredError as exc:
+        exit_on_structured_error(exc, output_mode)
+    try:
+        resolved = resolve_target_or_group(config, target, expected_family="wifi")
+    except StructuredError as exc:
+        exit_on_structured_error(exc, output_mode)
+
+    master_token = _load_wifi_creds_or_exit(output_mode)
+    foyer = FoyerClient(master_token=master_token)
+
+    def _verb_callable(rt: ResolvedTarget) -> FanOutResult:
+        bare_id = _strip_wifi_prefix(rt.target)
+        try:
+            verb(foyer, bare_id)
+        except StructuredError as exc:
+            from nest_cli.errors import error_enum_for_code
+
+            return FanOutResult(
+                target=rt.name,
+                exit_code=exc.code,
+                error={
+                    "code": error_enum_for_code(exc.code),
+                    "message": str(exc),
+                    **({"hint": exc.hint} if exc.hint else {}),
+                },
+            )
+        return FanOutResult(
+            target=rt.name,
+            exit_code=0,
+            result={
+                "client_id": bare_id,
+                "action": action_name,
+                "result": "ok",
+            },
+        )
+
+    exit_code = fan_out_verb(
+        targets=resolved,
+        verb_callable=_verb_callable,
+        concurrency=concurrency,
+        output_mode=output_mode,
+    )
+    sys.exit(exit_code)
 
 
 # ---------------------------------------------------------------------------
