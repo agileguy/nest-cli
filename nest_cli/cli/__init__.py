@@ -28,6 +28,7 @@ from nest_cli import __version__
 # which breaks monkeypatch in test code.
 from nest_cli.cli import list_cmd as _list_module
 from nest_cli.cli.auth_cmd import auth_group
+from nest_cli.cli.batch_cmd import batch_cmd
 from nest_cli.cli.cam_cmd import cam_group
 from nest_cli.cli.config_cmd import config_group
 from nest_cli.cli.wifi_cmd import wifi_group
@@ -51,6 +52,7 @@ def cli(ctx: click.Context) -> None:
 
 
 cli.add_command(auth_group)
+cli.add_command(batch_cmd)
 cli.add_command(cam_group)
 cli.add_command(config_group)
 cli.add_command(_list_cmd)
