@@ -38,10 +38,14 @@ from typing import Any
 import click
 import requests
 
+from nest_cli.cli._fanout import FanOutResult, fan_out_verb
 from nest_cli.cli._shared import (
+    ResolvedTarget,
     exit_on_structured_error,
     filter_aliases_by_family,
+    is_group_target,
     load_credentials_or_exit,
+    resolve_target_or_group,
 )
 from nest_cli.cli.cam_events_cmd import cam_events
 from nest_cli.cli.cam_stream_cmd import cam_stream, cam_stream_extend, cam_stream_stop
@@ -182,16 +186,30 @@ def cam_list(probe: bool, online_only: bool, output_mode: OutputMode) -> None:
 
 @cam_group.command("info")
 @click.argument("target")
+@click.option(
+    "--concurrency",
+    "concurrency",
+    type=click.IntRange(1, 32),
+    default=None,
+    help="Override the default fan-out concurrency cap (3) for group targets.",
+)
 @add_output_options
-def cam_info(target: str, output_mode: OutputMode) -> None:
+def cam_info(target: str, concurrency: int | None, output_mode: OutputMode) -> None:
     """Issue an SDM ``devices.get`` and emit the §10.1 Camera record.
 
-    Implements FR-CAM-2.
+    Implements FR-CAM-2 + Phase 4 group fan-out (FR-6, FR-9a).
 
-    ``<target>`` is either an alias name (resolved via ``[aliases]``) or
-    a literal SDM device path (``enterprises/{proj}/devices/{id}``).
-    Unknown-alias and unknown-device both exit 4.
+    ``<target>`` is either an alias name (resolved via ``[aliases]``),
+    a literal SDM device path (``enterprises/{proj}/devices/{id}``),
+    or a group reference (``@group-name``) per FR-6. For group
+    targets, the verb fans out per FR-7 (default concurrency 3,
+    override via ``--concurrency``) and emits one FR-9a JSONL envelope
+    per resolved member in resolved-config order. Unknown-alias and
+    unknown-device both exit 4.
     """
+    if is_group_target(target):
+        _cam_info_fanout(target, concurrency=concurrency, output_mode=output_mode)
+        return
     camera = _fetch_camera(target, output_mode)
     emit(camera, output_mode)
 
@@ -489,6 +507,58 @@ def _supported_verbs_for(camera: Camera) -> list[str]:
         if getattr(camera, attr, None) is not None:
             verbs.add(verb)
     return list(verbs)
+
+
+def _cam_info_fanout(target: str, *, concurrency: int | None, output_mode: OutputMode) -> None:
+    """Fan out ``cam info`` over a resolved group target (FR-6/FR-7)."""
+    try:
+        config = load_config(default_config_path())
+    except StructuredError as exc:
+        exit_on_structured_error(exc, output_mode)
+    try:
+        resolved = resolve_target_or_group(config, target, expected_family="cam")
+    except StructuredError as exc:
+        exit_on_structured_error(exc, output_mode)
+
+    # Pre-resolve credentials and client once so each per-target call
+    # doesn't re-load and re-refresh the cred file (FR-CRED-13's lock
+    # contention story is specifically about this).
+    creds = load_credentials_or_exit(output_mode)
+    client = SdmClient(creds)
+
+    def _verb(rt: ResolvedTarget) -> FanOutResult:
+        try:
+            camera = client.get_device(rt.target)
+        except StructuredError as exc:
+            return FanOutResult(
+                target=rt.name,
+                exit_code=exc.code,
+                error={
+                    "code": _enum_for_structured(exc),
+                    "message": str(exc),
+                    **({"hint": exc.hint} if exc.hint else {}),
+                },
+            )
+        return FanOutResult(
+            target=rt.name,
+            exit_code=0,
+            result=camera.model_dump(mode="json"),
+        )
+
+    exit_code = fan_out_verb(
+        targets=resolved,
+        verb_callable=_verb,
+        concurrency=concurrency,
+        output_mode=output_mode,
+    )
+    sys.exit(exit_code)
+
+
+def _enum_for_structured(exc: StructuredError) -> str:
+    """Map a StructuredError to its §11.3 enum without circular imports."""
+    from nest_cli.errors import error_enum_for_code
+
+    return error_enum_for_code(exc.code)
 
 
 def _fetch_camera(target: str, output_mode: OutputMode) -> Camera:

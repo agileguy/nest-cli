@@ -80,7 +80,7 @@ from typing import Any, NoReturn
 import click
 import google.api_core.exceptions
 
-from nest_cli.cli._shared import exit_on_structured_error
+from nest_cli.cli._shared import exit_on_structured_error, is_group_target
 from nest_cli.config import default_config_path, load_config, resolve_alias
 from nest_cli.errors import (
     EXIT_CONFIG_ERROR,
@@ -201,6 +201,30 @@ def cam_events(
       mode, or surfaced once in one-shot mode).
     - ``--types`` lists a token outside the §10.3 enum → exit 64.
     """
+    # FR-8d: group targets are forbidden in --follow mode (one
+    # subscription per stdout). The one-shot drain path MAY accept a
+    # group target — it has bounded output that fan-out can demultiplex
+    # — but the streaming form would interleave events from multiple
+    # cameras with no clean way to demux at the consumer.
+    if follow_mode and target is not None and is_group_target(target):
+        exit_on_structured_error(
+            StructuredError(
+                code=EXIT_USAGE_ERROR,
+                message=(
+                    "cam events --follow does not accept group targets (FR-8d). "
+                    "One Pub/Sub subscription per stdout — streaming events "
+                    "from multiple cameras through one channel would interleave "
+                    "events with no consumer-side demux."
+                ),
+                hint=(
+                    "Invoke `cam events --follow` against one alias at a time, "
+                    "or drop --follow to drain the pending events from all "
+                    "members of the group as a single one-shot fan-out."
+                ),
+            ),
+            output_mode,
+        )
+
     # Validate --types early so the operator gets feedback before we
     # even try to load the credential file.
     parsed_types: frozenset[EventTypeEnum] | None = None
