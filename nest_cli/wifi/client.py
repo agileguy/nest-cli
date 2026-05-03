@@ -168,7 +168,7 @@ class FoyerClient:
         per_ap_count = _count_clients_per_ap(devices)
 
         points: list[WifiPoint] = []
-        ap_records = _iter_ap_records(access_points)
+        ap_records = _iter_dict_records(access_points)
         for ap_record in ap_records:
             try:
                 ap_id_for_count = (
@@ -213,7 +213,7 @@ class FoyerClient:
         devices = record.get("devices") or record.get("stations") or {}
 
         clients: list[WifiClient] = []
-        for station in _iter_station_records(devices):
+        for station in _iter_dict_records(devices):
             try:
                 clients.append(WifiClient.from_googlewifi_response(station))
             except (KeyError, TypeError, ValueError) as exc:
@@ -320,21 +320,19 @@ class FoyerClient:
 # ---------------------------------------------------------------------------
 
 
-def _iter_ap_records(access_points: Any) -> list[dict[str, Any]]:
-    """Yield the access-point records from a dict or list container."""
-    if isinstance(access_points, dict):
-        return [v if isinstance(v, dict) else {} for v in access_points.values()]
-    if isinstance(access_points, list):
-        return [v if isinstance(v, dict) else {} for v in access_points]
-    return []
+def _iter_dict_records(container: Any) -> list[dict[str, Any]]:
+    """Yield dict records from a dict-of-dicts or list-of-dicts container.
 
-
-def _iter_station_records(devices: Any) -> list[dict[str, Any]]:
-    """Yield the station records from a dict or list container."""
-    if isinstance(devices, dict):
-        return [v if isinstance(v, dict) else {} for v in devices.values()]
-    if isinstance(devices, list):
-        return [v if isinstance(v, dict) else {} for v in devices]
+    Foyer's payloads use both shapes interchangeably across firmware
+    revisions: ``{"id1": {...}, "id2": {...}}`` is common, but some
+    list-shaped responses appear too. Non-dict elements are coerced
+    to ``{}`` so the caller's normalizer doesn't have to defend against
+    them.
+    """
+    if isinstance(container, dict):
+        return [v if isinstance(v, dict) else {} for v in container.values()]
+    if isinstance(container, list):
+        return [v if isinstance(v, dict) else {} for v in container]
     return []
 
 
@@ -346,7 +344,7 @@ def _count_clients_per_ap(devices: Any) -> dict[str, int]:
     Tolerates missing ``apId`` on individual entries by skipping them.
     """
     counts: dict[str, int] = {}
-    for station in _iter_station_records(devices):
+    for station in _iter_dict_records(devices):
         ap_id = station.get("apId") or station.get("ap_id") or station.get("connected_to_point_id")
         if isinstance(ap_id, str) and ap_id:
             counts[ap_id] = counts.get(ap_id, 0) + 1

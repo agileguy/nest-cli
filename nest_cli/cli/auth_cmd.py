@@ -62,7 +62,10 @@ from nest_cli.auth.wifi_credentials import (
     save_wifi_credentials,
 )
 from nest_cli.auth.wifi_types import WifiCredentials
-from nest_cli.cli._shared import exit_on_structured_error
+from nest_cli.cli._shared import (
+    exit_on_structured_error,
+    experimental_wifi_gate_or_exit,
+)
 from nest_cli.errors import (
     EXIT_AUTH_ERROR,
     EXIT_CONFIG_ERROR,
@@ -75,14 +78,6 @@ from nest_cli.output import OutputMode, add_output_options, emit
 # Android master token without the operator having to pipe stdin or pass
 # a file. Documented in the verb's ``--help`` (FR-CRED-7).
 _ENV_MASTER_TOKEN = "GOOGLE_ANDROID_MASTER_TOKEN"
-
-# Hint pointing operators at the SRD section that explains the wifi
-# experimental-flag posture. Used by FR-WIFI-0 + the auth wifi-* verbs.
-_EXPERIMENTAL_WIFI_HINT = (
-    "Pass --experimental-wifi to acknowledge SRD §3.2.3 — the wifi side "
-    "wraps single-maintainer reverse-engineered libraries that break when "
-    "Google rotates Foyer endpoints. The flag's friction is the feature."
-)
 
 
 def _redact_client_id(client_id: str) -> str:
@@ -462,35 +457,6 @@ def _build_wifi_status_record(output_mode: OutputMode) -> dict[str, object]:
 # ---------------------------------------------------------------------------
 
 
-def _experimental_wifi_gate_or_exit(
-    experimental_wifi: bool, output_mode: OutputMode, *, verb: str
-) -> None:
-    """Exit 64 unless ``--experimental-wifi`` was passed (FR-WIFI-0).
-
-    SRD §11.2 also names exit 5 for this case, but FR-WIFI-0 is more
-    specific (says exit 64 with a hint). We follow the FR-WIFI-0
-    wording — the verb exists, the operator is opting into a known-
-    fragile surface, and 64 (usage error) reads more honestly than 5
-    (unsupported feature). The ARCHITECTURE.md notes this resolution.
-    """
-    if experimental_wifi:
-        return
-    exit_on_structured_error(
-        StructuredError(
-            code=EXIT_USAGE_ERROR,
-            message=(
-                f"`auth {verb}` requires --experimental-wifi (FR-WIFI-0). "
-                "The wifi side wraps reverse-engineered single-maintainer "
-                "libraries that break when Google rotates Foyer endpoints; "
-                "every invocation must explicitly opt in."
-            ),
-            hint=_EXPERIMENTAL_WIFI_HINT,
-            family="wifi",
-        ),
-        output_mode,
-    )
-
-
 @auth_group.command("wifi-setup")
 @click.option(
     "--experimental-wifi",
@@ -552,7 +518,7 @@ def cmd_wifi_setup(
     ``myaccount.google.com/permissions``. ``auth wifi-revoke`` only
     scrubs the local file.
     """
-    _experimental_wifi_gate_or_exit(experimental_wifi, output_mode, verb="wifi-setup")
+    experimental_wifi_gate_or_exit(experimental_wifi, output_mode, verb="auth wifi-setup")
 
     creds_path = default_wifi_credentials_path()
     if creds_path.exists() and not overwrite:
@@ -685,7 +651,7 @@ def cmd_wifi_revoke(
     account password change (SRD §6.4). Operators are expected to weigh
     that blast radius before invoking either.
     """
-    _experimental_wifi_gate_or_exit(experimental_wifi, output_mode, verb="wifi-revoke")
+    experimental_wifi_gate_or_exit(experimental_wifi, output_mode, verb="auth wifi-revoke")
 
     creds_path = default_wifi_credentials_path()
     if not creds_path.exists():

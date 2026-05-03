@@ -38,49 +38,13 @@ from nest_cli.auth.wifi_credentials import (
     default_wifi_credentials_path,
     load_wifi_credentials,
 )
-from nest_cli.cli._shared import exit_on_structured_error
-from nest_cli.errors import (
-    EXIT_USAGE_ERROR,
-    StructuredError,
+from nest_cli.cli._shared import (
+    exit_on_structured_error,
+    experimental_wifi_gate_or_exit,
 )
+from nest_cli.errors import StructuredError
 from nest_cli.output import OutputMode, add_output_options, emit
 from nest_cli.wifi.client import FoyerClient
-
-# Hint pointing operators at the SRD section that explains the wifi
-# experimental-flag posture. Same string as the auth wifi verbs use, so
-# operators see consistent guidance regardless of which verb they ran.
-_EXPERIMENTAL_WIFI_HINT = (
-    "Pass --experimental-wifi to acknowledge SRD §3.2.3 — the wifi side "
-    "wraps single-maintainer reverse-engineered libraries that break when "
-    "Google rotates Foyer endpoints. The flag's friction is the feature."
-)
-
-
-def _experimental_wifi_gate_or_exit(
-    experimental_wifi: bool, output_mode: OutputMode, *, verb: str
-) -> None:
-    """Exit 64 with FR-WIFI-0 hint unless ``--experimental-wifi`` was passed.
-
-    SRD §11.2 also names exit 5 for this case, but FR-WIFI-0 is the
-    more specific requirement (says exit 64). We follow the FR-WIFI-0
-    wording — ARCHITECTURE.md notes the §11.2 vs FR-WIFI-0 resolution.
-    """
-    if experimental_wifi:
-        return
-    exit_on_structured_error(
-        StructuredError(
-            code=EXIT_USAGE_ERROR,
-            message=(
-                f"`wifi {verb}` requires --experimental-wifi (FR-WIFI-0). "
-                "The wifi side wraps reverse-engineered single-maintainer "
-                "libraries that break when Google rotates Foyer endpoints; "
-                "every invocation must explicitly opt in."
-            ),
-            hint=_EXPERIMENTAL_WIFI_HINT,
-            family="wifi",
-        ),
-        output_mode,
-    )
 
 
 def _load_wifi_creds_or_exit(output_mode: OutputMode) -> str:
@@ -145,14 +109,14 @@ def cmd_list_groups(experimental_wifi: bool, output_mode: OutputMode) -> None:
     Implements FR-WIFI-1. Output is one §10.6 WifiGroup record per group.
     Empty inventory exits 0 with empty output (FR-3 mirror).
     """
-    _experimental_wifi_gate_or_exit(experimental_wifi, output_mode, verb="list groups")
+    experimental_wifi_gate_or_exit(experimental_wifi, output_mode, verb="wifi list groups")
     master_token = _load_wifi_creds_or_exit(output_mode)
     try:
         client = FoyerClient(master_token=master_token)
         groups = client.list_groups()
     except StructuredError as exc:
         exit_on_structured_error(exc, output_mode)
-    emit([g.model_dump(mode="json") for g in groups], output_mode)
+    emit(groups, output_mode)
 
 
 # ---------------------------------------------------------------------------
@@ -175,14 +139,14 @@ def cmd_list_points(group_id: str, experimental_wifi: bool, output_mode: OutputM
     Group not found → exit 4 (family=wifi). Output is one §10.7
     WifiPoint record per point in deterministic id-ascending order.
     """
-    _experimental_wifi_gate_or_exit(experimental_wifi, output_mode, verb="list points")
+    experimental_wifi_gate_or_exit(experimental_wifi, output_mode, verb="wifi list points")
     master_token = _load_wifi_creds_or_exit(output_mode)
     try:
         client = FoyerClient(master_token=master_token)
         points = client.list_points(group_id)
     except StructuredError as exc:
         exit_on_structured_error(exc, output_mode)
-    emit([p.model_dump(mode="json") for p in points], output_mode)
+    emit(points, output_mode)
 
 
 # ---------------------------------------------------------------------------
@@ -207,14 +171,14 @@ def cmd_list_clients(group_id: str, experimental_wifi: bool, output_mode: Output
     The ``paused``, ``priority_until``, ``band``, and ``group_assignment``
     fields are normalized from the upstream Foyer payload.
     """
-    _experimental_wifi_gate_or_exit(experimental_wifi, output_mode, verb="list clients")
+    experimental_wifi_gate_or_exit(experimental_wifi, output_mode, verb="wifi list clients")
     master_token = _load_wifi_creds_or_exit(output_mode)
     try:
         client = FoyerClient(master_token=master_token)
         clients = client.list_clients(group_id)
     except StructuredError as exc:
         exit_on_structured_error(exc, output_mode)
-    emit([c.model_dump(mode="json") for c in clients], output_mode)
+    emit(clients, output_mode)
 
 
 # Re-export helpers for the test modules — keeps the public surface

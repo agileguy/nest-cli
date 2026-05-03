@@ -22,10 +22,21 @@ from nest_cli.auth.credentials import (
 )
 from nest_cli.auth.types import CamCredentials
 from nest_cli.errors import (
+    EXIT_USAGE_ERROR,
     StructuredError,
     emit_structured_error_to_stderr,
 )
 from nest_cli.output import OutputMode
+
+# Hint pointing operators at the SRD section that explains the wifi
+# experimental-flag posture. Used by every wifi verb (auth + list) so
+# operators see consistent guidance regardless of which verb tripped
+# the FR-WIFI-0 gate.
+EXPERIMENTAL_WIFI_HINT = (
+    "Pass --experimental-wifi to acknowledge SRD §3.2.3 — the wifi side "
+    "wraps single-maintainer reverse-engineered libraries that break when "
+    "Google rotates Foyer endpoints. The flag's friction is the feature."
+)
 
 
 def load_credentials_or_exit(output_mode: OutputMode) -> CamCredentials:
@@ -79,3 +90,33 @@ def filter_aliases_by_family(aliases: dict[str, str], family: str | None) -> dic
     if family is None:
         return dict(aliases)
     return {name: target for name, target in aliases.items() if family_for_target(target) == family}
+
+
+def experimental_wifi_gate_or_exit(
+    experimental_wifi: bool, output_mode: OutputMode, *, verb: str
+) -> None:
+    """Exit 64 with FR-WIFI-0 hint unless ``--experimental-wifi`` was passed.
+
+    SRD §11.2 also names exit 5 for this case, but FR-WIFI-0 is the
+    more specific requirement (says exit 64). We follow FR-WIFI-0;
+    ARCHITECTURE.md notes the §11.2 vs FR-WIFI-0 resolution.
+
+    ``verb`` is the operator-facing verb name (e.g. ``"wifi-setup"``,
+    ``"list groups"``) used in the error message body.
+    """
+    if experimental_wifi:
+        return
+    exit_on_structured_error(
+        StructuredError(
+            code=EXIT_USAGE_ERROR,
+            message=(
+                f"`{verb}` requires --experimental-wifi (FR-WIFI-0). "
+                "The wifi side wraps reverse-engineered single-maintainer "
+                "libraries that break when Google rotates Foyer endpoints; "
+                "every invocation must explicitly opt in."
+            ),
+            hint=EXPERIMENTAL_WIFI_HINT,
+            family="wifi",
+        ),
+        output_mode,
+    )
