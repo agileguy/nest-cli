@@ -296,6 +296,110 @@ def _live_stream_unknown_protos_payload(name: str) -> dict:
     }
 
 
+class TestOfferSdpSizeAndShape:
+    """Reviewer feedback (C8): cap --offer-sdp at 64KB; require v=0 start.
+
+    Operator-supplied SDP was previously read without any size cap or
+    basic shape check. Real SDPs are <4KB. The cap protects against
+    misdirected large files (e.g., the operator points at an MP4); the
+    v=0 check catches the same mistake earlier with a clearer hint.
+    """
+
+    @responses.activate
+    def test_oversized_stdin_input_exits_64(self, fake_paths: dict[str, Path]) -> None:
+        responses.add(
+            responses.GET,
+            f"{SDM_API_ROOT}/{_WEBRTC_TARGET}",
+            json=_doorbell_payload(),
+            status=200,
+        )
+        # 65537 bytes — one byte over the cap.
+        oversized = "v=0\r\n" + ("a=" + "x" * 80 + "\r\n") * 1000
+        # Pad to ensure > 65536 bytes regardless of exact maths above.
+        while len(oversized.encode("utf-8")) <= 65536:
+            oversized += "a=padding\r\n"
+        runner = CliRunner()
+        result = runner.invoke(
+            cli_root,
+            ["cam", "stream", _WEBRTC_TARGET, "--offer-sdp", "-", "--json"],
+            input=oversized,
+        )
+        assert result.exit_code == 64
+        envelope = json.loads(result.stderr)
+        assert "65536" in envelope["message"]
+
+    @responses.activate
+    def test_oversized_file_exits_64(self, fake_paths: dict[str, Path], tmp_path: Path) -> None:
+        responses.add(
+            responses.GET,
+            f"{SDM_API_ROOT}/{_WEBRTC_TARGET}",
+            json=_doorbell_payload(),
+            status=200,
+        )
+        offer_path = tmp_path / "huge.sdp"
+        # Write 70KB so stat() trips the cap before we read.
+        offer_path.write_bytes(b"v=0\r\n" + b"x" * 70_000)
+        runner = CliRunner()
+        result = runner.invoke(
+            cli_root,
+            ["cam", "stream", _WEBRTC_TARGET, "--offer-sdp", str(offer_path), "--json"],
+        )
+        assert result.exit_code == 64
+        envelope = json.loads(result.stderr)
+        assert "65536" in envelope["message"]
+
+    @responses.activate
+    def test_missing_v0_line_exits_64(self, fake_paths: dict[str, Path], tmp_path: Path) -> None:
+        responses.add(
+            responses.GET,
+            f"{SDM_API_ROOT}/{_WEBRTC_TARGET}",
+            json=_doorbell_payload(),
+            status=200,
+        )
+        offer_path = tmp_path / "bad.sdp"
+        offer_path.write_text("not an sdp\r\nstill not\r\n", encoding="utf-8")
+        runner = CliRunner()
+        result = runner.invoke(
+            cli_root,
+            ["cam", "stream", _WEBRTC_TARGET, "--offer-sdp", str(offer_path), "--json"],
+        )
+        assert result.exit_code == 64
+        envelope = json.loads(result.stderr)
+        assert "v=0" in envelope["message"]
+
+    @responses.activate
+    def test_valid_small_sdp_under_cap_passes(
+        self, fake_paths: dict[str, Path], tmp_path: Path
+    ) -> None:
+        """Sanity check: realistic SDP <4KB starting with v=0 still works."""
+        offer_path = tmp_path / "ok.sdp"
+        offer_path.write_text("v=0\r\no=offerer 1 1 IN IP4 1.2.3.4\r\n", encoding="utf-8")
+        responses.add(
+            responses.GET,
+            f"{SDM_API_ROOT}/{_WEBRTC_TARGET}",
+            json=_doorbell_payload(),
+            status=200,
+        )
+        responses.add(
+            responses.POST,
+            f"{SDM_API_ROOT}/{_WEBRTC_TARGET}:executeCommand",
+            json={
+                "results": {
+                    "answerSdp": "v=0\r\no=- 1 1 IN IP4 1.2.3.4\r\n",
+                    "expiresAt": "2026-05-03T01:00:00Z",
+                    "mediaSessionId": "ms-1234",
+                }
+            },
+            status=200,
+        )
+        runner = CliRunner()
+        result = runner.invoke(
+            cli_root,
+            ["cam", "stream", _WEBRTC_TARGET, "--offer-sdp", str(offer_path), "--json"],
+        )
+        assert result.exit_code == 0, result.output + result.stderr
+
+
 class TestCamStreamProtocolDetectFailures:
     """Reviewer feedback (C2): trait-absent vs trait-malformed.
 

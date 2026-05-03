@@ -35,6 +35,7 @@ Exit codes (SRD §11.1):
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 from typing import NoReturn
 
 import click
@@ -59,6 +60,13 @@ from nest_cli.sdm.types import Camera
 _TRAIT_LIVE_STREAM = "sdm.devices.traits.CameraLiveStream"
 _PROTO_RTSP = "RTSP"
 _PROTO_WEBRTC = "WEB_RTC"
+
+# Reviewer feedback (C8): cap operator-supplied SDP at 64KB. Real-world
+# SDPs are <4KB; anything an order of magnitude larger is either a
+# misdirected file or a hostile input. We pass the offer SDP wholesale
+# to SDM, so a hard cap at the CLI boundary keeps the request shape
+# predictable.
+_OFFER_SDP_MAX_BYTES = 65536
 
 
 @click.command("stream")
@@ -270,8 +278,15 @@ def _read_offer_sdp(source: str | None, output_mode: OutputMode) -> str:
     """Resolve ``--offer-sdp`` input. ``None`` exits 64 per FR-CAM-9.
 
     - ``None``  → exit 64 with hint pointing at FR-CAM-8 / §3.1.2.
-    - ``"-"``   → read from stdin (FR-CAM-10).
-    - else     → treat as file path; read contents.
+    - ``"-"``   → read from stdin (FR-CAM-10), capped at
+      ``_OFFER_SDP_MAX_BYTES`` (64KB).
+    - else      → treat as file path; stat-check the size before reading.
+
+    Reviewer feedback (C8): operator-supplied SDP was previously read
+    without any size cap or shape check. Realistic SDPs are <4KB; a
+    hostile or misdirected large file got passed wholesale to SDM. We
+    now cap at 64KB and require the content to start with ``v=0`` per
+    RFC 4566.
     """
     if source is None:
         _exit_missing_required(
@@ -285,20 +300,68 @@ def _read_offer_sdp(source: str | None, output_mode: OutputMode) -> str:
             output_mode,
         )
     if source == "-":
-        return sys.stdin.read()
-    try:
-        with open(source, encoding="utf-8") as fh:
-            return fh.read()
-    except OSError as exc:
+        # Read one byte more than the cap so we can detect overrun
+        # without buffering arbitrary input.
+        sdp = sys.stdin.read(_OFFER_SDP_MAX_BYTES + 1)
+        if len(sdp) > _OFFER_SDP_MAX_BYTES:
+            exit_on_structured_error(
+                StructuredError(
+                    code=EXIT_USAGE_ERROR,
+                    message=f"--offer-sdp exceeds {_OFFER_SDP_MAX_BYTES} bytes",
+                    hint="SDPs are typically <4KB; check the input source.",
+                ),
+                output_mode,
+            )
+    else:
+        try:
+            stat = Path(source).stat()
+        except OSError as exc:
+            exit_on_structured_error(
+                StructuredError(
+                    code=EXIT_USAGE_ERROR,
+                    message=f"could not stat --offer-sdp file {source}: {exc}",
+                    hint="Pass a readable file path, or '-' to read from stdin.",
+                ),
+                output_mode,
+            )
+            raise  # unreachable
+        if stat.st_size > _OFFER_SDP_MAX_BYTES:
+            exit_on_structured_error(
+                StructuredError(
+                    code=EXIT_USAGE_ERROR,
+                    message=f"--offer-sdp file exceeds {_OFFER_SDP_MAX_BYTES} bytes",
+                    hint="SDPs are typically <4KB; check the input source.",
+                ),
+                output_mode,
+            )
+        try:
+            with open(source, encoding="utf-8") as fh:
+                sdp = fh.read()
+        except OSError as exc:
+            exit_on_structured_error(
+                StructuredError(
+                    code=EXIT_USAGE_ERROR,
+                    message=f"could not read --offer-sdp file {source}: {exc}",
+                    hint="Pass a readable file path, or '-' to read from stdin.",
+                ),
+                output_mode,
+            )
+            raise  # unreachable
+
+    if not sdp.startswith("v=0"):
         exit_on_structured_error(
             StructuredError(
                 code=EXIT_USAGE_ERROR,
-                message=f"could not read --offer-sdp file {source}: {exc}",
-                hint="Pass a readable file path, or '-' to read from stdin.",
+                message=("--offer-sdp does not start with 'v=0' (RFC 4566 protocol-version line)"),
+                hint=(
+                    "The file should be a valid SDP offer; see "
+                    "https://www.rfc-editor.org/rfc/rfc4566"
+                ),
             ),
             output_mode,
         )
-        raise  # unreachable
+
+    return sdp
 
 
 def _exit_missing_required(
