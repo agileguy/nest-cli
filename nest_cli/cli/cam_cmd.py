@@ -43,6 +43,8 @@ from nest_cli.cli._shared import (
     filter_aliases_by_family,
     load_credentials_or_exit,
 )
+from nest_cli.cli.cam_events_cmd import cam_events
+from nest_cli.cli.cam_stream_cmd import cam_stream, cam_stream_extend, cam_stream_stop
 from nest_cli.cli.list_cmd import _probe_records
 from nest_cli.config import default_config_path, load_config, resolve_alias
 from nest_cli.errors import (
@@ -104,12 +106,13 @@ _TRAIT_CAMERA_EVENT_IMAGE = "sdm.devices.traits.CameraEventImage"
 _TRAIT_TO_VERBS: dict[str, list[str]] = {
     "sdm.devices.traits.CameraEventImage": ["snapshot"],
     "sdm.devices.traits.CameraImage": ["snapshot"],
-    "sdm.devices.traits.DoorbellChime": ["chime"],
-    # Future phases extend this table — Engineer B owns the stream / events rows:
-    # "sdm.devices.traits.CameraLiveStream": ["stream", "stream-extend", "stream-stop"],
-    # "sdm.devices.traits.CameraMotion": ["events"],
-    # "sdm.devices.traits.CameraPerson": ["events"],
-    # "sdm.devices.traits.CameraSound": ["events"],
+    "sdm.devices.traits.CameraLiveStream": ["stream", "stream-extend", "stream-stop"],
+    "sdm.devices.traits.CameraMotion": ["events"],
+    "sdm.devices.traits.CameraPerson": ["events"],
+    "sdm.devices.traits.CameraSound": ["events"],
+    # DoorbellChime is dual-purpose: it gates the chime verb AND emits
+    # doorbell-press events that the events verb consumes.
+    "sdm.devices.traits.DoorbellChime": ["chime", "events"],
 }
 
 # Verbs every camera has (no trait gate).
@@ -128,6 +131,17 @@ cam_group = click.Group(
     name="cam",
     help="Nest camera commands (SDM API). Implements FR-CAM-1, FR-CAM-2, FR-CAM-28.",
 )
+
+# Phase 2 stream verbs (FR-CAM-6..14). Defined in the sibling
+# ``cam_stream_cmd`` module to keep the merge surface small while two
+# engineers extend ``cam_cmd`` in parallel.
+cam_group.add_command(cam_stream)
+cam_group.add_command(cam_stream_extend)
+cam_group.add_command(cam_stream_stop)
+
+# Phase 2 events verb (FR-CAM-19..25 one-shot drain). --follow is
+# Phase 2.1 and not yet implemented.
+cam_group.add_command(cam_events)
 
 
 @cam_group.command("list")
