@@ -415,6 +415,25 @@ def cam_snapshot(
         )
         exit_on_structured_error(err, "text")
 
+    # Reviewer feedback (C5): --output - + --quiet is undefined behaviour.
+    # FR-14 says --quiet suppresses ALL stdout; pairing it with --output -
+    # would either silently emit JPEG bytes (violating --quiet) or write
+    # nothing at all (silently consuming the operator's snapshot). Reject
+    # the combination explicitly.
+    if output_path == "-" and output_mode == "quiet":
+        err = StructuredError(
+            code=EXIT_USAGE_ERROR,
+            message=(
+                "--output - is mutually exclusive with --quiet "
+                "(the only output channel would be silenced)"
+            ),
+            hint=(
+                "Pass --output <path> if you want to suppress envelope output, "
+                "or drop --quiet to send the JPEG to stdout."
+            ),
+        )
+        exit_on_structured_error(err, "text")
+
     camera = _fetch_camera(target, output_mode)
     creds = load_credentials_or_exit(output_mode)
     client = SdmClient(creds)

@@ -367,6 +367,27 @@ class TestSnapshotStdoutOutput:
         )
         assert result.exit_code == 64
 
+    def test_output_dash_with_quiet_exits_64(
+        self,
+        fake_paths: dict[str, Path],
+        write_creds: Any,
+    ) -> None:
+        """Reviewer feedback (C5): --output - + --quiet is undefined.
+
+        FR-14 says --quiet suppresses ALL stdout; pairing it with
+        --output - would silently consume the snapshot. Reject the
+        combination explicitly with exit 64.
+        """
+        write_creds(fake_paths["credentials"])
+        device = "enterprises/proj/devices/indoor-1"
+        runner = CliRunner()
+        result = runner.invoke(
+            cli_root,
+            ["cam", "snapshot", device, "--output", "-", "--quiet"],
+        )
+        assert result.exit_code == 64
+        assert "--quiet" in result.stderr or "--quiet" in result.output
+
 
 # --- C4 reviewer feedback: token leakage in error details -------------------
 
