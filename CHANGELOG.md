@@ -7,6 +7,93 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-05-03
+
+### Phase C — wifi action verbs implemented via Foyer REST (2026-05-03)
+
+The Phase B work shipped read inventory (list-groups, list-points,
+point-health) over Foyer's gRPC HomeGraph but left the action verbs as
+clean exit-5 stubs. Phase C lands real implementations for 8 of the 10
+action verbs by talking to Foyer's REST endpoints at `/v2/groups/...`,
+which require an OnHub-scoped access token derived through a two-step
+OAuth chain rooted in a standard Google OAuth refresh token.
+
+### Added
+
+- `WifiCredentials` schema bumped 2 → 3 with optional `refresh_token`
+  field (Google OAuth refresh token, validates `^1//[\w-]+$`). v2
+  files remain loadable; the loader treats missing `refresh_token` as
+  a v2 record (no auto-upgrade), so existing operators retain the
+  Phase B gRPC read path until they explicitly bootstrap.
+- `auth wifi-refresh-bootstrap` CLI verb. Persists a refresh token
+  alongside the existing v2 credentials and upgrades the file to
+  schema v3 in place. Token sources: `--refresh-token` flag,
+  `GOOGLE_REFRESH_TOKEN` env var, or interactive stdin prompt.
+  Bad-format tokens exit 6 with `family=wifi`. Missing v2 credentials
+  exit 6 with a hint pointing at `auth wifi-setup`.
+- `auth status` extended with `schema_version` and
+  `refresh_token_present` fields on the wifi record so operators can
+  verify a successful bootstrap.
+- `FoyerClient._refresh_onhub_access_token()` — two-step OAuth chain
+  that mints OnHub-scoped access tokens via `oauth2/v4/token` then
+  `oauthaccountmanager/v1/issuetoken`. Cached with the same 60s skew
+  the gRPC path uses; `threading.Lock` serializes the refresh
+  critical section.
+- `FoyerClient._rest()` — REST transport helper backed by the existing
+  `requests.Session` dep (no new HTTP libraries added). Status
+  mapping: 401/403 → `EXIT_AUTH_ERROR`, 404 → `EXIT_NOT_FOUND`,
+  5xx → `EXIT_NETWORK_ERROR`, other → `EXIT_DEVICE_ERROR`.
+- `FoyerClient._wait_for_operation()` — polls `/v2/operations/{id}`
+  every 5s until `operationState=DONE` or the per-call timeout trips.
+  Used by `run_speedtest` to wait on Foyer's async wanSpeedTest op.
+- 8 of 10 wifi action verbs land as real REST implementations:
+  - `wifi list clients <group>` (FR-WIFI-3)
+  - `wifi pause <client>` / `wifi unpause <client>` (FR-WIFI-4..5)
+  - `wifi prioritize <client> --duration <m>` (FR-WIFI-6)
+  - `wifi speedtest run <group> --timeout <s>` (FR-WIFI-8)
+  - `wifi speedtest history <group> --limit <n>` (FR-WIFI-9)
+  - `wifi reboot point <ap>` (FR-WIFI-10)
+  - `wifi reboot group <group>` (FR-WIFI-11)
+- ~30 new tests covering OnHub OAuth chain, REST helper status
+  mapping, async-op poller, schema v3 round-trip, bootstrap CLI happy
+  + error paths, per-verb REST shape assertions, and the rewired
+  fan-out test suite (`wifi pause @group` now succeeds).
+
+### Changed
+
+- `tests/wifi/conftest.py` — `_patch_skip_extras_check` now
+  initializes the OnHub token cache attributes added in 0.5.0. Adds
+  `fake_rest_client` fixture and `make_v3_creds` factory used by the
+  Phase C action verb tests.
+- All Phase B per-verb CLI test files (`test_pause.py`,
+  `test_unpause.py`, `test_prioritize.py`, `test_list_clients.py`,
+  `test_speedtest_run.py`, `test_speedtest_history.py`,
+  `test_reboot_point.py`, `test_reboot_group.py`) rewritten — seed v3
+  credentials and monkey-patch `FoyerClient._rest` to record calls
+  and assert (method, path, json, params).
+- `tests/wifi/test_client_phase_3_1.py` rewritten as Phase C unit
+  tests; per-verb classes assert the exact REST shape via the new
+  `fake_rest_client` recorder fixture.
+- `tests/batch/test_wifi_pause_group.py` — `wifi pause @kids-devices`
+  fan-out now produces two success envelopes (was two exit-5
+  envelopes in Phase B).
+
+### Wifi action verbs deferred to Phase D (exit 5, `family="wifi"`)
+
+Two verbs continue to exit 5 because their Foyer request body schemas
+are undocumented and the risk of corrupting station/group config is
+too high to ship a guess:
+
+- `wifi group-assign <client> --group <choice>` (FR-WIFI-7) —
+  `POST /v2/groups/{gid}/stationSets` body shape unknown.
+- `wifi guest enable / disable <group>` (FR-WIFI-14) —
+  `PUT /v2/groups/{gid}/guestWirelessConfig` body shape unknown
+  (SSID + password preservation rules unclear).
+
+The CLI surface is unchanged; the `_deferred_phase_d` envelope's hint
+explicitly references Phase D so operators can distinguish "deferred
+indefinitely" from "Phase B leftover".
+
 ### Phase B — wifi side rebuilt on direct gpsoauth + gRPC (2026-05-03)
 
 The wifi side originally wrapped `googlewifi.GoogleWifi` (which itself
