@@ -315,6 +315,65 @@ class TestMaxMessages:
             assert req["max_messages"] == 7
 
 
+class TestTargetFilterDoesNotAckOtherCameras:
+    """Reviewer feedback (C7): target filter must not ack other cameras' events.
+
+    Prior behaviour appended ``received_msg.ack_id`` to ``ack_ids``
+    BEFORE checking ``event.target == resolved_target``. The trailing
+    batch-acknowledge then silently consumed events for other cameras,
+    leading to lost events from cameras the operator wasn't filtering on.
+    """
+
+    def test_filtered_drain_only_acks_matching_target(self, fake_paths: dict[str, Path]) -> None:
+        fake_paths["config"].write_text(
+            '[pubsub]\nsubscription_name = "projects/proj/subscriptions/sdm-events"\n'
+            '[aliases]\nfront-door = "enterprises/proj/devices/front-id"\n',
+            encoding="utf-8",
+        )
+        msg_time = datetime(2026, 5, 3, 0, 30, 0, tzinfo=UTC)
+        front = "enterprises/proj/devices/front-id"
+        back = "enterprises/proj/devices/back-id"
+
+        with patch("nest_cli.cli.cam_events_cmd._build_subscriber") as mk:
+            subscriber = MagicMock()
+            pull_response = MagicMock()
+            pull_response.received_messages = [
+                _make_received_message(
+                    ack_id="front-1",
+                    inner_payload=_make_motion_event(target_id=front, publish_time=msg_time),
+                    publish_time=msg_time,
+                ),
+                _make_received_message(
+                    ack_id="back-1",
+                    inner_payload=_make_motion_event(target_id=back, publish_time=msg_time),
+                    publish_time=msg_time,
+                ),
+                _make_received_message(
+                    ack_id="front-2",
+                    inner_payload=_make_motion_event(
+                        target_id=front, event_id="evt-2", publish_time=msg_time
+                    ),
+                    publish_time=msg_time,
+                ),
+            ]
+            subscriber.pull.return_value = pull_response
+            mk.return_value = subscriber
+
+            runner = CliRunner()
+            result = runner.invoke(cli_root, ["cam", "events", "front-door", "--jsonl"])
+            assert result.exit_code == 0, result.output + result.stderr
+
+            # Only the two front-door events should be acked. The
+            # back-door event must remain in the subscription for a
+            # later drain.
+            ack_calls = subscriber.acknowledge.call_args_list
+            assert len(ack_calls) == 1
+            args, kwargs = ack_calls[0]
+            req = kwargs.get("request") or (args[0] if args else None)
+            acked = set(req["ack_ids"])
+            assert acked == {"front-1", "front-2"}, f"unexpected acks: {acked}"
+
+
 class TestAckFailureSurfaced:
     def test_ack_failure_writes_warning_to_stderr(self, fake_paths: dict[str, Path]) -> None:
         """Reviewer feedback (C3): ack failure must not be silent.

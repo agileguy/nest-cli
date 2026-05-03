@@ -145,24 +145,35 @@ def cam_events(
     received = list(response.received_messages or [])
     ack_ids: list[str] = []
 
+    # Reviewer feedback (C7): only ack messages we actually consumed.
+    # Prior code appended received_msg.ack_id to ack_ids BEFORE the
+    # target-filter check, so `cam events front-door` would ack
+    # back-door / garage events too — silently consuming other
+    # cameras' pending events. Now: corrupt or non-event envelopes
+    # still get acked (they'd otherwise re-pull forever); valid
+    # envelopes for OTHER targets are LEFT in the subscription so an
+    # all-targets drain or a future filtered drain picks them up.
     for received_msg in received:
         envelope = received_msg.message
-        ack_ids.append(received_msg.ack_id)
         inner = _decode_message_data(envelope.data)
         if inner is None:
-            # Skip non-JSON messages but still ack them — they're
-            # corrupt or non-event messages we'd otherwise re-pull
-            # forever.
+            # Corrupt / non-JSON: ack so we don't re-pull forever.
+            ack_ids.append(received_msg.ack_id)
             continue
 
         event = parse_pubsub_event(inner, publish_time=envelope.publish_time)
         if event is None:
+            # Unparseable but otherwise-valid Pub/Sub envelope: ack.
+            ack_ids.append(received_msg.ack_id)
             continue
 
         if resolved_target is not None and event.target != resolved_target:
+            # Filtered out — DO NOT ack. Leave for an all-targets drain
+            # or the next pull on the matching target.
             continue
 
         emit(event, output_mode)
+        ack_ids.append(received_msg.ack_id)
 
     if ack_ids:
         # Reviewer feedback (C3): catch a narrower exception family and
