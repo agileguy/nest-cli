@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+Phase 2.1 (SRD §16.3) — long-running `cam events --follow` event subscription.
+
+- `cam events --follow` long-poll loop with capped exponential backoff
+  (FR-CAM-21, FR-CAM-23). Emits each event as JSONL on stdout as it
+  arrives. On SIGINT/SIGTERM: ceases pulling, ack's any in-flight
+  consumed messages, emits a final JSONL summary line
+  `{"event": "interrupted", "received": N}` to stdout, exits 130
+  (SIGINT) or 143 (SIGTERM). Backoff schedule
+  `1s → 2s → 4s → 8s → 16s → 32s → 32s`; five consecutive failures
+  exit 3 (network) with a structured error naming the last failure;
+  a successful pull resets the counter.
+- `--types <comma-list>` filter (FR-CAM-22) applies in both follow
+  and one-shot drain modes; valid tokens are the §10.3 enum
+  (`motion`, `person`, `package`, `sound`, `doorbell-press`,
+  `unknown`). Invalid tokens exit 64 with a hint listing valid values.
+- 10 new tests in `tests/cam/test_events_follow.py` covering happy path,
+  SIGINT/SIGTERM exit-code mapping, type filter, invalid-type usage
+  error, backoff schedule durations, five-consecutive-failures exit,
+  counter-reset-on-success, target+type combined filtering, and the
+  `--quiet` summary-line override (FR-CAM-21 explicitly emits the
+  summary in all output modes).
+
+### Changed
+
+- `nest_cli/cli/cam_events_cmd.py` — refactored the message-processing
+  loop into a shared `_process_messages` helper that returns
+  `(ack_ids, emitted_count)`. The follow loop uses both; the one-shot
+  drain ignores `emitted_count`. Target-filter ack semantics
+  (reviewer feedback C7 from Phase 2) carry forward unchanged: events
+  whose target does NOT match are LEFT in the subscription; events
+  whose target matches but type is filtered ARE acked.
+
 ## [0.2.0] - 2026-05-03
 
 ### Added
