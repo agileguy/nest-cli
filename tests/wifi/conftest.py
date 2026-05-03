@@ -44,7 +44,7 @@ class _FakeGoogleWifi:
     # Class-level call recorder so tests can assert against the LAST
     # constructed instance even though each FoyerClient method spins
     # up a fresh GoogleWifi internally. Tests reset this in fixtures.
-    last_instance: "_FakeGoogleWifi | None" = None
+    last_instance: _FakeGoogleWifi | None = None
 
     def __init__(self, refresh_token: str | None = None, **_: Any) -> None:
         self.refresh_token = refresh_token
@@ -69,9 +69,7 @@ class _FakeGoogleWifi:
         """
         return True
 
-    async def pause_device(
-        self, system_id: str, device_id: str, pause_state: bool
-    ) -> bool:
+    async def pause_device(self, system_id: str, device_id: str, pause_state: bool) -> bool:
         """Spy that records the call and returns success.
 
         Records ``("pause_device", (system_id, device_id, pause_state), {})``
@@ -79,9 +77,7 @@ class _FakeGoogleWifi:
         right args. Returns True (mirrors upstream's "operationState ==
         CREATED" success path).
         """
-        self.calls.append(
-            ("pause_device", (system_id, device_id, pause_state), {})
-        )
+        self.calls.append(("pause_device", (system_id, device_id, pause_state), {}))
         return True
 
     async def prioritize_device(

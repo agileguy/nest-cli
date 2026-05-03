@@ -85,9 +85,7 @@ def test_group_assign_accepts_each_choice_value(
     assert "googlewifi" in (payload.get("hint") or "").lower()
 
 
-def test_group_assign_case_insensitive(
-    isolated_xdg: Path, fake_googlewifi: type
-) -> None:
+def test_group_assign_case_insensitive(isolated_xdg: Path, fake_googlewifi: type) -> None:
     """`--group FAMILY` is accepted just like `--group family`."""
     _seed_wifi_creds()
     runner = CliRunner()
@@ -106,9 +104,7 @@ def test_group_assign_case_insensitive(
     assert result.exit_code == 5, result.output
 
 
-def test_group_assign_invalid_choice_rejected(
-    isolated_xdg: Path, fake_googlewifi: type
-) -> None:
+def test_group_assign_invalid_choice_rejected(isolated_xdg: Path, fake_googlewifi: type) -> None:
     """`--group enterprise` (not in the choice set) → Click usage error."""
     _seed_wifi_creds()
     runner = CliRunner()

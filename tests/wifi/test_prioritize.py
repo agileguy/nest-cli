@@ -51,9 +51,7 @@ def _seed_wifi_creds() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_prioritize_default_duration_60_minutes(
-    isolated_xdg: Path, fake_googlewifi: type
-) -> None:
+def test_prioritize_default_duration_60_minutes(isolated_xdg: Path, fake_googlewifi: type) -> None:
     """No ``--duration`` → default 60 minutes (1 hour upstream)."""
     _seed_wifi_creds()
     runner = CliRunner()
@@ -206,9 +204,7 @@ def test_prioritize_above_range_300_minutes_rejected(isolated_xdg: Path) -> None
     assert "300" in err or "range" in err.lower() or "invalid" in err.lower()
 
 
-def test_prioritize_at_max_240_minutes_accepted(
-    isolated_xdg: Path, fake_googlewifi: type
-) -> None:
+def test_prioritize_at_max_240_minutes_accepted(isolated_xdg: Path, fake_googlewifi: type) -> None:
     """`--duration 240` is the inclusive upper bound."""
     _seed_wifi_creds()
     runner = CliRunner()
@@ -236,9 +232,7 @@ def test_prioritize_at_max_240_minutes_accepted(
 # ---------------------------------------------------------------------------
 
 
-def test_prioritize_unknown_client_exits_4(
-    isolated_xdg: Path, fake_googlewifi: type
-) -> None:
+def test_prioritize_unknown_client_exits_4(isolated_xdg: Path, fake_googlewifi: type) -> None:
     _seed_wifi_creds()
     runner = CliRunner()
     result = runner.invoke(

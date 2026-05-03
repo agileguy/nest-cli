@@ -52,9 +52,7 @@ def _seed_wifi_creds() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_pause_known_client_emits_ok_envelope(
-    isolated_xdg: Path, fake_googlewifi: type
-) -> None:
+def test_pause_known_client_emits_ok_envelope(isolated_xdg: Path, fake_googlewifi: type) -> None:
     """`wifi pause sta-laptop --experimental-wifi` exits 0 with envelope."""
     _seed_wifi_creds()
     runner = CliRunner()
@@ -77,9 +75,7 @@ def test_pause_known_client_emits_ok_envelope(
     }
 
 
-def test_pause_already_paused_client_idempotent(
-    isolated_xdg: Path, fake_googlewifi: type
-) -> None:
+def test_pause_already_paused_client_idempotent(isolated_xdg: Path, fake_googlewifi: type) -> None:
     """FR-WIFI-4 idempotence: pausing an already-paused client returns OK."""
     _seed_wifi_creds()
     runner = CliRunner()
@@ -99,9 +95,7 @@ def test_pause_already_paused_client_idempotent(
     assert payload["result"] == "ok"
 
 
-def test_pause_passes_correct_args_to_upstream(
-    isolated_xdg: Path, fake_googlewifi: type
-) -> None:
+def test_pause_passes_correct_args_to_upstream(isolated_xdg: Path, fake_googlewifi: type) -> None:
     """The FoyerClient resolves group_id from client_id and calls pause_device."""
     _seed_wifi_creds()
     runner = CliRunner()
@@ -123,9 +117,7 @@ def test_pause_passes_correct_args_to_upstream(
 # ---------------------------------------------------------------------------
 
 
-def test_pause_unknown_client_exits_4(
-    isolated_xdg: Path, fake_googlewifi: type
-) -> None:
+def test_pause_unknown_client_exits_4(isolated_xdg: Path, fake_googlewifi: type) -> None:
     """Unknown client_id → exit 4 with family=wifi."""
     _seed_wifi_creds()
     runner = CliRunner()
@@ -150,13 +142,11 @@ def test_pause_unknown_client_exits_4(
 # ---------------------------------------------------------------------------
 
 
-def test_pause_network_error_exits_3(
-    isolated_xdg: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_pause_network_error_exits_3(isolated_xdg: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Connection error during pause → exit 3 (family=wifi)."""
 
     class _NetworkErrorGoogleWifi:
-        last_instance: "_NetworkErrorGoogleWifi | None" = None
+        last_instance: _NetworkErrorGoogleWifi | None = None
 
         def __init__(self, refresh_token: str | None = None, **_: Any) -> None:
             type(self).last_instance = self
@@ -173,9 +163,7 @@ def test_pause_network_error_exits_3(
                 }
             }
 
-        async def pause_device(
-            self, system_id: str, device_id: str, pause_state: bool
-        ) -> bool:
+        async def pause_device(self, system_id: str, device_id: str, pause_state: bool) -> bool:
             raise ConnectionError("DNS resolution failed")
 
         async def close(self) -> None:

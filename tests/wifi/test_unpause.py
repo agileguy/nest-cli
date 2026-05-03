@@ -43,9 +43,7 @@ def _seed_wifi_creds() -> None:
     )
 
 
-def test_unpause_paused_client_emits_ok_envelope(
-    isolated_xdg: Path, fake_googlewifi: type
-) -> None:
+def test_unpause_paused_client_emits_ok_envelope(isolated_xdg: Path, fake_googlewifi: type) -> None:
     """`wifi unpause sta-kid-tablet --experimental-wifi` succeeds."""
     _seed_wifi_creds()
     runner = CliRunner()
@@ -82,9 +80,7 @@ def test_unpause_already_unpaused_client_idempotent(
     assert result.exit_code == 0, result.output
 
 
-def test_unpause_passes_correct_args_to_upstream(
-    isolated_xdg: Path, fake_googlewifi: type
-) -> None:
+def test_unpause_passes_correct_args_to_upstream(isolated_xdg: Path, fake_googlewifi: type) -> None:
     """unpause should call pause_device(..., pause_state=False)."""
     _seed_wifi_creds()
     runner = CliRunner()
@@ -101,9 +97,7 @@ def test_unpause_passes_correct_args_to_upstream(
     assert args == ("group-home-001", "sta-laptop", False)
 
 
-def test_unpause_unknown_client_exits_4(
-    isolated_xdg: Path, fake_googlewifi: type
-) -> None:
+def test_unpause_unknown_client_exits_4(isolated_xdg: Path, fake_googlewifi: type) -> None:
     """Unknown client_id → exit 4 with family=wifi."""
     _seed_wifi_creds()
     runner = CliRunner()
