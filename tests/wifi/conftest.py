@@ -74,8 +74,10 @@ def _patch_skip_extras_check(monkeypatch: pytest.MonkeyPatch) -> None:
     installed (they're in dev-deps via uv), but the import probe also
     creates an unnecessary side-effect for unit tests that never actually
     talk to gRPC. We replace the probe with a no-op, then store the same
-    state the original __init__ does.
+    state the original __init__ does (including the Phase C OnHub token
+    cache attributes added in 0.5.0).
     """
+    import threading as _threading
 
     def _init(
         self: FoyerClient,
@@ -84,6 +86,16 @@ def _patch_skip_extras_check(monkeypatch: pytest.MonkeyPatch) -> None:
         self._creds = creds
         self._access_token = None
         self._access_token_expiry = 0.0
+        self._onhub_token = None
+        self._onhub_token_expiry = 0.0
+        self._onhub_token_lock = _threading.Lock()
+        # Phase C fix — Step 1 web token cache fields (see client.py).
+        self._step1_web_token = None
+        self._step1_web_token_expiry = 0.0
+        # Phase C fix — default group resolver cache + lock.
+        self._resolved_default_group_id = None
+        self._default_group_lock = _threading.Lock()
+        self._rest_session = None
 
     monkeypatch.setattr(FoyerClient, "__init__", _init)
 
@@ -201,6 +213,103 @@ def empty_googlewifi(empty_foyer_client: None) -> None:
 def missing_googlewifi(missing_extras: None) -> None:
     """Phase B compat alias for ``missing_extras``."""
     return None
+
+
+# ---------------------------------------------------------------------------
+# Phase C — REST seam fakes. Action verb tests mock ``_rest`` (and
+# ``_wait_for_operation`` for speedtest run) directly so the test never
+# touches the OAuth chain or HTTP transport.
+# ---------------------------------------------------------------------------
+
+
+class _RestRecorder:
+    """Records each ``_rest`` call and returns canned responses.
+
+    Tests construct a recorder, register canned responses keyed by
+    ``(method, path)`` (path matches by exact equality or by prefix
+    when registered with a trailing ``*``), then assert against
+    ``recorder.calls`` after invoking the verb. Unmatched calls
+    return ``None`` (success-with-empty-body).
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+        self._responses: dict[str, Any] = {}
+
+    def register(self, method: str, path: str, response: Any) -> None:
+        self._responses[f"{method} {path}"] = response
+
+    def __call__(
+        self,
+        client: FoyerClient,
+        method: str,
+        path: str,
+        *,
+        json: Any = None,
+        params: dict[str, Any] | None = None,
+    ) -> Any:
+        self.calls.append({"method": method, "path": path, "json": json, "params": params})
+        key = f"{method} {path}"
+        if key in self._responses:
+            return self._responses[key]
+        # Prefix match — used for the speedtest history endpoint where
+        # the test doesn't care about the exact maxResultCount param.
+        for k, v in self._responses.items():
+            if k.endswith("*") and key.startswith(k[:-1]):
+                return v
+        return None
+
+
+@pytest.fixture
+def fake_rest_client(monkeypatch: pytest.MonkeyPatch) -> _RestRecorder:
+    """Patch FoyerClient._rest to record calls + serve canned responses.
+
+    Tests construct ``FoyerClient(_make_v3_creds())`` after this fixture
+    runs; both the constructor probe and the OnHub OAuth chain are
+    bypassed (the recorder feeds tokens-don't-matter responses). All
+    eight Phase C REST verbs route through ``_rest`` so this single
+    seam covers them.
+    """
+    _patch_skip_extras_check(monkeypatch)
+    recorder = _RestRecorder()
+
+    def _rest_proxy(
+        self: FoyerClient,
+        method: str,
+        path: str,
+        *,
+        json: Any = None,
+        params: dict[str, Any] | None = None,
+    ) -> Any:
+        return recorder(self, method, path, json=json, params=params)
+
+    monkeypatch.setattr(FoyerClient, "_rest", _rest_proxy)
+    return recorder
+
+
+@pytest.fixture
+def make_v3_creds(make_v2_creds: Any) -> Any:
+    """Factory for v3 WifiCredentials carrying a refresh_token.
+
+    Mirrors ``make_v2_creds`` — call it as ``make_v3_creds()`` to get a
+    fresh record. Used by Phase C action-verb tests that need the
+    ``refresh_token`` field populated to avoid the bootstrap-hint exit
+    path inside the OnHub mint code.
+    """
+
+    def _factory(refresh_token: str = "1//09abc-DEF") -> WifiCredentials:
+        base = _make_v2_creds()
+        return WifiCredentials(
+            version=3,
+            type=base.type,
+            google_account_email=base.google_account_email,
+            master_token=base.master_token,
+            android_id=base.android_id,
+            issued_at=base.issued_at,
+            refresh_token=refresh_token,
+        )
+
+    return _factory
 
 
 # ---------------------------------------------------------------------------

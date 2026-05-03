@@ -53,12 +53,17 @@ Failure mapping
 
 from __future__ import annotations
 
+import random
+import threading
 import time
 from typing import Any, Literal, cast
+
+import requests
 
 from nest_cli.auth.wifi_types import WifiCredentials
 from nest_cli.errors import (
     EXIT_AUTH_ERROR,
+    EXIT_CONFIG_ERROR,
     EXIT_DEVICE_ERROR,
     EXIT_NETWORK_ERROR,
     EXIT_NOT_FOUND,
@@ -95,6 +100,51 @@ ROUTER_DEVICE_TYPE = "action.devices.types.ROUTER"
 # StructuredError discriminator for every wifi-side error envelope (SRD §11.3).
 WIFI_FAMILY: Literal["wifi"] = "wifi"
 
+# ---------------------------------------------------------------------------
+# Phase C — OnHub-scoped OAuth + REST constants
+# ---------------------------------------------------------------------------
+#
+# The Phase B gpsoauth path mints an access token bound to the Google Home
+# Android app, which Foyer's gRPC HomeGraph endpoint accepts. Foyer's REST
+# action endpoints at ``/v2/groups/...`` reject that token; they require an
+# OnHub-scoped access token derived through a two-step OAuth chain rooted
+# in a standard Google OAuth refresh token (the value persisted by
+# ``auth wifi-refresh-bootstrap`` into v3 WifiCredentials).
+#
+# Step 1 exchanges the refresh token for a "web" access token via the
+# generic ``oauth2/v4/token`` endpoint, signed with the public OnHub web
+# OAuth client_id.
+#
+# Step 2 uses that web token to mint an OnHub-app-scoped access token via
+# ``oauthaccountmanager.googleapis.com/v1/issuetoken``. The resulting token
+# carries the ``accesspoints`` + ``clouddevices`` scopes Foyer's REST verbs
+# require. Cached with the same 60-second skew window the gRPC path uses.
+
+ONHUB_OAUTH2_TOKEN_URL = "https://www.googleapis.com/oauth2/v4/token"
+ONHUB_ISSUETOKEN_URL = "https://oauthaccountmanager.googleapis.com/v1/issuetoken"
+
+# Google Wifi web OAuth client_id — public, embedded in AngeloD2022's
+# onhubauthhelper and djtimca/googlewifi-api. Step 1 signs with this.
+ONHUB_WEB_CLIENT_ID = "936475272427.apps.googleusercontent.com"
+
+# OnHub Android app id + signing client_id. Step 2 mints with these.
+ONHUB_APP_ID = "com.google.OnHub"
+ONHUB_APP_CLIENT_ID = "586698244315-vc96jg3mn4nap78iir799fc2ll3rk18s.apps.googleusercontent.com"
+ONHUB_SCOPES = (
+    "https://www.googleapis.com/auth/accesspoints https://www.googleapis.com/auth/clouddevices"
+)
+
+# Foyer REST base. Same host as the gRPC service, different protocol.
+FOYER_REST_BASE = "https://googlehomefoyer-pa.googleapis.com"
+
+# Async operation poll interval + default ceiling.
+_OPERATION_POLL_INTERVAL_S = 5.0
+_DEFAULT_OPERATION_TIMEOUT_S = 180.0
+# PR #9 review fix #3 — terminal failure states the poller must
+# recognize so a server-side hardware failure surfaces immediately
+# instead of looping until the operator-level timeout trips.
+_OPERATION_TERMINAL_FAILED_STATES: frozenset[str] = frozenset({"FAILED", "CANCELLED", "ERROR"})
+
 
 # ---------------------------------------------------------------------------
 # Hint strings
@@ -113,6 +163,21 @@ _PHASE_C_HINT = (
     "guest/list-clients) are deferred to Phase C, which will map the "
     "specific Foyer RPCs. File an issue at "
     "https://github.com/agileguy/nest-cli/issues if you need a specific verb."
+)
+
+_REFRESH_TOKEN_HINT = (
+    "Run `nest-cli auth wifi-refresh-bootstrap --experimental-wifi "
+    "--refresh-token <1//...>` to upgrade the credentials file to v3 "
+    "with a Google OAuth refresh token. Foyer REST endpoints at "
+    "`/v2/groups/...` need an OnHub-scoped access token that the Phase B "
+    "gpsoauth path cannot mint."
+)
+
+_PHASE_D_HINT = (
+    "Deferred to Phase D: the request body schema for this verb is "
+    "undocumented and the risk of corrupting station/group config "
+    "is too high to ship without a tested mapping. Track at "
+    "https://github.com/agileguy/nest-cli/issues if you need this verb."
 )
 
 
@@ -184,6 +249,33 @@ class FoyerClient:
         self._creds = creds
         self._access_token: str | None = None
         self._access_token_expiry: float = 0.0
+        # Phase C: OnHub-scoped REST token cache + lock. Distinct from the
+        # gRPC access token above because the two scopes are non-overlapping
+        # (HomeGraph gRPC accepts the gpsoauth-minted token; the v2 REST
+        # endpoints reject it). The lock prevents two concurrent action
+        # verbs from racing the two-step OAuth chain twice.
+        self._onhub_token: str | None = None
+        self._onhub_token_expiry: float = 0.0
+        self._onhub_token_lock = threading.Lock()
+        # Phase C fix — Step 1 web token cached separately from the
+        # OnHub token so a Step 2 failure (4xx/5xx/timeout) doesn't
+        # force the next call to re-burn refresh-token quota by
+        # re-running Step 1. Cache lives inside ``_onhub_token_lock``.
+        self._step1_web_token: str | None = None
+        self._step1_web_token_expiry: float = 0.0
+        # Phase C fix — per-account default mesh group id, resolved
+        # lazily via ``_resolve_default_group_id`` on the first action
+        # verb that needs it (pause/unpause/prioritize). Cached for the
+        # lifetime of the client. A separate lock from the OnHub one
+        # because the resolver calls ``list_groups`` (gRPC HomeGraph),
+        # which is unrelated to the OnHub OAuth chain — and reusing
+        # ``_onhub_token_lock`` would deadlock if any future code path
+        # called the resolver from inside the OnHub mint.
+        self._resolved_default_group_id: str | None = None
+        self._default_group_lock = threading.Lock()
+        # requests.Session reused across REST calls so HTTPS connection
+        # pooling kicks in. Tests monkey-patch _rest itself, not the session.
+        self._rest_session: requests.Session | None = None
 
     # ------------------------------------------------------------------
     # Public surface — read verbs (Phase B)
@@ -288,38 +380,171 @@ class FoyerClient:
         )
 
     # ------------------------------------------------------------------
-    # Action verbs — Phase B exit-5 stubs (Phase C will map RPCs)
+    # Action verbs — Phase C: real Foyer REST implementations
     # ------------------------------------------------------------------
 
     def list_clients(self, group_id: str) -> list[WifiClient]:
         """Return every connected client in ``group_id`` (FR-WIFI-3).
 
-        Phase B status: ``GetHomeGraph`` does not include connected-client
-        records (only routers and devices the home shows); the Foyer RPC
-        for connected wifi stations has not yet been mapped. Surface a
-        clean exit-5 with hint until Phase C lands the right call.
+        Calls ``GET /v2/groups/{gid}/stations`` and projects each station
+        record onto a ``WifiClient``. Returns an empty list if the group
+        has no connected stations. 404 from Foyer (group id wrong) maps
+        to ``EXIT_NOT_FOUND`` family=wifi via ``_rest``.
         """
-        raise self._unsupported("wifi list-clients", group_id=group_id)
+        payload = self._rest("GET", f"/v2/groups/{group_id}/stations")
+        stations = (payload or {}).get("stations") or []
+        clients: list[WifiClient] = []
+        for record in stations:
+            try:
+                clients.append(WifiClient.from_googlewifi_response(record))
+            except (KeyError, TypeError, ValueError) as exc:
+                raise self._upstream_shape_error(
+                    "REST GET /v2/groups/{gid}/stations",
+                    f"normalizing station: {exc}",
+                ) from exc
+        return sorted(clients, key=lambda c: c.id)
 
-    def pause_station(self, client_id: str) -> None:
-        """Pause the named client (FR-WIFI-4) — deferred to Phase C."""
-        raise self._unsupported("wifi pause", client_id=client_id)
+    def pause_station(self, client_id: str, *, group_id: str | None = None) -> None:
+        """Pause the named client at the AP (FR-WIFI-4).
 
-    def unpause_station(self, client_id: str) -> None:
-        """Unpause the named client (FR-WIFI-5) — deferred to Phase C."""
-        raise self._unsupported("wifi unpause", client_id=client_id)
+        Implemented via ``PUT /v2/groups/{gid}/stationBlocking`` with
+        ``{stationId, blocked: "true"}``. When ``group_id`` is omitted the
+        client resolves it via ``_resolve_default_group_id`` — a clean
+        exit-6 fires for multi-group accounts (the operator must wait for
+        Phase C.1's ``--group`` flag, or pin to a single group server-side).
+        """
+        resolved = group_id if group_id is not None else self._resolve_default_group_id()
+        self._station_blocking(client_id, group_id=resolved, blocked=True)
 
-    def prioritize_station(self, client_id: str, duration_minutes: int) -> None:
-        """Prioritize the named client (FR-WIFI-6) — deferred to Phase C."""
-        raise self._unsupported(
-            "wifi prioritize",
-            client_id=client_id,
-            duration_minutes=duration_minutes,
+    def unpause_station(self, client_id: str, *, group_id: str | None = None) -> None:
+        """Unblock the named client (FR-WIFI-5).
+
+        Same group-resolution semantics as ``pause_station``.
+        """
+        resolved = group_id if group_id is not None else self._resolve_default_group_id()
+        self._station_blocking(client_id, group_id=resolved, blocked=False)
+
+    def _station_blocking(self, client_id: str, *, group_id: str, blocked: bool) -> None:
+        """Shared body for pause/unpause — PUT stationBlocking with the flag.
+
+        ``group_id`` is the resolved mesh group id (caller is responsible
+        for resolving via ``_resolve_default_group_id`` or passing an
+        explicit value). The path is parameterized so multi-group accounts
+        target the right mesh once a ``--group`` flag lands (Phase C.1).
+        """
+        self._rest(
+            "PUT",
+            f"/v2/groups/{group_id}/stationBlocking",
+            json={
+                "stationId": client_id,
+                "blocked": "true" if blocked else "false",
+            },
         )
 
+    def prioritize_station(
+        self,
+        client_id: str,
+        duration_minutes: int,
+        *,
+        group_id: str | None = None,
+    ) -> None:
+        """Prioritize the named client for ``duration_minutes`` (FR-WIFI-6).
+
+        Implemented via ``PUT /v2/groups/{gid}/prioritizedStation`` with
+        ``{stationId, prioritizationEndTime: <ISO8601-Z>}``. Foyer
+        computes the effective end time at the router; we send the
+        absolute timestamp so the operator's intent is unambiguous even
+        if the local clock and the router clock disagree by a minute or
+        two. When ``group_id`` is omitted the client resolves it via
+        ``_resolve_default_group_id``.
+        """
+        from datetime import UTC as _UTC
+        from datetime import datetime as _datetime
+        from datetime import timedelta as _timedelta
+
+        resolved = group_id if group_id is not None else self._resolve_default_group_id()
+        end = _datetime.now(_UTC) + _timedelta(minutes=duration_minutes)
+        end_iso = end.isoformat().replace("+00:00", "Z")
+        self._rest(
+            "PUT",
+            f"/v2/groups/{resolved}/prioritizedStation",
+            json={
+                "stationId": client_id,
+                "prioritizationEndTime": end_iso,
+            },
+        )
+
+    def _resolve_default_group_id(self) -> str:
+        """Return the operator's single mesh group id, or fail cleanly.
+
+        Action verbs need to target a specific mesh group's REST path
+        (``/v2/groups/{gid}/...``). Phase C ships without a ``--group``
+        flag, so we infer the target by listing the operator's groups and
+        accepting only the single-group case. Multi-group accounts get a
+        clean exit-6 + hint pointing at the Phase C.1 follow-up; zero-group
+        accounts get exit-4 (refresh-token scope or ownership issue).
+
+        The result is cached on the instance under
+        ``_default_group_lock`` so concurrent fan-out workers reuse it
+        without paying multiple ``GetHomeGraph`` round-trips. The lock is
+        intentionally distinct from ``_onhub_token_lock`` because
+        ``list_groups`` routes through the gRPC HomeGraph path (unrelated
+        to OnHub OAuth) — sharing the OnHub lock would deadlock if any
+        future code path called the resolver from inside the OnHub mint.
+        """
+        if not self._creds.refresh_token:
+            raise StructuredError(
+                code=EXIT_AUTH_ERROR,
+                message=(
+                    "REST action verbs require a v3 credentials file with a "
+                    "refresh_token; current credentials are v"
+                    f"{self._creds.version} with refresh_token=None"
+                ),
+                hint=_REFRESH_TOKEN_HINT,
+                family=WIFI_FAMILY,
+            )
+
+        with self._default_group_lock:
+            if self._resolved_default_group_id is not None:
+                return self._resolved_default_group_id
+
+            groups = self.list_groups()
+            count = len(groups)
+            if count == 1:
+                self._resolved_default_group_id = groups[0].id
+                return self._resolved_default_group_id
+            if count == 0:
+                raise StructuredError(
+                    code=EXIT_NOT_FOUND,
+                    message="no wifi groups visible to this account",
+                    hint=(
+                        "Verify your refresh token has accesspoints scope "
+                        "and you own at least one Nest Wifi mesh."
+                    ),
+                    family=WIFI_FAMILY,
+                )
+            raise StructuredError(
+                code=EXIT_CONFIG_ERROR,
+                message=(
+                    f"account has {count} wifi groups; per-station verbs need an explicit group"
+                ),
+                hint=(
+                    "Phase C.1 will add --group; for now use 'wifi list "
+                    "groups' to confirm and re-run after pinning a single "
+                    "group server-side."
+                ),
+                family=WIFI_FAMILY,
+            )
+
     def set_station_group(self, client_id: str, group: str | None) -> None:
-        """Assign the client to a Foyer group (FR-WIFI-7) — deferred to Phase C."""
-        raise self._unsupported(
+        """Assign the client to a Foyer group (FR-WIFI-7) — deferred to Phase D.
+
+        The Foyer endpoint exists at ``POST /v2/groups/{gid}/stationSets``
+        but the request body schema is not publicly documented. Shipping
+        a guess risks corrupting the operator's station-set configuration,
+        so this verb stays exit-5 with a hint pointing at Phase D.
+        """
+        raise self._deferred_phase_d(
             "wifi group-assign",
             client_id=client_id,
             requested_group=group,
@@ -331,37 +556,95 @@ class FoyerClient:
         *,
         timeout_s: float = 180.0,
     ) -> SpeedTest:
-        """Trigger a fresh speed test (FR-WIFI-8) — deferred to Phase C.
+        """Trigger a fresh speed test and return the result (FR-WIFI-8).
 
-        ``timeout_s`` is captured into the error envelope's ``details``
-        so the post-Phase-C signature lands without a CLI flag wiring
-        change. The value is not used at runtime today.
+        Three round-trips:
+
+        1. POST ``/v2/groups/{gid}/wanSpeedTest`` to kick off the test.
+           Response carries an ``operationId`` we poll on.
+        2. Poll ``/v2/operations/{operationId}`` every 5s until
+           ``operationState == "DONE"`` or ``timeout_s`` trips.
+        3. GET ``/v2/groups/{gid}/speedTestResults?maxResultCount=1`` to
+           fetch the freshest result and project it onto a SpeedTest record.
         """
-        raise self._unsupported(
-            "wifi speedtest run",
-            group_id=group_id,
-            timeout_s=timeout_s,
+        kickoff = self._rest("POST", f"/v2/groups/{group_id}/wanSpeedTest", json={})
+        operation_id = (kickoff or {}).get("operationId")
+        if not operation_id:
+            raise self._upstream_shape_error(
+                "REST POST /v2/groups/{gid}/wanSpeedTest",
+                f"response missing operationId (body={kickoff!r})",
+            )
+        self._wait_for_operation(operation_id, timeout_s=timeout_s)
+
+        history = self._rest(
+            "GET",
+            f"/v2/groups/{group_id}/speedTestResults",
+            params={"maxResultCount": 1},
         )
+        results = (history or {}).get("results") or []
+        if not results:
+            raise self._upstream_shape_error(
+                "REST GET /v2/groups/{gid}/speedTestResults",
+                "operation completed but no results returned",
+            )
+        return SpeedTest.from_googlewifi_response(group_id=group_id, payload=results[0])
 
     def get_speedtest_history(self, group_id: str, *, limit: int) -> list[SpeedTest]:
-        """Return speed-test history (FR-WIFI-9) — deferred to Phase C."""
-        raise self._unsupported(
-            "wifi speedtest history",
-            group_id=group_id,
-            limit=limit,
+        """Return up to ``limit`` recent speed-test results (FR-WIFI-9).
+
+        GET ``/v2/groups/{gid}/speedTestResults?maxResultCount={limit}``.
+        Empty list if the router has no history. Each result projects
+        through ``SpeedTest.from_googlewifi_response``.
+        """
+        payload = self._rest(
+            "GET",
+            f"/v2/groups/{group_id}/speedTestResults",
+            params={"maxResultCount": limit},
         )
+        results = (payload or {}).get("results") or []
+        out: list[SpeedTest] = []
+        for record in results:
+            try:
+                out.append(SpeedTest.from_googlewifi_response(group_id=group_id, payload=record))
+            except (KeyError, TypeError, ValueError) as exc:
+                raise self._upstream_shape_error(
+                    "REST GET /v2/groups/{gid}/speedTestResults",
+                    f"normalizing result: {exc}",
+                ) from exc
+        return out
 
     def reboot_point(self, point_id: str) -> None:
-        """Reboot a single point (FR-WIFI-10) — deferred to Phase C."""
-        raise self._unsupported("wifi reboot point", point_id=point_id)
+        """Reboot a single mesh point (FR-WIFI-10).
+
+        POST ``/v2/accesspoints/{apId}/reboot`` with an empty body.
+        Foyer returns 204 on success. Unknown ap id → EXIT_NOT_FOUND.
+        """
+        self._rest("POST", f"/v2/accesspoints/{point_id}/reboot", json={})
 
     def reboot_group(self, group_id: str) -> list[str]:
-        """Reboot every point in a group (FR-WIFI-11) — deferred to Phase C."""
-        raise self._unsupported("wifi reboot group", group_id=group_id)
+        """Reboot every point in a mesh group (FR-WIFI-11).
+
+        POST ``/v2/groups/{gid}/reboot`` with an empty body. We list the
+        points first so the response payload contains the list of points
+        actually rebooted (matches the Phase B CLI shape that already
+        exists at ``wifi reboot group``). list_points uses the gRPC seam,
+        which works on v2 and v3 credentials alike.
+        """
+        points = self.list_points(group_id)
+        self._rest("POST", f"/v2/groups/{group_id}/reboot", json={})
+        return [p.id for p in points]
 
     def set_guest_enabled(self, group_id: str, *, enabled: bool) -> None:
-        """Toggle the guest network (FR-WIFI-14) — deferred to Phase C."""
-        raise self._unsupported(
+        """Toggle the guest network (FR-WIFI-14) — deferred to Phase D.
+
+        The Foyer endpoint exists at
+        ``PUT /v2/groups/{gid}/guestWirelessConfig`` but the body shape
+        (SSID + password preservation rules + per-band enables) is not
+        publicly documented. A guess risks nuking the guest network's
+        SSID or password, so this verb stays exit-5 with a hint pointing
+        at Phase D.
+        """
+        raise self._deferred_phase_d(
             "wifi guest enable/disable",
             group_id=group_id,
             requested_enabled=enabled,
@@ -407,8 +690,7 @@ class FoyerClient:
             raise StructuredError(
                 code=EXIT_AUTH_ERROR,
                 message=(
-                    "gpsoauth.perform_oauth did not return an access token "
-                    f"(Error={err_blob!r})"
+                    f"gpsoauth.perform_oauth did not return an access token (Error={err_blob!r})"
                 ),
                 hint=(
                     "The Android master token is invalid, expired, or paired "
@@ -514,12 +796,390 @@ class FoyerClient:
             ) from exc
 
     # ------------------------------------------------------------------
+    # Internals — Phase C: OnHub OAuth + REST transport
+    # ------------------------------------------------------------------
+
+    def _redact_secrets(self, text: str) -> str:
+        """Best-effort redaction of credentials before they touch error messages.
+
+        Google's OAuth error responses can echo back the bearer header or
+        the refresh_token under some upstream conditions. Before any
+        Google-supplied error body is included in a ``StructuredError``
+        message, run it through this method so the operator's tokens
+        never leak to stderr / structured-error JSON / shell history.
+
+        Replaces the refresh token, the cached Step 1 web token, and
+        the cached OnHub token with stable redaction sentinels so the
+        rest of the diagnostic body remains useful (HTTP status text,
+        upstream error codes, etc.).
+        """
+        redacted = text
+        if self._creds.refresh_token:
+            redacted = redacted.replace(
+                self._creds.refresh_token,
+                "<redacted-refresh-token>",
+            )
+        if self._step1_web_token:
+            redacted = redacted.replace(
+                self._step1_web_token,
+                "<redacted-web-token>",
+            )
+        if self._onhub_token:
+            redacted = redacted.replace(
+                self._onhub_token,
+                "<redacted-onhub-token>",
+            )
+        return redacted
+
+    def _refresh_onhub_access_token(self) -> str:
+        """Mint a fresh OnHub-scoped access token via the two-step OAuth chain.
+
+        Step 1: POST ``oauth2/v4/token`` with the operator's refresh token,
+        signed against the public OnHub web client_id, returning a generic
+        Google "web" access token.
+
+        Step 2: POST ``oauthaccountmanager/v1/issuetoken`` bearer-authed with
+        the Step 1 token, claiming the OnHub Android app id + scopes
+        (``accesspoints`` + ``clouddevices``), returning the OnHub-scoped
+        access token Foyer's REST endpoints accept.
+
+        The two-step is what AngeloD2022/onhubauthhelper and
+        djtimca/googlewifi-api both use; the gRPC HomeGraph token cannot
+        be substituted (different scopes).
+
+        Caches each step's token separately with the same 60-second skew
+        window. The Step 1 web token is cached so a Step 2 failure
+        (4xx/5xx/timeout) doesn't force the next attempt to re-burn
+        refresh-token quota by re-running Step 1. Serialized via
+        ``_onhub_token_lock`` so two action verbs racing don't both pay
+        the round-trips.
+        """
+        with self._onhub_token_lock:
+            # Re-check inside the lock — another thread may have just
+            # refreshed while we were waiting on the lock.
+            now = time.time()
+            if self._onhub_token is not None and now < self._onhub_token_expiry:
+                return self._onhub_token
+
+            if not self._creds.refresh_token:
+                raise StructuredError(
+                    code=EXIT_AUTH_ERROR,
+                    message=(
+                        "Foyer REST verbs require a v3 credentials file with a "
+                        "refresh_token; current credentials are v"
+                        f"{self._creds.version} with refresh_token=None"
+                    ),
+                    hint=_REFRESH_TOKEN_HINT,
+                    family=WIFI_FAMILY,
+                )
+
+            session = self._get_rest_session()
+
+            # --- Step 1: refresh-token → web access token ----------------
+            # Skip Step 1 if we already have a non-expired web token cached
+            # from a previous call where Step 2 failed (or where Step 2
+            # succeeded and the OnHub token has since expired but the web
+            # token hasn't). This is the PR #9 review fix #2: don't waste
+            # refresh-token quota re-running Step 1 when Step 2 is what
+            # failed.
+            if self._step1_web_token is not None and time.time() < self._step1_web_token_expiry:
+                web_token = self._step1_web_token
+            else:
+                try:
+                    step1 = session.post(
+                        ONHUB_OAUTH2_TOKEN_URL,
+                        data={
+                            "client_id": ONHUB_WEB_CLIENT_ID,
+                            "grant_type": "refresh_token",
+                            "refresh_token": self._creds.refresh_token,
+                        },
+                        timeout=20,
+                    )
+                except (requests.ConnectionError, requests.Timeout, OSError) as exc:
+                    raise StructuredError(
+                        code=EXIT_NETWORK_ERROR,
+                        message=(
+                            f"network error contacting oauth2/v4/token: {type(exc).__name__}: {exc}"
+                        ),
+                        hint="Check your internet connection and retry.",
+                        family=WIFI_FAMILY,
+                    ) from exc
+                if step1.status_code >= 400:
+                    body_excerpt = self._redact_secrets(step1.text[:200])
+                    raise StructuredError(
+                        code=EXIT_AUTH_ERROR,
+                        message=(
+                            "oauth2/v4/token rejected the refresh token "
+                            f"(HTTP {step1.status_code}): {body_excerpt}"
+                        ),
+                        hint=(
+                            "The OAuth refresh token is invalid, expired, or "
+                            "revoked. Re-run `nest-cli auth wifi-refresh-bootstrap "
+                            "--experimental-wifi --refresh-token <1//...>` with a "
+                            "freshly minted token."
+                        ),
+                        family=WIFI_FAMILY,
+                    )
+                try:
+                    step1_body = step1.json()
+                    web_token = str(step1_body["access_token"])
+                    step1_expires_in = int(step1_body.get("expires_in", ACCESS_TOKEN_DURATION_S))
+                except (ValueError, KeyError) as exc:
+                    body_excerpt = self._redact_secrets(step1.text[:200])
+                    raise StructuredError(
+                        code=EXIT_AUTH_ERROR,
+                        message=(
+                            f"oauth2/v4/token response missing access_token (body={body_excerpt})"
+                        ),
+                        family=WIFI_FAMILY,
+                    ) from exc
+
+                # Cache the Step 1 token with the same skew window so
+                # subsequent Step 2 retries don't re-burn refresh-token quota.
+                self._step1_web_token = web_token
+                self._step1_web_token_expiry = time.time() + step1_expires_in - ACCESS_TOKEN_SKEW_S
+
+            # --- Step 2: web token → OnHub-scoped token ------------------
+            # NOTE: any failure here (4xx/5xx/timeout) leaves
+            # ``_step1_web_token`` cached so the next call re-runs Step 2
+            # only, conserving refresh-token quota.
+            try:
+                step2 = session.post(
+                    ONHUB_ISSUETOKEN_URL,
+                    data={
+                        "app_id": ONHUB_APP_ID,
+                        "client_id": ONHUB_APP_CLIENT_ID,
+                        "scope": ONHUB_SCOPES,
+                    },
+                    headers={"Authorization": f"Bearer {web_token}"},
+                    timeout=20,
+                )
+            except (requests.ConnectionError, requests.Timeout, OSError) as exc:
+                raise StructuredError(
+                    code=EXIT_NETWORK_ERROR,
+                    message=(f"network error contacting issuetoken: {type(exc).__name__}: {exc}"),
+                    hint="Check your internet connection and retry.",
+                    family=WIFI_FAMILY,
+                ) from exc
+            if step2.status_code >= 400:
+                body_excerpt = self._redact_secrets(step2.text[:200])
+                raise StructuredError(
+                    code=EXIT_AUTH_ERROR,
+                    message=(
+                        "issuetoken rejected the OnHub mint request "
+                        f"(HTTP {step2.status_code}): {body_excerpt}"
+                    ),
+                    hint=(
+                        "The web access token from Step 1 lacks the right "
+                        "scopes, or the OnHub app_id / client_id constants "
+                        "have rotated. File a nest-cli issue if this "
+                        "persists."
+                    ),
+                    family=WIFI_FAMILY,
+                )
+            try:
+                body = step2.json()
+                onhub_token: str = str(body["token"])
+                expires_in_s = int(body.get("expiresIn", ACCESS_TOKEN_DURATION_S))
+            except (ValueError, KeyError) as exc:
+                body_excerpt = self._redact_secrets(step2.text[:200])
+                raise StructuredError(
+                    code=EXIT_AUTH_ERROR,
+                    message=(f"issuetoken response missing token (body={body_excerpt})"),
+                    family=WIFI_FAMILY,
+                ) from exc
+
+            self._onhub_token = onhub_token
+            self._onhub_token_expiry = time.time() + expires_in_s - ACCESS_TOKEN_SKEW_S
+            return onhub_token
+
+    def _ensure_onhub_token(self) -> str:
+        """Return a non-expired OnHub access token, minting one if needed."""
+        if self._onhub_token is None or time.time() >= self._onhub_token_expiry:
+            return self._refresh_onhub_access_token()
+        return self._onhub_token
+
+    def _get_rest_session(self) -> requests.Session:
+        """Lazy-construct + return the shared requests.Session for REST calls."""
+        if self._rest_session is None:
+            self._rest_session = requests.Session()
+        return self._rest_session
+
+    def _rest(
+        self,
+        method: str,
+        path: str,
+        *,
+        json: Any = None,
+        params: dict[str, Any] | None = None,
+    ) -> Any:
+        """Issue a REST call to ``FOYER_REST_BASE + path`` with OnHub auth.
+
+        Returns the JSON-decoded response body, or ``None`` for empty
+        2xx bodies (some Foyer endpoints return 204). Non-2xx responses
+        map to ``StructuredError`` with family=wifi and an exit code
+        chosen by status (401/403 → exit 2, 404 → exit 4, 5xx → exit 3,
+        anything else → exit 1).
+
+        Tests fake this method directly to avoid spinning up a real
+        HTTP transport; the verbs above call ``self._rest(...)``
+        unchanged so the production / fake split happens at one seam.
+        """
+        token = self._ensure_onhub_token()
+        url = FOYER_REST_BASE + path
+        session = self._get_rest_session()
+        try:
+            response = session.request(
+                method,
+                url,
+                json=json,
+                params=params,
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=30,
+            )
+        except (requests.ConnectionError, requests.Timeout, OSError) as exc:
+            raise StructuredError(
+                code=EXIT_NETWORK_ERROR,
+                message=(
+                    f"network error contacting Foyer REST {method} {path}: "
+                    f"{type(exc).__name__}: {exc}"
+                ),
+                hint="Check your internet connection and retry.",
+                family=WIFI_FAMILY,
+            ) from exc
+        if response.status_code >= 400:
+            raise self._rest_error(method, path, response)
+        if not response.content:
+            return None
+        try:
+            return response.json()
+        except ValueError as exc:
+            raise self._upstream_shape_error(
+                f"REST {method} {path}",
+                f"non-JSON response: {response.text[:200]}",
+            ) from exc
+
+    def _wait_for_operation(
+        self,
+        operation_id: str,
+        *,
+        timeout_s: float = _DEFAULT_OPERATION_TIMEOUT_S,
+    ) -> Any:
+        """Poll ``/v2/operations/{id}`` until ``operationState=DONE`` or timeout.
+
+        Returns the final operation payload. Used by ``run_speedtest``,
+        which kicks off an async wanSpeedTest operation server-side.
+
+        Loop ordering (PR #9 review fix #3): poll FIRST, then check
+        terminal states, then check the deadline, then sleep with jitter.
+        This guarantees a fast operation (e.g. a 2-second server-side
+        speedtest) is observed on the first iteration without a
+        five-second blind spot.
+
+        Failure modes:
+        - ``DONE`` → return the payload.
+        - ``FAILED`` / ``CANCELLED`` / ``ERROR`` (the terminal-failure
+          states) → raise ``EXIT_DEVICE_ERROR`` immediately rather than
+          looping until ``timeout_s`` trips. Foyer reported an upstream
+          failure; spinning is wasted polling.
+        - Timeout → raise ``EXIT_NETWORK_ERROR``. The operation may still
+          complete server-side; the operator can re-poll via
+          ``wifi speedtest history`` once it does.
+
+        Sleep jitter (``random.uniform(0, 1.0)``) added to
+        ``_OPERATION_POLL_INTERVAL_S`` so two clients polling the same
+        operation don't synchronize their requests on the same 5-second
+        boundary (thundering-herd mitigation).
+        """
+        deadline = time.time() + timeout_s
+        while True:
+            payload = self._rest("GET", f"/v2/operations/{operation_id}")
+            state = (payload or {}).get("operationState")
+            if state == "DONE":
+                return payload
+            if isinstance(state, str) and state in _OPERATION_TERMINAL_FAILED_STATES:
+                raise StructuredError(
+                    code=EXIT_DEVICE_ERROR,
+                    message=f"operation {operation_id} ended in state {state}",
+                    hint=(
+                        "The Foyer operation reported an upstream failure; "
+                        "rerun and check 'wifi speedtest history' for prior "
+                        "results."
+                    ),
+                    family=WIFI_FAMILY,
+                )
+            if time.time() >= deadline:
+                raise StructuredError(
+                    code=EXIT_NETWORK_ERROR,
+                    message=(
+                        f"operation {operation_id} did not complete within "
+                        f"{timeout_s:.0f}s (last state: {state!r})"
+                    ),
+                    hint=(
+                        "Re-run with --timeout <larger>, or check "
+                        "`wifi speedtest history` later — the operation may "
+                        "still complete server-side."
+                    ),
+                    family=WIFI_FAMILY,
+                )
+            time.sleep(_OPERATION_POLL_INTERVAL_S + random.uniform(0, 1.0))
+
+    @staticmethod
+    def _rest_error(method: str, path: str, response: Any) -> StructuredError:
+        """Map a non-2xx REST response to a StructuredError.
+
+        Status mapping:
+        - 401/403 → EXIT_AUTH_ERROR (operator re-runs wifi-refresh-bootstrap)
+        - 404     → EXIT_NOT_FOUND  (group/AP/station id wrong)
+        - 5xx     → EXIT_NETWORK_ERROR (transient upstream)
+        - other   → EXIT_DEVICE_ERROR (Foyer-shape rotation, SRD §3.2.3)
+        """
+        status = response.status_code
+        body = response.text[:200] if hasattr(response, "text") else ""
+        if status in (401, 403):
+            return StructuredError(
+                code=EXIT_AUTH_ERROR,
+                message=(f"Foyer REST {method} {path} returned HTTP {status}: {body}"),
+                hint=(
+                    "The OnHub access token was rejected. Re-run "
+                    "`nest-cli auth wifi-refresh-bootstrap --experimental-wifi "
+                    "--refresh-token <1//...>` with a freshly minted token."
+                ),
+                family=WIFI_FAMILY,
+            )
+        if status == 404:
+            return StructuredError(
+                code=EXIT_NOT_FOUND,
+                message=(f"Foyer REST {method} {path} returned 404: {body}"),
+                hint=(
+                    "Check the group / point / station id. Run "
+                    "`wifi list groups --experimental-wifi` to enumerate."
+                ),
+                family=WIFI_FAMILY,
+            )
+        if status >= 500:
+            return StructuredError(
+                code=EXIT_NETWORK_ERROR,
+                message=(f"Foyer REST {method} {path} returned HTTP {status}: {body}"),
+                hint="Foyer reported an upstream error; retry in a few seconds.",
+                family=WIFI_FAMILY,
+            )
+        return StructuredError(
+            code=EXIT_DEVICE_ERROR,
+            message=(f"Foyer REST {method} {path} returned unexpected HTTP {status}: {body}"),
+            hint=(
+                "Foyer surfaced an unexpected status code. This may indicate "
+                "an upstream-shape rotation (SRD §3.2.3); check the nest-cli "
+                "issue tracker."
+            ),
+            family=WIFI_FAMILY,
+        )
+
+    # ------------------------------------------------------------------
     # Internals — error helpers
     # ------------------------------------------------------------------
 
-    def _require_group(
-        self, systems: dict[str, Any], group_id: str
-    ) -> dict[str, Any]:
+    def _require_group(self, systems: dict[str, Any], group_id: str) -> dict[str, Any]:
         """Return ``systems[group_id]`` or raise EXIT_NOT_FOUND."""
         if group_id not in systems:
             raise StructuredError(
@@ -567,6 +1227,24 @@ class FoyerClient:
             code=EXIT_UNSUPPORTED_FEATURE,
             message=f"{verb} is not implemented in Phase B",
             hint=_PHASE_C_HINT,
+            family=WIFI_FAMILY,
+            details=details,
+        )
+
+    @staticmethod
+    def _deferred_phase_d(verb: str, **details: Any) -> StructuredError:
+        """Build a Phase-C exit-5 envelope for verbs explicitly held to Phase D.
+
+        Phase C ships REST implementations for 8 of the 10 action verbs.
+        ``set_station_group`` and ``set_guest_enabled`` are held back
+        because their Foyer request bodies are undocumented and the
+        risk of corrupting station/group config (or nuking the guest
+        SSID/password) is too high to ship a guess.
+        """
+        return StructuredError(
+            code=EXIT_UNSUPPORTED_FEATURE,
+            message=f"{verb} is deferred to Phase D",
+            hint=_PHASE_D_HINT,
             family=WIFI_FAMILY,
             details=details,
         )

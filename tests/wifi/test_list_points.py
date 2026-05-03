@@ -77,9 +77,7 @@ def test_unknown_group_exits_4(isolated_xdg: Path, fake_googlewifi: type) -> Non
     assert "wifi" in err_text
 
 
-def test_upstream_shape_rotation_exits_1(
-    isolated_xdg: Path, rotated_foyer_client: None
-) -> None:
+def test_upstream_shape_rotation_exits_1(isolated_xdg: Path, rotated_foyer_client: None) -> None:
     """If Foyer returns a non-dict shape, exit 1 (device_error, family=wifi).
 
     Phase B injects the rotation via the ``rotated_foyer_client`` fixture,

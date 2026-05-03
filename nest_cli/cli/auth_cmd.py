@@ -86,6 +86,14 @@ _ENV_MASTER_TOKEN = "GOOGLE_ANDROID_MASTER_TOKEN"
 _ENV_ANDROID_ID = "GOOGLE_ANDROID_ID"
 _ANDROID_ID_PATTERN = re.compile(r"^[0-9a-f]{16}$")
 
+# Phase C: ``auth wifi-refresh-bootstrap`` accepts a Google OAuth refresh
+# token via flag, env, or interactive stdin prompt. The token shape is
+# the standard Google form ``1//<chars>`` — we validate the prefix +
+# allowed character set so a paste error surfaces cleanly as exit 6
+# rather than as an opaque OAuth failure later.
+_ENV_REFRESH_TOKEN = "GOOGLE_REFRESH_TOKEN"
+_REFRESH_TOKEN_PATTERN = re.compile(r"^1//[\w-]+$")
+
 
 def _redact_client_id(client_id: str) -> str:
     """Redact all but the trailing 8 characters (auth status output only)."""
@@ -456,6 +464,8 @@ def _build_wifi_status_record(output_mode: OutputMode) -> dict[str, object]:
         "credentials_path": str(creds_path),
         "google_account_email": wifi_creds.google_account_email,
         "issued_at": wifi_creds.issued_at,
+        "schema_version": wifi_creds.version,
+        "refresh_token_present": wifi_creds.refresh_token is not None,
     }
 
 
@@ -788,4 +798,202 @@ def cmd_wifi_revoke(
     click.echo(WIFI_REVOCATION_REMINDER, err=True)
 
     payload = {"status": "revoked", "credentials_path": str(creds_path)}
+    emit(payload, output_mode)
+
+
+# ---------------------------------------------------------------------------
+# auth wifi-refresh-bootstrap (Phase C)
+# ---------------------------------------------------------------------------
+
+
+def _stdin_is_tty() -> bool:
+    """Return ``True`` if stdin reports as a tty.
+
+    Indirected through this helper so tests can monkeypatch the value
+    deterministically (CliRunner replaces stdin with an in-memory stream
+    whose ``isatty()`` is always False).
+    """
+    import sys
+
+    isatty = getattr(sys.stdin, "isatty", None)
+    return bool(isatty()) if callable(isatty) else False
+
+
+def _resolve_refresh_token(
+    flag_value: str | None,
+    output_mode: OutputMode,
+) -> str:
+    """Resolve a refresh token from flag → env → stdin in precedence order.
+
+    Returns the trimmed, format-validated token. Empty / non-matching
+    sources surface as exit 6 (config_error, family=wifi). Stdin is
+    only consulted when stdin is a tty (CliRunner controls this for
+    tests via the ``input=`` parameter, which makes the input non-tty
+    but still readable; click.prompt then reads from the buffer).
+    """
+    if flag_value is not None:
+        return _validate_refresh_token(
+            flag_value.strip(), source="--refresh-token", output_mode=output_mode
+        )
+
+    env_value = os.environ.get(_ENV_REFRESH_TOKEN, "").strip()
+    if env_value:
+        return _validate_refresh_token(
+            env_value, source=_ENV_REFRESH_TOKEN, output_mode=output_mode
+        )
+
+    # Last resort: prompt on stdin. ``hide_input=True`` masks the value
+    # so it doesn't echo and doesn't end up in shell history.
+    prompted = click.prompt(
+        "Google OAuth refresh token (1//...)",
+        type=str,
+        hide_input=True,
+        default="",
+        show_default=False,
+    )
+    prompted = (prompted or "").strip()
+    if not prompted:
+        exit_on_structured_error(
+            StructuredError(
+                code=EXIT_CONFIG_ERROR,
+                message="no refresh token supplied (flag, env, or stdin all empty)",
+                hint=(
+                    f"Pass --refresh-token <1//...>, set the {_ENV_REFRESH_TOKEN} env var, "
+                    "or paste the value at the prompt. See `auth wifi-refresh-bootstrap "
+                    "--help` for how to obtain one (web OAuth or AngeloD2022/onhubauthhelper)."
+                ),
+                family="wifi",
+            ),
+            output_mode,
+        )
+    return _validate_refresh_token(prompted, source="stdin", output_mode=output_mode)
+
+
+def _validate_refresh_token(value: str, *, source: str, output_mode: OutputMode) -> str:
+    """Reject a refresh token that doesn't match ``^1//[\\w-]+$``."""
+    if not _REFRESH_TOKEN_PATTERN.fullmatch(value):
+        exit_on_structured_error(
+            StructuredError(
+                code=EXIT_CONFIG_ERROR,
+                message=(
+                    f"refresh_token from {source} is not a Google OAuth refresh token "
+                    f"(expected '1//...', got {len(value)} chars starting "
+                    f"{value[:5]!r})"
+                ),
+                hint=(
+                    "Refresh tokens look like '1//09abc-DEF_xyz...'. Re-extract from "
+                    "your OAuth flow or AngeloD2022/onhubauthhelper output and retry."
+                ),
+                family="wifi",
+            ),
+            output_mode,
+        )
+    return value
+
+
+@auth_group.command("wifi-refresh-bootstrap")
+@click.option(
+    "--experimental-wifi",
+    is_flag=True,
+    default=False,
+    help="Required acknowledgement that the wifi side is experimental (FR-WIFI-0).",
+)
+@click.option(
+    "--refresh-token",
+    "refresh_token",
+    type=str,
+    default=None,
+    help=(
+        "Google OAuth refresh token (1//...). Mutually exclusive with the "
+        "GOOGLE_REFRESH_TOKEN env var and the interactive prompt; precedence: "
+        "flag > env > stdin. Obtain via the AngeloD2022/onhubauthhelper "
+        "tool or by running a manual OAuth flow against the Google Wifi web "
+        "client_id (936475272427.apps.googleusercontent.com)."
+    ),
+)
+@add_output_options
+def cmd_wifi_refresh_bootstrap(
+    experimental_wifi: bool,
+    refresh_token: str | None,
+    output_mode: OutputMode,
+) -> None:
+    """Persist an OAuth refresh token alongside an existing v2 wifi credential.
+
+    Phase C action verbs (pause, prioritize, speedtest, reboot, ...) hit
+    Foyer REST endpoints at ``/v2/groups/...`` that reject the
+    gpsoauth-minted access token used by the Phase B gRPC read path.
+    They require an OnHub-scoped access token derived through a two-step
+    OAuth chain rooted in a standard Google OAuth refresh token
+    (``1//...``). This verb persists that refresh token alongside the
+    operator's existing v2 master_token / android_id, upgrading the file
+    to schema v3 in place.
+
+    Token sources, in precedence order:
+
+    1. ``--refresh-token <1//...>`` — pass the value as a flag.
+    2. ``GOOGLE_REFRESH_TOKEN`` env var — read the token from env.
+    3. Interactive stdin prompt — last resort; uses ``getpass`` so the
+       value doesn't echo and doesn't end up in shell history.
+
+    The verb requires a pre-existing v2 credentials file (created by
+    ``auth wifi-setup``). If no v2 credentials exist, the verb exits 6
+    with a hint pointing at ``auth wifi-setup``. Existing v3 records
+    have their ``refresh_token`` field overwritten in place; the
+    ``master_token``, ``android_id``, ``google_account_email``, and
+    ``issued_at`` fields are preserved.
+
+    To obtain a refresh token: run a one-time OAuth web flow against the
+    Google Wifi web client_id ``936475272427.apps.googleusercontent.com``
+    (see Google's OAuth playground or the AngeloD2022/onhubauthhelper
+    tool on GitHub for a ready-made implementation).
+    """
+    experimental_wifi_gate_or_exit(
+        experimental_wifi, output_mode, verb="auth wifi-refresh-bootstrap"
+    )
+
+    creds_path = default_wifi_credentials_path()
+    if not creds_path.exists():
+        exit_on_structured_error(
+            StructuredError(
+                code=EXIT_CONFIG_ERROR,
+                message=f"no wifi credentials at {creds_path}",
+                hint=(
+                    "Run `nest-cli auth wifi-setup --experimental-wifi` first to "
+                    "create a v2 credentials file, then re-run this command to "
+                    "upgrade it to v3."
+                ),
+                family="wifi",
+            ),
+            output_mode,
+        )
+
+    try:
+        existing = load_wifi_credentials(creds_path)
+    except WifiCredentialError as exc:
+        exit_on_structured_error(_wifi_credential_error_to_structured(exc), output_mode)
+
+    token = _resolve_refresh_token(refresh_token, output_mode)
+
+    upgraded = WifiCredentials(
+        version=3,
+        type=existing.type,
+        google_account_email=existing.google_account_email,
+        master_token=existing.master_token,
+        android_id=existing.android_id,
+        issued_at=existing.issued_at,
+        refresh_token=token,
+    )
+
+    try:
+        save_wifi_credentials(creds_path, upgraded)
+    except WifiCredentialError as exc:
+        exit_on_structured_error(_wifi_credential_error_to_structured(exc), output_mode)
+
+    payload = {
+        "status": "ok",
+        "credentials_path": str(creds_path),
+        "version": upgraded.version,
+        "google_account_email": upgraded.google_account_email,
+        "refresh_token_present": True,
+    }
     emit(payload, output_mode)

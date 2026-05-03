@@ -234,3 +234,102 @@ class TestLocking:
         save_wifi_credentials(path, _make_creds())
         lock_sidecar = path.with_suffix(path.suffix + ".lock")
         assert lock_sidecar.exists()
+
+
+# ---------------------------------------------------------------------------
+# Phase C — schema v3 with optional refresh_token field
+# ---------------------------------------------------------------------------
+
+
+def _make_creds_v3(
+    *,
+    refresh_token: str = "1//09abc-DEF_xyz123",
+) -> WifiCredentials:
+    """Build a v3 WifiCredentials carrying both master_token and refresh_token."""
+    return WifiCredentials(
+        version=3,
+        type="foyer",
+        google_account_email="operator@example.com",
+        master_token="aas_et/master-token",
+        android_id="0123456789abcdef",
+        issued_at=datetime(2026, 5, 3, 12, 0, 0, tzinfo=UTC),
+        refresh_token=refresh_token,
+    )
+
+
+class TestSchemaV3RefreshToken:
+    """Phase C bumps the schema to v3 with optional refresh_token."""
+
+    def test_v3_with_refresh_token_round_trips(self, tmp_path: Path) -> None:
+        path = tmp_path / "creds-wifi.json"
+        creds = _make_creds_v3()
+        save_wifi_credentials(path, creds)
+        loaded = load_wifi_credentials(path)
+        assert loaded.version == 3
+        assert loaded.refresh_token == "1//09abc-DEF_xyz123"
+        assert loaded.master_token == creds.master_token
+
+    def test_v2_without_refresh_token_still_loads(self, tmp_path: Path) -> None:
+        """Back-compat: v2 file (no refresh_token key) must still load."""
+        path = tmp_path / "creds-wifi.json"
+        save_wifi_credentials(path, _make_creds())
+        loaded = load_wifi_credentials(path)
+        assert loaded.version == 2
+        assert loaded.refresh_token is None
+
+    def test_v2_file_with_explicit_null_refresh_token_loads(self, tmp_path: Path) -> None:
+        """Hand-crafted v2 file with refresh_token=null must validate."""
+        path = tmp_path / "creds-wifi.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "version": 2,
+                    "type": "foyer",
+                    "google_account_email": "operator@example.com",
+                    "master_token": "aas_et/m",
+                    "android_id": "0123456789abcdef",
+                    "issued_at": "2026-05-03T12:00:00Z",
+                    "refresh_token": None,
+                }
+            ),
+            encoding="utf-8",
+        )
+        os.chmod(path, 0o600)
+        loaded = load_wifi_credentials(path)
+        assert loaded.refresh_token is None
+
+    def test_v3_serializes_refresh_token_in_json(self, tmp_path: Path) -> None:
+        path = tmp_path / "creds-wifi.json"
+        save_wifi_credentials(path, _make_creds_v3())
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        assert raw["version"] == 3
+        assert raw["refresh_token"] == "1//09abc-DEF_xyz123"
+
+    def test_invalid_refresh_token_format_rejected(self) -> None:
+        """A refresh_token not matching ^1//[\\w-]+$ fails Pydantic validation."""
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError):
+            WifiCredentials(
+                version=3,
+                type="foyer",
+                google_account_email="operator@example.com",
+                master_token="aas_et/m",
+                android_id="0123456789abcdef",
+                issued_at=datetime(2026, 5, 3, 12, 0, 0, tzinfo=UTC),
+                refresh_token="ya29.not-a-refresh-token",
+            )
+
+    def test_version_4_rejected(self) -> None:
+        """Schema only accepts version 2 or 3 — v4 must fail validation."""
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError):
+            WifiCredentials(
+                version=4,
+                type="foyer",
+                google_account_email="operator@example.com",
+                master_token="m",
+                android_id="0123456789abcdef",
+                issued_at=datetime(2026, 5, 3, 12, 0, 0, tzinfo=UTC),
+            )
