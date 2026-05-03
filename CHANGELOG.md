@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-05-03
+
 ### Added
 
 Phase 3.1 (SRD §16.5) — wifi speedtest, reboot, network info,
