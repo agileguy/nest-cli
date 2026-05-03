@@ -42,6 +42,7 @@ import click
 
 from nest_cli.cli._shared import (
     exit_on_structured_error,
+    is_group_target,
     load_credentials_or_exit,
 )
 from nest_cli.config import default_config_path, load_config, resolve_alias
@@ -102,7 +103,31 @@ def cam_stream(
     Per FR-CAM-11 the CLI does not decode/transcode/proxy video. The
     output is the operator's input to a downstream consumer
     (ffmpeg/mpv for RTSP; a WebRTC-capable peer for WebRTC).
+
+    Group targets are forbidden for ``cam stream`` (FR-8c). Streaming
+    against multiple cameras simultaneously would multiplex stream
+    metadata onto a single stdout, which downstream consumers cannot
+    demux. ``@group-name`` exits 64 immediately.
     """
+    if is_group_target(target):
+        exit_on_structured_error(
+            StructuredError(
+                code=EXIT_USAGE_ERROR,
+                message=(
+                    "cam stream does not accept group targets (FR-8c). "
+                    "Streaming is per-camera only — multiplexing multiple "
+                    "stream sessions onto one stdout would corrupt the "
+                    "downstream consumer's view."
+                ),
+                hint=(
+                    "Invoke `cam stream` against one alias at a time, or "
+                    "use `nest-cli batch` if you need to script several "
+                    "stream negotiations sequentially."
+                ),
+            ),
+            output_mode,
+        )
+
     camera, client = _fetch_camera(target, output_mode)
 
     # FR-CAM-7 does not forbid --offer-sdp on RTSP cameras; we ignore
