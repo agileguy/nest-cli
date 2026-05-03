@@ -19,6 +19,7 @@ from typing import Any
 import pytest
 
 from nest_cli.errors import (
+    EXIT_AUTH_ERROR,
     EXIT_CONFIG_ERROR,
     EXIT_NOT_FOUND,
     StructuredError,
@@ -136,3 +137,38 @@ class TestResolveDefaultGroupId:
 
         assert first == second == third == "home-mesh-001"
         assert call_count["n"] == 1
+
+    def test_v2_creds_fail_fast_with_bootstrap_hint(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        make_v2_creds: Any,
+    ) -> None:
+        """v2 creds (no refresh_token) → exit-2 + bootstrap hint, no list_groups call.
+
+        Without this pre-flight check, the resolver would proceed to
+        ``list_groups()`` (gRPC) and then fail with a master_token error
+        if the gpsoauth call returned bad data, masking the real issue
+        (the operator needs to run ``auth wifi-refresh-bootstrap``).
+        """
+        from tests.wifi.conftest import _patch_skip_extras_check  # noqa: PLC0415
+
+        _patch_skip_extras_check(monkeypatch)
+        client = FoyerClient(make_v2_creds())
+
+        list_groups_called = {"n": 0}
+
+        def _list_groups(self: FoyerClient) -> list[WifiGroup]:
+            list_groups_called["n"] += 1
+            return [_make_group("home-mesh-001")]
+
+        monkeypatch.setattr(FoyerClient, "list_groups", _list_groups)
+
+        with pytest.raises(StructuredError) as exc_info:
+            client._resolve_default_group_id()
+
+        err = exc_info.value
+        assert err.code == EXIT_AUTH_ERROR
+        assert err.family == "wifi"
+        assert "refresh_token" in err.message
+        assert "wifi-refresh-bootstrap" in (err.hint or "")
+        assert list_groups_called["n"] == 0  # short-circuited before gRPC

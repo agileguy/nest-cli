@@ -171,6 +171,13 @@ def patch_foyer_init(monkeypatch: pytest.MonkeyPatch) -> None:
         self._onhub_token_expiry = 0.0
         self._onhub_token_lock = threading.Lock()
         self._rest_session = None
+        # Phase C review fixes (PR #9): Step 1 web-token cache + default-group resolver.
+        # Pre-fill the resolved group id to "default" so existing e2e path assertions
+        # stay stable; the resolver short-circuits and never calls list_groups.
+        self._step1_web_token = None
+        self._step1_web_token_expiry = 0.0
+        self._resolved_default_group_id = "default"
+        self._default_group_lock = threading.Lock()
 
     monkeypatch.setattr(FoyerClient, "__init__", _init)
 

@@ -492,6 +492,18 @@ class FoyerClient:
         to OnHub OAuth) — sharing the OnHub lock would deadlock if any
         future code path called the resolver from inside the OnHub mint.
         """
+        if not self._creds.refresh_token:
+            raise StructuredError(
+                code=EXIT_AUTH_ERROR,
+                message=(
+                    "REST action verbs require a v3 credentials file with a "
+                    "refresh_token; current credentials are v"
+                    f"{self._creds.version} with refresh_token=None"
+                ),
+                hint=_REFRESH_TOKEN_HINT,
+                family=WIFI_FAMILY,
+            )
+
         with self._default_group_lock:
             if self._resolved_default_group_id is not None:
                 return self._resolved_default_group_id
