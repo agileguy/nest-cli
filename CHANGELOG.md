@@ -7,6 +7,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-05-03
+
+### Added
+
+Phase 3 (SRD §16.4) — wifi side gated behind `--experimental-wifi`.
+
+- `nest_cli/wifi/{client,types}.py` (new package) — `FoyerClient` sync
+  facade over `googlewifi.GoogleWifi` (lazy-imported; lives in optional
+  `[wifi]` extra). `WifiGroup` (§10.6), `WifiPoint` (§10.7),
+  `WifiClient` (§10.8) pydantic models.
+- `nest_cli/auth/wifi_credentials.py` + `wifi_types.py` (new) — wifi
+  master-token credential I/O with chmod 0600 enforce, atomic write,
+  flock-with-O_NOFOLLOW (mirrors v0.1.0 cam-side patterns).
+- `nest_cli/cli/wifi_cmd.py` (new) — `wifi` Click group with all 7 verbs.
+- `nest_cli/cli/_shared.py:experimental_wifi_gate()` — shared FR-WIFI-0
+  enforcement helper.
+- `auth wifi-setup --experimental-wifi` (FR-CRED-7) — accepts Google
+  email + Android master token via stdin / `--master-token-file` /
+  `GOOGLE_ANDROID_MASTER_TOKEN`; persists Foyer-usable token to
+  `~/.config/nest-cli/credentials-wifi.json` chmod 0600.
+- `auth wifi-revoke --experimental-wifi` (FR-CRED-9) — atomic stub-replace
+  + stderr reminder pointing at `myaccount.google.com/permissions`.
+- `auth status` (FR-CRED-10) — extended to emit a 2-element JSON array
+  with both cam and wifi family records (`configured: false` when
+  credentials absent).
+- `wifi list groups --experimental-wifi` (FR-WIFI-1).
+- `wifi list points <group> --experimental-wifi` (FR-WIFI-2).
+- `wifi list clients <group> --experimental-wifi` (FR-WIFI-3).
+- `wifi pause <client-id> --experimental-wifi` (FR-WIFI-4) — idempotent.
+- `wifi unpause <client-id> --experimental-wifi` (FR-WIFI-5) — idempotent.
+- `wifi prioritize <client-id> --duration <1..240> --experimental-wifi`
+  (FR-WIFI-6) — Google Wi-Fi boost; default 60min.
+- `wifi group-assign <client-id> --group <family|parental|guest|none>
+  --experimental-wifi` (FR-WIFI-7) — case-insensitive choice.
+- 108 new tests (219 → 327): auth-wifi I/O, FoyerClient surface, list
+  verbs, action verbs, experimental-wifi gate enforcement, chmod
+  invariants, error envelope shape, mock googlewifi corpus.
+- `pyproject.toml` `[wifi]` optional extra — `glocaltokens` + `googlewifi`
+  pinned per SRD §13.2.
+- `tests/fixtures/foyer/samples/{groups,access_points,devices}.json`
+  (new) — sanitized mock corpus.
+
+### Changed
+
+- `nest_cli/errors.py:StructuredError` — added optional
+  `family: Literal["cam", "wifi"] | None = None` field. Wifi verbs
+  emit `family="wifi"` per SRD §11.3; cam-side errors keep v0.1.0 /
+  v0.2.x back-compat (no `family` field — documented deviation in
+  ARCHITECTURE.md).
+- `auth status --json` payload changed from a 1-element array (cam
+  only) to a 2-element array (cam + wifi). Wire-level change for any
+  operator scripting against `len(...)`.
+- `docs/ARCHITECTURE.md` — documents the FR-WIFI-0 (exit 64) vs
+  SRD §11.2 (exit 5) ambiguity resolution and the family-field policy.
+
+### Deferred
+
+- `wifi speedtest run / history` (FR-WIFI-8..9) → Phase 3.1.
+- `wifi reboot point / group` (FR-WIFI-10..12) → Phase 3.1.
+- `wifi network` / `wifi guest enable|disable` (FR-WIFI-13..14) → Phase 3.1.
+- `wifi point-health` (FR-WIFI-15) → Phase 3.1.
+- Cam-side `family` field retrofit → follow-up.
+- `scripts/smoke-wifi.py` rewrite to match real `googlewifi` async API
+  (current script references methods that don't exist upstream).
+
 ## [0.2.1] - 2026-05-03
 
 ### Added
