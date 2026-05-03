@@ -31,6 +31,8 @@ longer exists → exit 4 from the SDM 404 path with a hint pointing at
 
 from __future__ import annotations
 
+from typing import Any
+
 import click
 
 from nest_cli.cli._shared import (
@@ -217,6 +219,52 @@ def cam_chime(target: str, output_mode: OutputMode) -> None:
     except StructuredError as exc:
         exit_on_structured_error(exc, output_mode)
     emit({"target": target, "command": _SDM_CMD_DOORBELL_CHIME, "result": "ok"}, output_mode)
+
+
+@cam_group.command("battery")
+@click.argument("target")
+@add_output_options
+def cam_battery(target: str, output_mode: OutputMode) -> None:
+    """Emit battery state for battery-powered cameras.
+
+    Implements FR-CAM-26. Cameras with a non-null ``battery_pct`` field
+    emit ``{target, battery_pct, is_battery_powered: true, last_event_ts}``
+    at exit 0. Cameras without battery state exit 5 with
+    ``is_battery_powered: false`` and the target name in the structured
+    error details.
+
+    SDM does not expose a documented trait for battery state; this verb
+    is gated on the parsed ``Camera.battery_pct`` field, which is
+    populated when the upstream SDM payload includes a ``battery_pct``
+    key. Today that means battery state surfaces only for hardware where
+    Google's SDM response carries it; operators with battery cams that
+    don't currently expose this field will see exit 5 honestly rather
+    than synthesized data.
+    """
+    camera = _fetch_camera(target, output_mode)
+    if camera.battery_pct is None:
+        err = StructuredError(
+            code=EXIT_UNSUPPORTED_FEATURE,
+            message=(
+                f"camera {target!r} does not expose battery state (no battery_pct in SDM response)"
+            ),
+            hint=(
+                "SDM only surfaces battery_pct for hardware that exposes it. "
+                "Run `nest-cli cam info <target>` to inspect the raw record."
+            ),
+            details={"target": target, "is_battery_powered": False},
+        )
+        exit_on_structured_error(err, output_mode)
+
+    payload: dict[str, Any] = {
+        "target": target,
+        "target_id": camera.target_id,
+        "battery_pct": camera.battery_pct,
+        "is_battery_powered": True,
+    }
+    if camera.last_event_ts is not None:
+        payload["last_event_ts"] = camera.last_event_ts
+    emit(payload, output_mode)
 
 
 # ---------------------------------------------------------------------------
