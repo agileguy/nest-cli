@@ -358,38 +358,95 @@ class FoyerClient:
         )
 
     # ------------------------------------------------------------------
-    # Action verbs — Phase B exit-5 stubs (Phase C will map RPCs)
+    # Action verbs — Phase C: real Foyer REST implementations
     # ------------------------------------------------------------------
 
     def list_clients(self, group_id: str) -> list[WifiClient]:
         """Return every connected client in ``group_id`` (FR-WIFI-3).
 
-        Phase B status: ``GetHomeGraph`` does not include connected-client
-        records (only routers and devices the home shows); the Foyer RPC
-        for connected wifi stations has not yet been mapped. Surface a
-        clean exit-5 with hint until Phase C lands the right call.
+        Calls ``GET /v2/groups/{gid}/stations`` and projects each station
+        record onto a ``WifiClient``. Returns an empty list if the group
+        has no connected stations. 404 from Foyer (group id wrong) maps
+        to ``EXIT_NOT_FOUND`` family=wifi via ``_rest``.
         """
-        raise self._unsupported("wifi list-clients", group_id=group_id)
+        payload = self._rest("GET", f"/v2/groups/{group_id}/stations")
+        stations = (payload or {}).get("stations") or []
+        clients: list[WifiClient] = []
+        for record in stations:
+            try:
+                clients.append(WifiClient.from_googlewifi_response(record))
+            except (KeyError, TypeError, ValueError) as exc:
+                raise self._upstream_shape_error(
+                    "REST GET /v2/groups/{gid}/stations",
+                    f"normalizing station: {exc}",
+                ) from exc
+        return sorted(clients, key=lambda c: c.id)
 
     def pause_station(self, client_id: str) -> None:
-        """Pause the named client (FR-WIFI-4) — deferred to Phase C."""
-        raise self._unsupported("wifi pause", client_id=client_id)
+        """Pause the named client at the AP (FR-WIFI-4).
+
+        Implemented via ``PUT /v2/groups/{gid}/stationBlocking`` with
+        ``{stationId, blocked: "true"}``. Note: pause requires the
+        per-account default mesh group id; we use ``"default"`` and rely
+        on Foyer to scope by the OnHub token. If your account owns
+        multiple groups this verb may need a ``--group`` flag (Phase D).
+        """
+        self._station_blocking(client_id, blocked=True)
 
     def unpause_station(self, client_id: str) -> None:
-        """Unpause the named client (FR-WIFI-5) — deferred to Phase C."""
-        raise self._unsupported("wifi unpause", client_id=client_id)
+        """Unblock the named client (FR-WIFI-5)."""
+        self._station_blocking(client_id, blocked=False)
+
+    def _station_blocking(self, client_id: str, *, blocked: bool) -> None:
+        """Shared body for pause/unpause — PUT stationBlocking with the flag.
+
+        Uses ``"default"`` as the group id; the OnHub access token scopes
+        to the operator's primary mesh group server-side. Multi-group
+        accounts will need a per-verb group selector (Phase D).
+        """
+        self._rest(
+            "PUT",
+            "/v2/groups/default/stationBlocking",
+            json={
+                "stationId": client_id,
+                "blocked": "true" if blocked else "false",
+            },
+        )
 
     def prioritize_station(self, client_id: str, duration_minutes: int) -> None:
-        """Prioritize the named client (FR-WIFI-6) — deferred to Phase C."""
-        raise self._unsupported(
-            "wifi prioritize",
-            client_id=client_id,
-            duration_minutes=duration_minutes,
+        """Prioritize the named client for ``duration_minutes`` (FR-WIFI-6).
+
+        Implemented via ``PUT /v2/groups/default/prioritizedStation`` with
+        ``{stationId, prioritizationEndTime: <ISO8601-Z>}``. Foyer
+        computes the effective end time at the router; we send the
+        absolute timestamp so the operator's intent is unambiguous even
+        if the local clock and the router clock disagree by a minute or
+        two.
+        """
+        from datetime import UTC as _UTC
+        from datetime import datetime as _datetime
+        from datetime import timedelta as _timedelta
+
+        end = _datetime.now(_UTC) + _timedelta(minutes=duration_minutes)
+        end_iso = end.isoformat().replace("+00:00", "Z")
+        self._rest(
+            "PUT",
+            "/v2/groups/default/prioritizedStation",
+            json={
+                "stationId": client_id,
+                "prioritizationEndTime": end_iso,
+            },
         )
 
     def set_station_group(self, client_id: str, group: str | None) -> None:
-        """Assign the client to a Foyer group (FR-WIFI-7) — deferred to Phase C."""
-        raise self._unsupported(
+        """Assign the client to a Foyer group (FR-WIFI-7) — deferred to Phase D.
+
+        The Foyer endpoint exists at ``POST /v2/groups/{gid}/stationSets``
+        but the request body schema is not publicly documented. Shipping
+        a guess risks corrupting the operator's station-set configuration,
+        so this verb stays exit-5 with a hint pointing at Phase D.
+        """
+        raise self._deferred_phase_d(
             "wifi group-assign",
             client_id=client_id,
             requested_group=group,
@@ -401,37 +458,95 @@ class FoyerClient:
         *,
         timeout_s: float = 180.0,
     ) -> SpeedTest:
-        """Trigger a fresh speed test (FR-WIFI-8) — deferred to Phase C.
+        """Trigger a fresh speed test and return the result (FR-WIFI-8).
 
-        ``timeout_s`` is captured into the error envelope's ``details``
-        so the post-Phase-C signature lands without a CLI flag wiring
-        change. The value is not used at runtime today.
+        Three round-trips:
+
+        1. POST ``/v2/groups/{gid}/wanSpeedTest`` to kick off the test.
+           Response carries an ``operationId`` we poll on.
+        2. Poll ``/v2/operations/{operationId}`` every 5s until
+           ``operationState == "DONE"`` or ``timeout_s`` trips.
+        3. GET ``/v2/groups/{gid}/speedTestResults?maxResultCount=1`` to
+           fetch the freshest result and project it onto a SpeedTest record.
         """
-        raise self._unsupported(
-            "wifi speedtest run",
-            group_id=group_id,
-            timeout_s=timeout_s,
+        kickoff = self._rest("POST", f"/v2/groups/{group_id}/wanSpeedTest", json={})
+        operation_id = (kickoff or {}).get("operationId")
+        if not operation_id:
+            raise self._upstream_shape_error(
+                "REST POST /v2/groups/{gid}/wanSpeedTest",
+                f"response missing operationId (body={kickoff!r})",
+            )
+        self._wait_for_operation(operation_id, timeout_s=timeout_s)
+
+        history = self._rest(
+            "GET",
+            f"/v2/groups/{group_id}/speedTestResults",
+            params={"maxResultCount": 1},
         )
+        results = (history or {}).get("results") or []
+        if not results:
+            raise self._upstream_shape_error(
+                "REST GET /v2/groups/{gid}/speedTestResults",
+                "operation completed but no results returned",
+            )
+        return SpeedTest.from_googlewifi_response(group_id=group_id, payload=results[0])
 
     def get_speedtest_history(self, group_id: str, *, limit: int) -> list[SpeedTest]:
-        """Return speed-test history (FR-WIFI-9) — deferred to Phase C."""
-        raise self._unsupported(
-            "wifi speedtest history",
-            group_id=group_id,
-            limit=limit,
+        """Return up to ``limit`` recent speed-test results (FR-WIFI-9).
+
+        GET ``/v2/groups/{gid}/speedTestResults?maxResultCount={limit}``.
+        Empty list if the router has no history. Each result projects
+        through ``SpeedTest.from_googlewifi_response``.
+        """
+        payload = self._rest(
+            "GET",
+            f"/v2/groups/{group_id}/speedTestResults",
+            params={"maxResultCount": limit},
         )
+        results = (payload or {}).get("results") or []
+        out: list[SpeedTest] = []
+        for record in results:
+            try:
+                out.append(SpeedTest.from_googlewifi_response(group_id=group_id, payload=record))
+            except (KeyError, TypeError, ValueError) as exc:
+                raise self._upstream_shape_error(
+                    "REST GET /v2/groups/{gid}/speedTestResults",
+                    f"normalizing result: {exc}",
+                ) from exc
+        return out
 
     def reboot_point(self, point_id: str) -> None:
-        """Reboot a single point (FR-WIFI-10) — deferred to Phase C."""
-        raise self._unsupported("wifi reboot point", point_id=point_id)
+        """Reboot a single mesh point (FR-WIFI-10).
+
+        POST ``/v2/accesspoints/{apId}/reboot`` with an empty body.
+        Foyer returns 204 on success. Unknown ap id → EXIT_NOT_FOUND.
+        """
+        self._rest("POST", f"/v2/accesspoints/{point_id}/reboot", json={})
 
     def reboot_group(self, group_id: str) -> list[str]:
-        """Reboot every point in a group (FR-WIFI-11) — deferred to Phase C."""
-        raise self._unsupported("wifi reboot group", group_id=group_id)
+        """Reboot every point in a mesh group (FR-WIFI-11).
+
+        POST ``/v2/groups/{gid}/reboot`` with an empty body. We list the
+        points first so the response payload contains the list of points
+        actually rebooted (matches the Phase B CLI shape that already
+        exists at ``wifi reboot group``). list_points uses the gRPC seam,
+        which works on v2 and v3 credentials alike.
+        """
+        points = self.list_points(group_id)
+        self._rest("POST", f"/v2/groups/{group_id}/reboot", json={})
+        return [p.id for p in points]
 
     def set_guest_enabled(self, group_id: str, *, enabled: bool) -> None:
-        """Toggle the guest network (FR-WIFI-14) — deferred to Phase C."""
-        raise self._unsupported(
+        """Toggle the guest network (FR-WIFI-14) — deferred to Phase D.
+
+        The Foyer endpoint exists at
+        ``PUT /v2/groups/{gid}/guestWirelessConfig`` but the body shape
+        (SSID + password preservation rules + per-band enables) is not
+        publicly documented. A guess risks nuking the guest network's
+        SSID or password, so this verb stays exit-5 with a hint pointing
+        at Phase D.
+        """
+        raise self._deferred_phase_d(
             "wifi guest enable/disable",
             group_id=group_id,
             requested_enabled=enabled,
@@ -927,6 +1042,24 @@ class FoyerClient:
             code=EXIT_UNSUPPORTED_FEATURE,
             message=f"{verb} is not implemented in Phase B",
             hint=_PHASE_C_HINT,
+            family=WIFI_FAMILY,
+            details=details,
+        )
+
+    @staticmethod
+    def _deferred_phase_d(verb: str, **details: Any) -> StructuredError:
+        """Build a Phase-C exit-5 envelope for verbs explicitly held to Phase D.
+
+        Phase C ships REST implementations for 8 of the 10 action verbs.
+        ``set_station_group`` and ``set_guest_enabled`` are held back
+        because their Foyer request bodies are undocumented and the
+        risk of corrupting station/group config (or nuking the guest
+        SSID/password) is too high to ship a guess.
+        """
+        return StructuredError(
+            code=EXIT_UNSUPPORTED_FEATURE,
+            message=f"{verb} is deferred to Phase D",
+            hint=_PHASE_D_HINT,
             family=WIFI_FAMILY,
             details=details,
         )

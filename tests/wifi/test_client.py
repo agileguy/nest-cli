@@ -128,9 +128,7 @@ class TestListPoints:
         assert err.family == "wifi"
         assert "group-no-such" in err.message
 
-    def test_returns_deterministic_order(
-        self, fake_foyer_client: None, make_v2_creds: Any
-    ) -> None:
+    def test_returns_deterministic_order(self, fake_foyer_client: None, make_v2_creds: Any) -> None:
         client = FoyerClient(make_v2_creds())
         points = client.list_points("group-home-001")
         ids = [p.id for p in points]
@@ -188,11 +186,13 @@ class TestPointHealth:
 # ---------------------------------------------------------------------------
 
 
-class TestActionVerbsAreDeferred:
-    """All action verbs exit-5 with family=wifi in Phase B.
+class TestPhaseDDeferredVerbs:
+    """``set_station_group`` and ``set_guest_enabled`` stay exit-5 in Phase C.
 
-    The CLI surface ships so operators can wire scripts; Phase C will
-    map each verb to its specific Foyer RPC.
+    Their Foyer request bodies are undocumented; shipping a guess risks
+    corrupting station-set config or nuking the guest SSID/password.
+    The other 8 action verbs land in Phase C as real REST implementations
+    and have their own dedicated tests.
     """
 
     def _client(self, make_v2_creds: Any) -> FoyerClient:
@@ -201,15 +201,7 @@ class TestActionVerbsAreDeferred:
     @pytest.mark.parametrize(
         ("verb_call",),
         [
-            (lambda c: c.list_clients("group-home-001"),),
-            (lambda c: c.pause_station("sta-laptop"),),
-            (lambda c: c.unpause_station("sta-laptop"),),
-            (lambda c: c.prioritize_station("sta-laptop", 60),),
             (lambda c: c.set_station_group("sta-laptop", "family"),),
-            (lambda c: c.run_speedtest("group-home-001"),),
-            (lambda c: c.get_speedtest_history("group-home-001", limit=10),),
-            (lambda c: c.reboot_point("ap-master-living-room"),),
-            (lambda c: c.reboot_group("group-home-001"),),
             (lambda c: c.set_guest_enabled("group-home-001", enabled=True),),
         ],
     )
@@ -225,6 +217,9 @@ class TestActionVerbsAreDeferred:
         err = exc_info.value
         assert err.code == EXIT_UNSUPPORTED_FEATURE
         assert err.family == "wifi"
+        # Hint should mention Phase D so operators know it's not random
+        # Phase B carryover.
+        assert "Phase D" in (err.hint or "")
 
 
 # ---------------------------------------------------------------------------
@@ -274,9 +269,7 @@ class TestAccessTokenRefresh:
     runs unaltered, and gpsoauth is stubbed in-place via mock.patch).
     """
 
-    def test_refresh_calls_gpsoauth_with_correct_constants(
-        self, make_v2_creds: Any
-    ) -> None:
+    def test_refresh_calls_gpsoauth_with_correct_constants(self, make_v2_creds: Any) -> None:
         creds = make_v2_creds(
             google_account_email="me@example.com",
             master_token="aas_et/test-master-token",
@@ -297,9 +290,7 @@ class TestAccessTokenRefresh:
             client_sig=ACCESS_TOKEN_CLIENT_SIGNATURE,
         )
 
-    def test_refresh_caches_token_until_skew_window(
-        self, make_v2_creds: Any
-    ) -> None:
+    def test_refresh_caches_token_until_skew_window(self, make_v2_creds: Any) -> None:
         creds = make_v2_creds()
         with patch("gpsoauth.perform_oauth") as fake_oauth:
             fake_oauth.return_value = {"Auth": "tok"}

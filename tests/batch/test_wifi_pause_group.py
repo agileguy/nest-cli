@@ -1,19 +1,13 @@
-"""End-to-end test for ``wifi pause @group`` fan-out (FR-6, FR-8a).
+"""End-to-end test for ``wifi pause @group`` fan-out (FR-6, FR-8a, Phase C).
 
-Phase B status (2026-05-03): the wifi ``pause`` verb stubs out at the
-FoyerClient layer with exit-5 (``unsupported_feature``, family=wifi).
-The fan-out machinery still emits one FR-9a envelope per target — both
-sub-targets fail with exit-5, and the FR-8a aggregate exit code follows
-the all-failed rule (= exit code of the first resolved target = 5).
-
-Once Phase C lands the actual ``pause_station`` RPC, this test will be
-reinstated against the new transport with exit-0 envelopes.
+Phase C lands the real REST implementation for ``wifi pause``. The
+fan-out machinery emits one FR-9a envelope per target; both should now
+succeed (exit 0) when the underlying REST call returns success.
 
 Reuses the ``fake_googlewifi`` fixture name from ``tests/wifi/conftest.py``
 (now an alias for the Phase-B ``fake_foyer_client`` fixture, kept for
-backward compatibility). For this batch test, the fixture is a no-op
-because the verb exits 5 before reaching any fetch path; we still
-ensure the FoyerClient extras-import probe is short-circuited.
+backward compatibility). For this batch test the gRPC fixture isn't
+exercised — the verb body now hits ``_rest`` instead.
 """
 
 from __future__ import annotations
@@ -32,34 +26,40 @@ from nest_cli.auth.wifi_credentials import (
 )
 from nest_cli.auth.wifi_types import WifiCredentials
 from nest_cli.cli import cli as cli_root
-from nest_cli.errors import EXIT_UNSUPPORTED_FEATURE
 from nest_cli.wifi.client import FoyerClient
 
 
 @pytest.fixture
-def patched_foyer_client(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Short-circuit FoyerClient.__init__ extras-import probe.
-
-    The wifi ``pause`` verb constructs a FoyerClient and immediately
-    raises exit-5 (the action verb is a Phase-B stub), but the
-    constructor still runs and probes for gpsoauth/grpc/ghome_foyer_api.
-    Tests should not depend on those modules being installed; we replace
-    ``__init__`` with a minimal version that skips the probe.
-
-    ``_fetch_systems`` is also patched to a stub that returns ``{}`` for
-    safety, even though pause never reaches it.
-    """
+def patched_foyer_client(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
+    """Short-circuit FoyerClient.__init__ + record _rest calls."""
 
     def _init(self: FoyerClient, creds: WifiCredentials) -> None:
+        import threading as _threading
+
         self._creds = creds
         self._access_token = None
         self._access_token_expiry = 0.0
-
-    def _fetch(self: FoyerClient) -> dict[str, dict[str, Any]]:
-        return {}
+        self._onhub_token = None
+        self._onhub_token_expiry = 0.0
+        self._onhub_token_lock = _threading.Lock()
+        self._rest_session = None
 
     monkeypatch.setattr(FoyerClient, "__init__", _init)
-    monkeypatch.setattr(FoyerClient, "_fetch_systems", _fetch)
+    calls: list[dict[str, Any]] = []
+
+    def _fake_rest(
+        self: FoyerClient,
+        method: str,
+        path: str,
+        *,
+        json: Any = None,
+        params: dict[str, Any] | None = None,
+    ) -> Any:
+        calls.append({"method": method, "path": path, "json": json, "params": params})
+        return None
+
+    monkeypatch.setattr(FoyerClient, "_rest", _fake_rest)
+    return calls
 
 
 @pytest.fixture
@@ -72,12 +72,13 @@ def _seed_wifi_creds() -> None:
     save_wifi_credentials(
         default_wifi_credentials_path(),
         WifiCredentials(
-            version=2,
+            version=3,
             type="foyer",
             google_account_email="me@example.com",
-            master_token="t",  # noqa: S106
+            master_token="aas_et/m",  # noqa: S106
             android_id="0123456789abcdef",
             issued_at=datetime(2026, 5, 3, tzinfo=UTC),
+            refresh_token="1//09abc-DEF",
         ),
     )
 
@@ -98,16 +99,12 @@ def _write_config_with_group(xdg_root: Path) -> None:
 
 
 class TestWifiPauseGroup:
-    def test_wifi_pause_at_group_emits_two_exit5_envelopes(
+    def test_wifi_pause_at_group_emits_two_success_envelopes(
         self,
         isolated_xdg: Path,
-        patched_foyer_client: None,
+        patched_foyer_client: list[dict[str, Any]],
     ) -> None:
-        """``wifi pause @kids-devices`` → two FR-9a envelopes, exit 5.
-
-        Both sub-targets exit 5; the FR-8a aggregate is 5 (all-failed →
-        first target's exit code).
-        """
+        """``wifi pause @kids-devices`` → two FR-9a envelopes, exit 0."""
         _seed_wifi_creds()
         _write_config_with_group(isolated_xdg)
 
@@ -116,13 +113,18 @@ class TestWifiPauseGroup:
             cli_root,
             ["wifi", "pause", "@kids-devices", "--experimental-wifi", "--jsonl"],
         )
-        assert result.exit_code == EXIT_UNSUPPORTED_FEATURE, result.output + result.stderr
+        assert result.exit_code == 0, result.output + result.stderr
         lines = [ln for ln in result.output.splitlines() if ln.strip()]
         assert len(lines) == 2
-        names = [json.loads(ln)["target"] for ln in lines]
+        envelopes = [json.loads(ln) for ln in lines]
+        names = [e["target"] for e in envelopes]
         assert names == ["kid-tablet", "phone"]
-        for ln in lines:
-            envelope = json.loads(ln)
-            assert envelope["status"] == "error"
-            assert envelope["exit_code"] == EXIT_UNSUPPORTED_FEATURE
-            assert envelope["error"]["code"] == "unsupported_feature"
+        for env in envelopes:
+            assert env["status"] == "ok"
+            assert env["exit_code"] == 0
+            assert env["result"]["action"] == "pause"
+        # Two REST calls (one per target)
+        assert len(patched_foyer_client) == 2
+        for call in patched_foyer_client:
+            assert call["path"] == "/v2/groups/default/stationBlocking"
+            assert call["json"]["blocked"] == "true"
