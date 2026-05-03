@@ -31,18 +31,29 @@ class WifiCredentials(BaseModel):
     schema validation; the loader maps that to a config-error exit with a
     hint pointing at ``auth wifi-setup --overwrite``.
 
+    Phase C (v3): adds optional ``refresh_token``. The action verbs
+    (pause/prioritize/speedtest/reboot/...) hit Foyer REST endpoints at
+    ``/v2/groups/...`` that reject the gpsoauth-minted access token; they
+    require an OnHub-scoped token derived through a two-step OAuth chain
+    rooted in a standard refresh token (``1//<chars>``). v3 records
+    persist that token alongside the master token; v2 records remain
+    loadable but Foyer REST verbs exit-2 with a hint pointing at
+    ``auth wifi-refresh-bootstrap`` until the file is upgraded. The gRPC
+    read path continues to use master_token + android_id regardless.
+
     ``extra="forbid"`` means unknown keys raise ``ValidationError``,
     which the credentials loader maps to exit 6 (FR-CRED-8).
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    version: int = Field(..., ge=2, le=2)
+    version: int = Field(..., ge=2, le=3)
     type: str = Field(..., pattern="^foyer$")
     google_account_email: str = Field(..., min_length=3)
     master_token: str = Field(..., min_length=1)
     android_id: str = Field(..., min_length=16, max_length=16, pattern=r"^[0-9a-f]{16}$")
     issued_at: datetime
+    refresh_token: str | None = Field(default=None, pattern=r"^1//[\w-]+$")
 
     @field_serializer("issued_at", when_used="json")
     def _serialize_issued_at(self, dt: datetime) -> str:
