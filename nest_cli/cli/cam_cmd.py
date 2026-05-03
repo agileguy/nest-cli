@@ -31,9 +31,11 @@ longer exists → exit 4 from the SDM 404 path with a hint pointing at
 
 from __future__ import annotations
 
+import sys
 from typing import Any
 
 import click
+import requests
 
 from nest_cli.cli._shared import (
     exit_on_structured_error,
@@ -42,7 +44,13 @@ from nest_cli.cli._shared import (
 )
 from nest_cli.cli.list_cmd import _probe_records
 from nest_cli.config import default_config_path, load_config, resolve_alias
-from nest_cli.errors import EXIT_UNSUPPORTED_FEATURE, StructuredError
+from nest_cli.errors import (
+    EXIT_DEVICE_ERROR,
+    EXIT_NETWORK_ERROR,
+    EXIT_UNSUPPORTED_FEATURE,
+    EXIT_USAGE_ERROR,
+    StructuredError,
+)
 from nest_cli.output import OutputMode, add_output_options, emit
 from nest_cli.sdm.client import SdmClient
 from nest_cli.sdm.types import Camera
@@ -309,6 +317,138 @@ def cam_signal(target: str, output_mode: OutputMode) -> None:
     emit(payload, output_mode)
 
 
+@cam_group.command("snapshot")
+@click.argument("target")
+@click.option(
+    "--output",
+    "output_path",
+    required=True,
+    type=str,
+    help="Path to write the JPEG. Use '-' to write to stdout.",
+)
+@click.option(
+    "--json",
+    "json_flag",
+    is_flag=True,
+    default=False,
+    help="Emit a JSON SnapshotResult envelope after writing the JPEG.",
+)
+@click.option(
+    "--jsonl",
+    "jsonl_flag",
+    is_flag=True,
+    default=False,
+    help="Emit a JSON-lines SnapshotResult envelope after writing the JPEG.",
+)
+@click.option(
+    "--quiet",
+    "quiet_flag",
+    is_flag=True,
+    default=False,
+    help="Suppress the SnapshotResult envelope; only the JPEG file is produced.",
+)
+def cam_snapshot(
+    target: str,
+    output_path: str,
+    json_flag: bool,
+    jsonl_flag: bool,
+    quiet_flag: bool,
+) -> None:
+    """Capture a JPEG with the FR-CAM-3..5 two-tier fallback.
+
+    Tier 1: ``CameraImage.GenerateImage`` (preferred when present).
+    Tier 2: ``CameraEventImage.GenerateImage`` keyed off the most recent
+    eventId in the past 60s. Tier 3 (ffmpeg-from-RTSP) is deferred.
+
+    Auth-rejection at any tier exits 2 immediately, no fallback (FR-CAM-4a).
+    A camera with neither trait AND no event in window exits 5 (FR-CAM-4b).
+
+    ``--output -`` writes JPEG bytes to stdout. ``--output -`` is mutually
+    exclusive with ``--json`` / ``--jsonl`` (FR-CAM-5) — passing both exits 64.
+    Note: snapshot does not accept the global ``--output text|json|jsonl|quiet``
+    mode flag because ``--output`` here means the JPEG destination path; the
+    convenience flags ``--json`` / ``--jsonl`` / ``--quiet`` cover the
+    envelope-format dimension.
+    """
+    output_mode = _resolve_snapshot_output_mode(json_flag, jsonl_flag, quiet_flag)
+
+    if output_path == "-" and output_mode in ("json", "jsonl"):
+        err = StructuredError(
+            code=EXIT_USAGE_ERROR,
+            message="--output - is mutually exclusive with --json / --jsonl",
+            hint=(
+                "JPEG bytes and JSON envelope share stdout; pick one. "
+                "Drop --json/--jsonl to send the JPEG to stdout, or pass a "
+                "file path to --output and keep the JSON envelope."
+            ),
+        )
+        exit_on_structured_error(err, "text")
+
+    camera = _fetch_camera(target, output_mode)
+    creds = load_credentials_or_exit(output_mode)
+    client = SdmClient(creds)
+
+    # Tier selection — auth-rejection short-circuits FR-CAM-4a.
+    try:
+        jpeg_bytes, mechanism = _try_snapshot_tiers(client, camera)
+    except StructuredError as exc:
+        exit_on_structured_error(exc, output_mode)
+
+    # Write the bytes.
+    if output_path == "-":
+        sys.stdout.buffer.write(jpeg_bytes)
+        sys.stdout.buffer.flush()
+    else:
+        from pathlib import Path
+
+        out = Path(output_path)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_bytes(jpeg_bytes)
+
+    # Emit the SnapshotResult envelope (skipped for --output -).
+    if output_path != "-":
+        result_payload: dict[str, Any] = {
+            "target": target,
+            "output": output_path,
+            "mechanism": mechanism,
+            "bytes": len(jpeg_bytes),
+        }
+        emit(result_payload, output_mode)
+
+
+def _resolve_snapshot_output_mode(
+    json_flag: bool,
+    jsonl_flag: bool,
+    quiet_flag: bool,
+) -> OutputMode:
+    """Pick a snapshot-specific OutputMode from the three convenience flags.
+
+    Snapshot can't use ``add_output_options`` because the SRD-mandated
+    ``--output <path>`` flag would collide with the global mode flag's
+    name. Two convenience flags together exit 64; default is ``"text"``.
+    """
+    selected: list[OutputMode] = []
+    if json_flag:
+        selected.append("json")
+    if jsonl_flag:
+        selected.append("jsonl")
+    if quiet_flag:
+        selected.append("quiet")
+
+    if len(selected) > 1:
+        err = StructuredError(
+            code=EXIT_USAGE_ERROR,
+            message=(
+                "Snapshot output flags conflict: "
+                + ", ".join(sorted(set(selected)))
+                + " name different modes."
+            ),
+            hint="Pass at most one of --json, --jsonl, --quiet.",
+        )
+        exit_on_structured_error(err, "text")
+    return selected[0] if selected else "text"
+
+
 # ---------------------------------------------------------------------------
 # Internals
 # ---------------------------------------------------------------------------
@@ -407,3 +547,170 @@ def _doorbell_capable_hint(failing_target: str, output_mode: OutputMode) -> str:
             "verb only works on devices carrying sdm.devices.traits.DoorbellChime."
         )
     return f"Doorbell-capable aliases in your config: {', '.join(capable)}."
+
+
+# ---------------------------------------------------------------------------
+# Snapshot helpers (FR-CAM-3..5)
+# ---------------------------------------------------------------------------
+
+
+# Per-tier per-request timeout for the ``executeCommand`` call AND the
+# follow-up image GET. SRD §7.4 puts the per-operation default at 10s;
+# snapshot is allowed to be a bit longer because the JPEG transfer
+# itself may add latency on cellular cameras. 20s total keeps us
+# inside the 30s budget the SRD mentions for snapshot in §7.1.
+_SNAPSHOT_IMAGE_TIMEOUT_S = 20
+
+
+def _try_snapshot_tiers(client: SdmClient, camera: Camera) -> tuple[bytes, str]:
+    """Run the FR-CAM-4 fallback chain. Return (jpeg_bytes, mechanism).
+
+    Mechanism is one of ``"camera_image"`` / ``"camera_event_image"``.
+    Auth-rejection at any tier propagates immediately (no fallback) per
+    FR-CAM-4a — ``StructuredError(code=EXIT_AUTH_ERROR)`` from the SDM
+    client is re-raised as-is and the caller maps it to exit 2.
+
+    Tier selection:
+
+    - **Tier 1**: camera has ``CameraImage`` trait → call
+      ``CameraImage.GenerateImage``, GET the returned URL.
+    - **Tier 2**: camera has ``CameraEventImage`` trait AND a recent
+      eventId is available (via ``_fetch_recent_event_id``) → call
+      ``CameraEventImage.GenerateImage`` with the eventId param.
+    - **Tier 3** (deferred): ffmpeg-from-RTSP. Not in v0.2.0.
+
+    If neither tier is available, raise ``StructuredError(EXIT_UNSUPPORTED_FEATURE)``
+    per FR-CAM-4b.
+    """
+    has_camera_image = camera.has_trait(_TRAIT_CAMERA_IMAGE)
+    has_camera_event_image = camera.has_trait(_TRAIT_CAMERA_EVENT_IMAGE)
+
+    if has_camera_image:
+        # Tier 1.
+        result = client.execute_command(camera.target_id, _SDM_CMD_CAMERA_IMAGE, {})
+        url, token = _parse_image_url_and_token(result, mechanism="camera_image")
+        return _download_snapshot_bytes(url, token), "camera_image"
+
+    if has_camera_event_image:
+        event_id = _fetch_recent_event_id(client, camera)
+        if event_id is not None:
+            # Tier 2.
+            result = client.execute_command(
+                camera.target_id,
+                _SDM_CMD_CAMERA_EVENT_IMAGE,
+                {"eventId": event_id},
+            )
+            url, token = _parse_image_url_and_token(result, mechanism="camera_event_image")
+            return _download_snapshot_bytes(url, token), "camera_event_image"
+
+    # Neither tier worked — FR-CAM-4b.
+    raise StructuredError(
+        code=EXIT_UNSUPPORTED_FEATURE,
+        message=(
+            f"camera {camera.target_id!r} cannot snapshot: "
+            "no CameraImage trait and no recent event in the 60s window"
+        ),
+        hint=(
+            "Run `nest-cli cam capabilities <target>` to inspect the trait array. "
+            "WebRTC-only cameras (most 2nd-gen battery hardware) only snapshot "
+            "via CameraEventImage, which requires a recent motion/person/"
+            "doorbell-press event in the last 60 seconds."
+        ),
+        details={
+            "target_id": camera.target_id,
+            "traits": [t.name for t in camera.traits],
+        },
+    )
+
+
+def _fetch_recent_event_id(client: SdmClient, camera: Camera) -> str | None:
+    """Return the most recent eventId for ``camera`` within the FR-CAM-4 60s window.
+
+    v0.2.0 returns ``None`` unconditionally — Pub/Sub provisioning
+    (``auth setup --pubsub``) is the Phase 2 stretch / Phase 5+
+    deferral that wires the eventId source. Tests inject a value via
+    monkeypatch on this function to exercise the tier-2 control flow.
+
+    The seam exists deliberately so the verb's fallback shape is
+    locked in now and only this one function needs replacement when
+    the Pub/Sub source lands.
+    """
+    _ = (client, camera)  # explicit unused — both will be used in the future
+    return None
+
+
+def _parse_image_url_and_token(result: dict[str, Any], mechanism: str) -> tuple[str, str]:
+    """Extract the ``{url, token}`` pair from an SDM GenerateImage result.
+
+    Both ``CameraImage.GenerateImage`` and ``CameraEventImage.GenerateImage``
+    return ``{"results": {"url": ..., "token": ...}}``. Missing or
+    malformed fields raise a device-error so the verb fails cleanly with
+    exit 1 rather than crashing.
+    """
+    inner = result.get("results")
+    if not isinstance(inner, dict):
+        raise StructuredError(
+            code=EXIT_DEVICE_ERROR,
+            message=(
+                f"SDM GenerateImage ({mechanism}) returned malformed result: "
+                "missing 'results' object"
+            ),
+            details={"mechanism": mechanism, "result": result},
+        )
+    url = inner.get("url")
+    token = inner.get("token")
+    if not isinstance(url, str) or not url:
+        raise StructuredError(
+            code=EXIT_DEVICE_ERROR,
+            message=f"SDM GenerateImage ({mechanism}) result missing 'url'",
+            details={"mechanism": mechanism, "result": result},
+        )
+    if not isinstance(token, str) or not token:
+        raise StructuredError(
+            code=EXIT_DEVICE_ERROR,
+            message=f"SDM GenerateImage ({mechanism}) result missing 'token'",
+            details={"mechanism": mechanism},
+        )
+    return url, token
+
+
+def _download_snapshot_bytes(url: str, token: str) -> bytes:
+    """GET ``url`` with the SDM-issued token and return the JPEG bytes.
+
+    Per SDM's CameraImage / CameraEventImage docs, the issued token is
+    passed as ``Authorization: Basic <token>``. Network failures map to
+    exit 3 (network); HTTP non-2xx maps to exit 1 (device error) since
+    the SDM token is short-lived and a non-2xx here means Google
+    rejected our follow-up retrieval, which is a per-device condition.
+    """
+    try:
+        response = requests.get(
+            url,
+            headers={"Authorization": f"Basic {token}"},
+            timeout=_SNAPSHOT_IMAGE_TIMEOUT_S,
+        )
+    except requests.exceptions.ConnectionError as exc:
+        raise StructuredError(
+            code=EXIT_NETWORK_ERROR,
+            message=f"network error fetching snapshot bytes: {exc}",
+            hint="Check your internet connection and retry.",
+        ) from exc
+    except requests.exceptions.Timeout as exc:
+        raise StructuredError(
+            code=EXIT_NETWORK_ERROR,
+            message=(f"timed out fetching snapshot bytes after {_SNAPSHOT_IMAGE_TIMEOUT_S}s"),
+            hint="Google's image-delivery endpoint is slow; retry shortly.",
+        ) from exc
+    except requests.exceptions.RequestException as exc:
+        raise StructuredError(
+            code=EXIT_NETWORK_ERROR,
+            message=f"unexpected requests error fetching snapshot bytes: {exc}",
+        ) from exc
+
+    if response.status_code != 200:
+        raise StructuredError(
+            code=EXIT_DEVICE_ERROR,
+            message=(f"snapshot image fetch returned HTTP {response.status_code} for {url}"),
+            details={"status_code": response.status_code},
+        )
+    return response.content
