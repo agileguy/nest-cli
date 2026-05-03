@@ -42,6 +42,7 @@ def _seed_v3() -> None:
 
 @pytest.fixture
 def stub_rest(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
+    """Same pattern as test_pause.py — short-circuit the resolver."""
     calls: list[dict[str, Any]] = []
 
     def _fake_rest(
@@ -56,6 +57,11 @@ def stub_rest(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
         return None
 
     monkeypatch.setattr(FoyerClient, "_rest", _fake_rest)
+    monkeypatch.setattr(
+        FoyerClient,
+        "_resolve_default_group_id",
+        lambda self: "home-mesh-001",
+    )
     return calls
 
 
@@ -73,7 +79,7 @@ def test_prioritize_default_duration_succeeds(
     assert payload["client_id"] == "sta-laptop"
     assert payload["duration_minutes"] == 60
     assert stub_rest[0]["method"] == "PUT"
-    assert stub_rest[0]["path"] == "/v2/groups/default/prioritizedStation"
+    assert stub_rest[0]["path"] == "/v2/groups/home-mesh-001/prioritizedStation"
     assert stub_rest[0]["json"]["stationId"] == "sta-laptop"
     assert stub_rest[0]["json"]["prioritizationEndTime"].endswith("Z")
 

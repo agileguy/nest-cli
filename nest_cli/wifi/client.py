@@ -62,6 +62,7 @@ import requests
 from nest_cli.auth.wifi_types import WifiCredentials
 from nest_cli.errors import (
     EXIT_AUTH_ERROR,
+    EXIT_CONFIG_ERROR,
     EXIT_DEVICE_ERROR,
     EXIT_NETWORK_ERROR,
     EXIT_NOT_FOUND,
@@ -251,6 +252,22 @@ class FoyerClient:
         self._onhub_token: str | None = None
         self._onhub_token_expiry: float = 0.0
         self._onhub_token_lock = threading.Lock()
+        # Phase C fix — Step 1 web token cached separately from the
+        # OnHub token so a Step 2 failure (4xx/5xx/timeout) doesn't
+        # force the next call to re-burn refresh-token quota by
+        # re-running Step 1. Cache lives inside ``_onhub_token_lock``.
+        self._step1_web_token: str | None = None
+        self._step1_web_token_expiry: float = 0.0
+        # Phase C fix — per-account default mesh group id, resolved
+        # lazily via ``_resolve_default_group_id`` on the first action
+        # verb that needs it (pause/unpause/prioritize). Cached for the
+        # lifetime of the client. A separate lock from the OnHub one
+        # because the resolver calls ``list_groups`` (gRPC HomeGraph),
+        # which is unrelated to the OnHub OAuth chain — and reusing
+        # ``_onhub_token_lock`` would deadlock if any future code path
+        # called the resolver from inside the OnHub mint.
+        self._resolved_default_group_id: str | None = None
+        self._default_group_lock = threading.Lock()
         # requests.Session reused across REST calls so HTTPS connection
         # pooling kicks in. Tests monkey-patch _rest itself, not the session.
         self._rest_session: requests.Session | None = None
@@ -382,61 +399,125 @@ class FoyerClient:
                 ) from exc
         return sorted(clients, key=lambda c: c.id)
 
-    def pause_station(self, client_id: str) -> None:
+    def pause_station(self, client_id: str, *, group_id: str | None = None) -> None:
         """Pause the named client at the AP (FR-WIFI-4).
 
         Implemented via ``PUT /v2/groups/{gid}/stationBlocking`` with
-        ``{stationId, blocked: "true"}``. Note: pause requires the
-        per-account default mesh group id; we use ``"default"`` and rely
-        on Foyer to scope by the OnHub token. If your account owns
-        multiple groups this verb may need a ``--group`` flag (Phase D).
+        ``{stationId, blocked: "true"}``. When ``group_id`` is omitted the
+        client resolves it via ``_resolve_default_group_id`` — a clean
+        exit-6 fires for multi-group accounts (the operator must wait for
+        Phase C.1's ``--group`` flag, or pin to a single group server-side).
         """
-        self._station_blocking(client_id, blocked=True)
+        resolved = group_id if group_id is not None else self._resolve_default_group_id()
+        self._station_blocking(client_id, group_id=resolved, blocked=True)
 
-    def unpause_station(self, client_id: str) -> None:
-        """Unblock the named client (FR-WIFI-5)."""
-        self._station_blocking(client_id, blocked=False)
+    def unpause_station(self, client_id: str, *, group_id: str | None = None) -> None:
+        """Unblock the named client (FR-WIFI-5).
 
-    def _station_blocking(self, client_id: str, *, blocked: bool) -> None:
+        Same group-resolution semantics as ``pause_station``.
+        """
+        resolved = group_id if group_id is not None else self._resolve_default_group_id()
+        self._station_blocking(client_id, group_id=resolved, blocked=False)
+
+    def _station_blocking(self, client_id: str, *, group_id: str, blocked: bool) -> None:
         """Shared body for pause/unpause — PUT stationBlocking with the flag.
 
-        Uses ``"default"`` as the group id; the OnHub access token scopes
-        to the operator's primary mesh group server-side. Multi-group
-        accounts will need a per-verb group selector (Phase D).
+        ``group_id`` is the resolved mesh group id (caller is responsible
+        for resolving via ``_resolve_default_group_id`` or passing an
+        explicit value). The path is parameterized so multi-group accounts
+        target the right mesh once a ``--group`` flag lands (Phase C.1).
         """
         self._rest(
             "PUT",
-            "/v2/groups/default/stationBlocking",
+            f"/v2/groups/{group_id}/stationBlocking",
             json={
                 "stationId": client_id,
                 "blocked": "true" if blocked else "false",
             },
         )
 
-    def prioritize_station(self, client_id: str, duration_minutes: int) -> None:
+    def prioritize_station(
+        self,
+        client_id: str,
+        duration_minutes: int,
+        *,
+        group_id: str | None = None,
+    ) -> None:
         """Prioritize the named client for ``duration_minutes`` (FR-WIFI-6).
 
-        Implemented via ``PUT /v2/groups/default/prioritizedStation`` with
+        Implemented via ``PUT /v2/groups/{gid}/prioritizedStation`` with
         ``{stationId, prioritizationEndTime: <ISO8601-Z>}``. Foyer
         computes the effective end time at the router; we send the
         absolute timestamp so the operator's intent is unambiguous even
         if the local clock and the router clock disagree by a minute or
-        two.
+        two. When ``group_id`` is omitted the client resolves it via
+        ``_resolve_default_group_id``.
         """
         from datetime import UTC as _UTC
         from datetime import datetime as _datetime
         from datetime import timedelta as _timedelta
 
+        resolved = group_id if group_id is not None else self._resolve_default_group_id()
         end = _datetime.now(_UTC) + _timedelta(minutes=duration_minutes)
         end_iso = end.isoformat().replace("+00:00", "Z")
         self._rest(
             "PUT",
-            "/v2/groups/default/prioritizedStation",
+            f"/v2/groups/{resolved}/prioritizedStation",
             json={
                 "stationId": client_id,
                 "prioritizationEndTime": end_iso,
             },
         )
+
+    def _resolve_default_group_id(self) -> str:
+        """Return the operator's single mesh group id, or fail cleanly.
+
+        Action verbs need to target a specific mesh group's REST path
+        (``/v2/groups/{gid}/...``). Phase C ships without a ``--group``
+        flag, so we infer the target by listing the operator's groups and
+        accepting only the single-group case. Multi-group accounts get a
+        clean exit-6 + hint pointing at the Phase C.1 follow-up; zero-group
+        accounts get exit-4 (refresh-token scope or ownership issue).
+
+        The result is cached on the instance under
+        ``_default_group_lock`` so concurrent fan-out workers reuse it
+        without paying multiple ``GetHomeGraph`` round-trips. The lock is
+        intentionally distinct from ``_onhub_token_lock`` because
+        ``list_groups`` routes through the gRPC HomeGraph path (unrelated
+        to OnHub OAuth) — sharing the OnHub lock would deadlock if any
+        future code path called the resolver from inside the OnHub mint.
+        """
+        with self._default_group_lock:
+            if self._resolved_default_group_id is not None:
+                return self._resolved_default_group_id
+
+            groups = self.list_groups()
+            count = len(groups)
+            if count == 1:
+                self._resolved_default_group_id = groups[0].id
+                return self._resolved_default_group_id
+            if count == 0:
+                raise StructuredError(
+                    code=EXIT_NOT_FOUND,
+                    message="no wifi groups visible to this account",
+                    hint=(
+                        "Verify your refresh token has accesspoints scope "
+                        "and you own at least one Nest Wifi mesh."
+                    ),
+                    family=WIFI_FAMILY,
+                )
+            raise StructuredError(
+                code=EXIT_CONFIG_ERROR,
+                message=(
+                    f"account has {count} wifi groups; per-station verbs need an explicit group"
+                ),
+                hint=(
+                    "Phase C.1 will add --group; for now use 'wifi list "
+                    "groups' to confirm and re-run after pinning a single "
+                    "group server-side."
+                ),
+                family=WIFI_FAMILY,
+            )
 
     def set_station_group(self, client_id: str, group: str | None) -> None:
         """Assign the client to a Foyer group (FR-WIFI-7) — deferred to Phase D.

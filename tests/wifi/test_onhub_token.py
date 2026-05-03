@@ -78,6 +78,10 @@ def v3_client(monkeypatch: pytest.MonkeyPatch, v3_creds: WifiCredentials) -> Foy
         import threading as _threading
 
         self._onhub_token_lock = _threading.Lock()
+        self._step1_web_token = None
+        self._step1_web_token_expiry = 0.0
+        self._resolved_default_group_id = None
+        self._default_group_lock = _threading.Lock()
         self._rest_session = None
 
     monkeypatch.setattr(FoyerClient, "__init__", _init)
@@ -97,6 +101,10 @@ def v2_client(monkeypatch: pytest.MonkeyPatch, make_v2_creds: Any) -> FoyerClien
         import threading as _threading
 
         self._onhub_token_lock = _threading.Lock()
+        self._step1_web_token = None
+        self._step1_web_token_expiry = 0.0
+        self._resolved_default_group_id = None
+        self._default_group_lock = _threading.Lock()
         self._rest_session = None
 
     monkeypatch.setattr(FoyerClient, "__init__", _init)

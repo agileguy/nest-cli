@@ -83,10 +83,12 @@ class TestPauseStation:
         self, fake_rest_client: Any, make_v3_creds: Any
     ) -> None:
         client = FoyerClient(make_v3_creds())
+        # Pre-fill resolver cache so the call doesn't try to list_groups.
+        client._resolved_default_group_id = "home-mesh-001"
         client.pause_station("sta-laptop")
         call = fake_rest_client.calls[0]
         assert call["method"] == "PUT"
-        assert call["path"] == "/v2/groups/default/stationBlocking"
+        assert call["path"] == "/v2/groups/home-mesh-001/stationBlocking"
         assert call["json"] == {"stationId": "sta-laptop", "blocked": "true"}
 
 
@@ -95,15 +97,16 @@ class TestUnpauseStation:
         self, fake_rest_client: Any, make_v3_creds: Any
     ) -> None:
         client = FoyerClient(make_v3_creds())
+        client._resolved_default_group_id = "home-mesh-001"
         client.unpause_station("sta-laptop")
         call = fake_rest_client.calls[0]
         assert call["method"] == "PUT"
-        assert call["path"] == "/v2/groups/default/stationBlocking"
+        assert call["path"] == "/v2/groups/home-mesh-001/stationBlocking"
         assert call["json"] == {"stationId": "sta-laptop", "blocked": "false"}
 
 
 # ---------------------------------------------------------------------------
-# prioritize (FR-WIFI-6) — PUT /v2/groups/default/prioritizedStation
+# prioritize (FR-WIFI-6) — PUT /v2/groups/{gid}/prioritizedStation
 # ---------------------------------------------------------------------------
 
 
@@ -112,10 +115,11 @@ class TestPrioritizeStation:
         self, fake_rest_client: Any, make_v3_creds: Any
     ) -> None:
         client = FoyerClient(make_v3_creds())
+        client._resolved_default_group_id = "home-mesh-001"
         client.prioritize_station("sta-laptop", 60)
         call = fake_rest_client.calls[0]
         assert call["method"] == "PUT"
-        assert call["path"] == "/v2/groups/default/prioritizedStation"
+        assert call["path"] == "/v2/groups/home-mesh-001/prioritizedStation"
         body = call["json"]
         assert body["stationId"] == "sta-laptop"
         # ISO8601 with literal Z suffix
@@ -127,6 +131,7 @@ class TestPrioritizeStation:
         from datetime import datetime as _datetime
 
         client = FoyerClient(make_v3_creds())
+        client._resolved_default_group_id = "home-mesh-001"
         client.prioritize_station("sta-laptop", 1)
         body = fake_rest_client.calls[0]["json"]
         # Just confirm the endTime parses

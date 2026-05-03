@@ -89,6 +89,12 @@ def _patch_skip_extras_check(monkeypatch: pytest.MonkeyPatch) -> None:
         self._onhub_token = None
         self._onhub_token_expiry = 0.0
         self._onhub_token_lock = _threading.Lock()
+        # Phase C fix — Step 1 web token cache fields (see client.py).
+        self._step1_web_token = None
+        self._step1_web_token_expiry = 0.0
+        # Phase C fix — default group resolver cache + lock.
+        self._resolved_default_group_id = None
+        self._default_group_lock = _threading.Lock()
         self._rest_session = None
 
     monkeypatch.setattr(FoyerClient, "__init__", _init)

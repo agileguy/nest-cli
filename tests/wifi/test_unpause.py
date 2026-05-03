@@ -42,6 +42,7 @@ def _seed_v3() -> None:
 
 @pytest.fixture
 def stub_rest(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
+    """Same pattern as test_pause.py — short-circuit the resolver."""
     calls: list[dict[str, Any]] = []
 
     def _fake_rest(
@@ -56,6 +57,11 @@ def stub_rest(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
         return None
 
     monkeypatch.setattr(FoyerClient, "_rest", _fake_rest)
+    monkeypatch.setattr(
+        FoyerClient,
+        "_resolve_default_group_id",
+        lambda self: "home-mesh-001",
+    )
     return calls
 
 

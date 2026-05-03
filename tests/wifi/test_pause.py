@@ -49,7 +49,15 @@ def _seed_wifi_creds(version: int = 3) -> None:
 
 @pytest.fixture
 def stub_rest(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
-    """Patch FoyerClient._rest to record calls and return success-with-empty."""
+    """Patch FoyerClient._rest to record calls and return success-with-empty.
+
+    Also stubs ``_resolve_default_group_id`` to short-circuit the
+    list-groups round-trip; pause/unpause inherit the new dynamic group
+    resolution path (see Phase C review fix #1) but the fixture pretends
+    the operator has a single mesh group named ``home-mesh-001`` so the
+    REST call lands on a real-looking path without each test needing to
+    seed a single-group fixture.
+    """
     calls: list[dict[str, Any]] = []
 
     def _fake_rest(
@@ -64,6 +72,11 @@ def stub_rest(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
         return None
 
     monkeypatch.setattr(FoyerClient, "_rest", _fake_rest)
+    monkeypatch.setattr(
+        FoyerClient,
+        "_resolve_default_group_id",
+        lambda self: "home-mesh-001",
+    )
     return calls
 
 
@@ -91,7 +104,7 @@ def test_pause_known_client_succeeds_via_rest(
     # Exactly one REST call PUT to stationBlocking with blocked=true
     assert len(stub_rest) == 1
     assert stub_rest[0]["method"] == "PUT"
-    assert stub_rest[0]["path"] == "/v2/groups/default/stationBlocking"
+    assert stub_rest[0]["path"] == "/v2/groups/home-mesh-001/stationBlocking"
     assert stub_rest[0]["json"]["blocked"] == "true"
 
 
@@ -114,10 +127,21 @@ def test_pause_already_paused_client_still_succeeds(
 def test_pause_v2_credentials_exit_2_with_bootstrap_hint(
     isolated_xdg: Path, fake_googlewifi: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """v2 creds (no refresh_token) hit the OnHub mint path and exit 2."""
+    """v2 creds (no refresh_token) hit the OnHub mint path and exit 2.
+
+    Stub the resolver so the test reaches the OnHub mint path; the
+    resolver itself uses the gRPC HomeGraph (works on v2 creds) but
+    short-circuiting it keeps the test's intent unchanged: confirm that
+    the token-mint failure is what surfaces, not the multi-group fan-out.
+    """
     _seed_wifi_creds(version=2)
     # No stub_rest fixture — real _refresh_onhub_access_token runs and
     # refuses immediately because creds.refresh_token is None.
+    monkeypatch.setattr(
+        FoyerClient,
+        "_resolve_default_group_id",
+        lambda self: "home-mesh-001",
+    )
     runner = CliRunner()
     result = runner.invoke(
         wifi_group,

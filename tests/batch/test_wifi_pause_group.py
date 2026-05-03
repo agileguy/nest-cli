@@ -42,6 +42,12 @@ def patched_foyer_client(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]
         self._onhub_token = None
         self._onhub_token_expiry = 0.0
         self._onhub_token_lock = _threading.Lock()
+        self._step1_web_token = None
+        self._step1_web_token_expiry = 0.0
+        # Pre-fill resolver cache to a deterministic single group id so
+        # the fan-out workers don't try to list_groups (PR #9 review fix #1).
+        self._resolved_default_group_id = "home-mesh-001"
+        self._default_group_lock = _threading.Lock()
         self._rest_session = None
 
     monkeypatch.setattr(FoyerClient, "__init__", _init)
@@ -126,5 +132,5 @@ class TestWifiPauseGroup:
         # Two REST calls (one per target)
         assert len(patched_foyer_client) == 2
         for call in patched_foyer_client:
-            assert call["path"] == "/v2/groups/default/stationBlocking"
+            assert call["path"] == "/v2/groups/home-mesh-001/stationBlocking"
             assert call["json"]["blocked"] == "true"
