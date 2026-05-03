@@ -166,11 +166,18 @@ _PHASE_C_HINT = (
 )
 
 _REFRESH_TOKEN_HINT = (
-    "Run `nest-cli auth wifi-refresh-bootstrap --experimental-wifi "
-    "--refresh-token <1//...>` to upgrade the credentials file to v3 "
-    "with a Google OAuth refresh token. Foyer REST endpoints at "
-    "`/v2/groups/...` need an OnHub-scoped access token that the Phase B "
-    "gpsoauth path cannot mint."
+    "Foyer REST endpoints at `/v2/groups/...` need an OnHub-scoped access "
+    "token that the Phase B gpsoauth path cannot mint. As of 2026, every "
+    "public method to obtain a Google OAuth refresh token (1//...) for "
+    "the Google Wifi web client_id has been retired by Google: "
+    "`programmatic_auth` returns 404, OAuth Playground rejects with "
+    "redirect_uri_mismatch, the device-flow grant rejects with "
+    "Invalid client type, and the AngeloD2022/onhubauthhelper Chrome "
+    "extension is broken. If you have a refresh token from a pre-2023 "
+    "extraction, run `nest-cli auth wifi-refresh-bootstrap "
+    "--experimental-wifi --refresh-token <1//...>` to persist it. "
+    "Otherwise track https://github.com/agileguy/nest-cli/issues for "
+    "Phase D auth-discovery progress."
 )
 
 _PHASE_D_HINT = (

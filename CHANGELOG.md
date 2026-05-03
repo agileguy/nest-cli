@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Documentation
+
+- Documented the 2026 OnHub OAuth dead-end discovered during Phase C live-verification on operator hardware (2026-05-03). Every public method to obtain a Google OAuth refresh token (`1//...`) for the Google Wifi web client_id `936475272427.apps.googleusercontent.com` has been closed by Google:
+  - `accounts.google.com/o/oauth2/programmatic_auth` returns server-side HTTP 404 (endpoint retired ~2023; `AngeloD2022/onhubauthhelper` Chrome extension depended on it and is broken).
+  - Google OAuth Playground rejects with `redirect_uri_mismatch` (client_id does not whitelist Playground's redirect URI).
+  - OAuth 2.0 Device Authorization Grant rejects with `Invalid client type` (it is a Web Application client, not registered for device flow).
+  - Substituting the Foyer ya29 access token (the one our gpsoauth + gRPC path mints successfully today) as the bearer for `oauthaccountmanager.googleapis.com/v1/issuetoken` returns HTTP 400 / 403 with insufficient scopes; gpsoauth cannot mint a token with the combined `accesspoints clouddevices` scopes via the Chromecast app signature (`RESTRICTED_CLIENT`), and the OnHub app's signing SHA1 is not public.
+- Phase B read verbs (`wifi list groups`, `wifi list points`, `wifi point-health`) remain fully operational via the gpsoauth + gRPC path — verified live against an Active T1 / Nest Wifi Pro mesh on 2026-05-03 (returned `[{id:"036f7d70-...", name:"Home", points:6, ...}]`).
+- Phase C action verbs (`wifi pause/unpause/prioritize/list-clients/speedtest/reboot`) ship as architecturally-correct code that fails fast at the auth pre-flight check with an updated `_REFRESH_TOKEN_HINT` reflecting the dead-end. The verbs cannot mutate Foyer state today; even attempting `wifi reboot point` or `wifi reboot group` exits 2 before any HTTP request is sent.
+- Possible future paths to unblock Phase C: Frida + mitmproxy on a rooted Android device to capture the live Google Home app's Foyer REST auth header; APK decompile of the current Google Home app to discover its OAuth flow; or wait for the community to publish a new bootstrap (no movement since 2023). Track at https://github.com/agileguy/nest-cli/issues for Phase D auth-discovery work.
+
+### Changed
+
+- `_REFRESH_TOKEN_HINT` updated to surface the 2026 auth dead-end rather than pointing operators at the broken `AngeloD2022/onhubauthhelper` and OAuth Playground methods.
+- SRD §17 gains a Phase C addendum (parallel to the Phase B note) documenting the auth investigation and architectural decisions in light of the finding.
+
 ## [0.5.0] - 2026-05-03
 
 ### Phase C — wifi action verbs implemented via Foyer REST (2026-05-03)

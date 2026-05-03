@@ -1453,4 +1453,74 @@ Empirical validation against a live Active T1 + Nest Wifi Pro mesh on 2026-05-03
 
 ---
 
+## §17 Phase C implementation note (2026-05-03 — wifi action verbs)
+
+This section documents the Phase C wifi-action-verb implementation that shipped as v0.5.0 (commit `8409e2a`, PR #9), and the operational dead-end discovered during live-verification on operator hardware the same day.
+
+### What Phase C ships (v0.5.0)
+
+Eight of the ten wifi action verbs deferred from Phase B are now implemented as REST calls against `googlehomefoyer-pa.googleapis.com/v2/...`:
+
+- `wifi list clients <group>` (FR-WIFI-3) — `GET /v2/groups/{gid}/stations`
+- `wifi pause <client>` (FR-WIFI-4) — `PUT /v2/groups/{gid}/stationBlocking` with `blocked=true`
+- `wifi unpause <client>` (FR-WIFI-5) — `PUT /v2/groups/{gid}/stationBlocking` with `blocked=false`
+- `wifi prioritize <client> --duration <m>` (FR-WIFI-6) — `PUT /v2/groups/{gid}/prioritizedStation`
+- `wifi speedtest run <group> --timeout <s>` (FR-WIFI-8) — `POST /v2/groups/{gid}/wanSpeedTest` + poll `/v2/operations/{id}` + `GET /v2/groups/{gid}/speedTestResults?maxResultCount=1`
+- `wifi speedtest history <group> --limit <n>` (FR-WIFI-9) — `GET /v2/groups/{gid}/speedTestResults?maxResultCount={n}`
+- `wifi reboot point <ap>` (FR-WIFI-10) — `POST /v2/accesspoints/{apId}/reboot`
+- `wifi reboot group <group>` (FR-WIFI-11) — `POST /v2/groups/{gid}/reboot`
+
+REST verbs share `FoyerClient._rest()` (synchronous `requests.Session`, no new dependencies). Status mapping: `401/403 → EXIT_AUTH_ERROR`, `404 → EXIT_NOT_FOUND`, `5xx → EXIT_NETWORK_ERROR`. Async operations (`wanSpeedTest`) route through `FoyerClient._wait_for_operation()` with a configurable per-call timeout.
+
+`set_station_group` (FR-WIFI-7) and `set_guest_enabled` / `wifi guest enable|disable` (FR-WIFI-14) remain exit-5 stubs. Their REST endpoints exist (per APK enumeration in `olssonm/google-wifi-api` issue #6) but the request body schemas are undocumented; the risk of corrupting station-group assignments or nuking guest-network config without a tested mapping was judged too high to ship in v0.5.0. Both deferred to Phase D.
+
+### The OnHub OAuth chain Phase C requires
+
+Foyer REST endpoints reject the gpsoauth-minted Foyer access token (the one Phase B uses successfully for the gRPC path). They require an OnHub-scoped access token derived through djtimca/googlewifi-api's two-step OAuth chain:
+
+1. **Step 1**: `POST https://www.googleapis.com/oauth2/v4/token` with `client_id=936475272427.apps.googleusercontent.com`, `grant_type=refresh_token`, `refresh_token=<creds.refresh_token>` → web access token (scope `OAuthLogin`).
+2. **Step 2**: `POST https://oauthaccountmanager.googleapis.com/v1/issuetoken` with `app_id=com.google.OnHub`, `client_id=586698244315-vc96jg3mn4nap78iir799fc2ll3rk18s.apps.googleusercontent.com`, `scope=https://www.googleapis.com/auth/accesspoints https://www.googleapis.com/auth/clouddevices`, bearer auth via Step 1 token → OnHub access token (used for every `/v2/...` REST call).
+
+Tokens cached with the same 60-second skew the Phase B gRPC path uses; Step 1 web token is cached separately from the OnHub token so a Step 2 transient failure does not re-burn refresh-token quota on retry.
+
+Schema: `WifiCredentials` bumped 2 → 3 with optional `refresh_token: str` field (`^1//[\w-]+$`). v2 files remain loadable; the Phase B gRPC read path continues to work without a refresh_token. New CLI verb `auth wifi-refresh-bootstrap` accepts the refresh token via `--refresh-token` flag, `GOOGLE_REFRESH_TOKEN` env var, or interactive `getpass` prompt, validates format, and upgrades the credentials file to v3 in place.
+
+### What broke during live-verification — the 2026 OAuth dead-end
+
+Operator attempted to obtain a refresh token on 2026-05-03 to live-verify Phase C against an Active T1 / Nest Wifi Pro mesh. Every public path is closed by Google as of 2026:
+
+- **Google OAuth Playground** — rejects with `redirect_uri_mismatch`. The `936475272427` client_id does not whitelist `developers.google.com/oauthplayground` as a redirect URI. (This is the same flow Step 1 of djtimca's chain expects to work; the chain is correct, the entry point is closed.)
+- **OAuth 2.0 Device Authorization Grant** (`oauth2.googleapis.com/device/code`) — rejects with `invalid_client / Invalid client type`. The `936475272427` client_id is registered as a Web Application type, not configured for device flow.
+- **`accounts.google.com/o/oauth2/programmatic_auth`** — returns server-side HTTP 404 (endpoint retired, confirmed by curl probe on 2026-05-03). This was the endpoint the `AngeloD2022/onhubauthhelper` Chrome extension used; the extension is broken and its `angelod.com/onhubauthtool` companion is offline.
+- **No working community tool exists in 2026**. Comprehensive search of Home Assistant community, Reddit, GitHub, and the `hagooglewifi` integration (effectively abandoned since mid-2023) turned up zero published methods that successfully produce the `1//` refresh token.
+
+Probed the alternative of using the gpsoauth-minted Foyer ya29 directly as the bearer for `oauthaccountmanager/v1/issuetoken` (i.e., bypassing the refresh_token requirement entirely):
+
+| Bearer source | issuetoken response | Notes |
+|---|---|---|
+| Foyer ya29 (scope `OAuthLogin`, Chromecast app/sig) | HTTP 400 `bad request` | wrong scope |
+| `accesspoints`-only ya29 (Chromecast app/sig — mintable) | HTTP 403 `insufficient authentication scopes` | scope subset insufficient |
+| Combined `accesspoints clouddevices` via gpsoauth (Chromecast app/sig) | gpsoauth `RESTRICTED_CLIENT` | Chromecast app not authorized for combined set |
+| OnHub app + Chromecast sig | gpsoauth `UNREGISTERED_ON_API_CONSOLE` | sig mismatch; OnHub app's real SHA1 is not public |
+| `com.google.android.apps.access.wifi.consumer` + Chromecast sig | gpsoauth `UNREGISTERED_ON_API_CONSOLE` | sig mismatch |
+
+Conclusion: there is no path to OnHub-scoped tokens from the master_token + gpsoauth alone, and there is no public path to obtain a refresh_token in 2026. The `1//` refresh token does not live on the Android filesystem in a readable form (Android's GMS authenticator stores only short-lived `ya29` access tokens in `accounts_ce.db`'s `authtokens` table).
+
+### What this means operationally
+
+Phase C v0.5.0 ships as architecturally-correct code that **cannot mutate Foyer state today**. Every action verb routes through one of two refresh-token gates:
+
+1. **Verbs that need a group id** (`pause`, `unpause`, `prioritize`) — pre-flight check in `_resolve_default_group_id` raises `EXIT_AUTH_ERROR` if `creds.refresh_token is None`.
+2. **Verbs with explicit ids** (`reboot point <ap>`, `reboot group <gid>`, `list_clients`, etc.) — first call to `_rest()` invokes `_refresh_onhub_access_token`, which raises `EXIT_AUTH_ERROR` on missing refresh_token.
+
+Both gates produce identical exit-2 behavior with the updated `_REFRESH_TOKEN_HINT` (see `nest_cli/wifi/client.py`). **No HTTP request reaches Foyer** before either gate fires. The auth dead-end is therefore also a safety floor: even an accidental `wifi reboot group` invocation cannot affect a real mesh.
+
+Read verbs (`wifi list groups`, `wifi list points`, `wifi point-health`) bypass both gates because they go through the gRPC `GetHomeGraph` path that uses the gpsoauth-minted ya29 (not the OnHub token). Verified live on 2026-05-03 against the operator's Active T1 + Nest Wifi Pro mesh: `wifi list groups --output json` returned `[{id:"036f7d70-a247-4dd0-a81e-24abb460f209", name:"Home", points:6, online:true, ...}]`. **Phase B reads remain fully operational.**
+
+### Phase D — the unblock plan
+
+Reverse-engineering the live Google Home app's OAuth flow on the operator's rooted Active T1 is the most actionable remaining path. See `docs/PHASE-D-OAUTH-REVERSE-ENGINEERING-PLAN.md` for the structured approach (Frida + mitmproxy traffic capture, cert-pinning bypass, replay scripting). On success, this section is updated and Phase C verbs become operational.
+
+---
+
 **End of document.**
