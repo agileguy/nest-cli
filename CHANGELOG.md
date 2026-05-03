@@ -7,6 +7,80 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-05-03
+
+### Added
+
+Phase 4 (SRD §16.6) — bulk operation primitives. Final phase of v1
+SRD; cross-cutting cam + wifi.
+
+- `resolve_target_or_group(config, target_or_group, *, expected_family)`
+  in `nest_cli/cli/_shared.py` (FR-5, FR-6) — translates a plain
+  alias, literal device path, or `@group-name` into an ordered list
+  of `ResolvedTarget` records. Cross-family group memberships
+  resolve with `family_match=False` so the executor can emit FR-5
+  exit-5 records for wrong-family members without aborting the rest
+  of the group. Unknown groups and groups referencing missing
+  aliases both surface as exit 4.
+- `nest_cli/cli/_fanout.py` — fan-out execution helper
+  (`fan_out_verb`) wrapping `ThreadPoolExecutor` with order-
+  preserving result collection. Default concurrency 3 (FR-7,
+  configurable via per-verb `--concurrency N`). Computes the FR-8a
+  aggregate exit code (0 / 7 / first-failure-code in resolved-
+  config order) and emits one FR-9a envelope per resolved target.
+  Synthesizes exit-5 records for `family_match=False` targets
+  without invoking the verb callable (FR-5).
+- `nest-cli batch --file <path>` / `--stdin` (FR-9, FR-10) — reads
+  newline-delimited commands and dispatches each via Click's in-
+  process `CliRunner` so SystemExit is captured per-line. Each
+  invocation gets `--jsonl` injected into its argv (when no output
+  flag is already present) so the inner verb's stdout is parseable
+  and stuffable into the FR-9a `result` field. Empty input exits 0
+  with no stdout (FR-10b); blank lines and `#` comments are silently
+  skipped.
+- SIGINT/SIGTERM handling for batch (FR-10c): cease dispatching new
+  sub-ops, emit final
+  `{"event":"interrupted","completed":N,"pending":M}` summary line,
+  exit 130 (SIGINT) or 143 (SIGTERM). Handlers save+restore so
+  in-process tests don't leak state.
+- `cam stream` and `cam events --follow` reject `@group` targets
+  with exit 64 (FR-8c, FR-8d). `cam events` without `--follow` MAY
+  accept a group target and the verb does NOT exit 64 on `@group`
+  (the one-shot drain has bounded output that fan-out can demux).
+- Per-verb group fan-out wired into `cam info` and `wifi pause` as
+  representative integrations:
+  - `cam info @home-cams` → FR-9a JSONL per camera; pre-loads cam
+    credentials once before the fan-out so per-target threads share
+    a refreshed access token.
+  - `wifi pause @kids-devices` → FR-9a JSONL per resolved client
+    with the `wifi:` prefix stripped before the FoyerClient call.
+- 47 new tests (396 → 443) under `tests/batch/` plus
+  `tests/cam/test_stream_group_reject.py` and
+  `tests/cam/test_events_follow_group_reject.py`. Coverage:
+  resolver shape (single alias, literal path, `@group`, unknown
+  group, unknown member alias, cross-family flagged), executor
+  ordering / concurrency / exit-code arithmetic / cross-family
+  synthesis, batch happy path / partial failure / first-failure-
+  code aggregate / empty input / comments / SIGINT / SIGTERM /
+  handler restoration, and the cam-info-group + wifi-pause-group
+  end-to-end integrations.
+
+### Changed
+
+- `nest_cli/cli/__init__.py` registers the new `batch_cmd` verb on
+  the root `cli` group.
+- `family_for_target` in `_shared.py` now returns
+  `Literal["cam", "wifi"]` instead of `str` so the
+  `ResolvedTarget` dataclass stays statically type-checked.
+
+### Deferred (Phase 5+)
+
+- `groups add` / `groups remove` mutations (FR-8b — explicit
+  deferral; mutations remain manual TOML edits).
+- Whole-batch concurrency (the brief is per-group concurrency, not
+  whole-batch concurrency).
+- Cron-like scheduled batch.
+
 ## [0.3.1] - 2026-05-03
 
 ### Added

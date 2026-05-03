@@ -8,7 +8,7 @@ from nest_cli.__main__ import main
 
 def test_version_constant_matches_pyproject() -> None:
     """The package-level __version__ is the canonical value pyproject mirrors."""
-    assert nest_cli.__version__ == "0.1.0"
+    assert nest_cli.__version__ == "0.4.0"
 
 
 def test_version_flag_exits_clean() -> None:
@@ -16,7 +16,7 @@ def test_version_flag_exits_clean() -> None:
     runner = CliRunner()
     result = runner.invoke(main, ["--version"])
     assert result.exit_code == 0
-    assert "0.1.0" in result.output
+    assert "0.4.0" in result.output
 
 
 def test_no_args_shows_help() -> None:
