@@ -169,3 +169,58 @@ class TestEmitStructuredErrorToStderr:
         captured = capsys.readouterr()
         payload = json.loads(captured.err)
         assert payload["details"] == {"credential": "oauth_refresh_token"}
+
+
+class TestStructuredErrorFamilyField:
+    """SRD §11.3 — optional family discriminator on the error envelope.
+
+    The wifi side (Phase 3) emits ``family="wifi"`` so operators piping
+    JSONL through ``jq 'select(.family == "wifi")'`` can filter without
+    inspecting the closed enum. The cam side (v0.1.0 / v0.2.x) was
+    shipped without the field; we keep that envelope bit-identical for
+    back-compat — a follow-up retrofit is tracked in ARCHITECTURE.md.
+    """
+
+    def test_default_family_is_none(self) -> None:
+        err = StructuredError(code=EXIT_DEVICE_ERROR, message="boom")
+        assert err.family is None
+
+    def test_family_can_be_set_to_wifi(self) -> None:
+        err = StructuredError(
+            code=EXIT_NETWORK_ERROR,
+            message="foyer rotated",
+            family="wifi",
+        )
+        assert err.family == "wifi"
+
+    def test_json_envelope_includes_family_when_set(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        err = StructuredError(
+            code=EXIT_NETWORK_ERROR,
+            message="foyer rotated",
+            family="wifi",
+        )
+        emit_structured_error_to_stderr(err, output_mode="json")
+        payload = json.loads(capsys.readouterr().err)
+        assert payload["family"] == "wifi"
+
+    def test_json_envelope_omits_family_when_none(self, capsys: pytest.CaptureFixture[str]) -> None:
+        # Cam-side back-compat: no family field on the envelope.
+        err = StructuredError(code=EXIT_AUTH_ERROR, message="creds rejected")
+        emit_structured_error_to_stderr(err, output_mode="json")
+        payload = json.loads(capsys.readouterr().err)
+        assert "family" not in payload
+
+    def test_text_mode_does_not_emit_family_anywhere(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # Text mode is human-only; family is operator metadata for jq.
+        err = StructuredError(
+            code=EXIT_NETWORK_ERROR,
+            message="foyer rotated",
+            family="wifi",
+        )
+        emit_structured_error_to_stderr(err, output_mode="text")
+        captured = capsys.readouterr()
+        assert "family" not in captured.err.lower()
