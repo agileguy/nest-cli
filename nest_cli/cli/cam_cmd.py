@@ -621,20 +621,15 @@ def _try_snapshot_tiers(client: SdmClient, camera: Camera) -> tuple[bytes, str]:
     if has_camera_event_image:
         event_id = _fetch_recent_event_id(client, camera)
         if event_id is not None:
-            try:
-                result = client.execute_command(
-                    camera.target_id,
-                    _SDM_CMD_CAMERA_EVENT_IMAGE,
-                    {"eventId": event_id},
-                )
-                url, token = _parse_image_url_and_token(result, mechanism="camera_event_image")
-                return _download_snapshot_bytes(url, token), "camera_event_image"
-            except StructuredError:
-                # Tier 2 also failed — surface its error directly. Auth
-                # rejections at tier 2 still propagate as exit 2 because
-                # the SDM client raises EXIT_AUTH_ERROR; we re-raise the
-                # exception unchanged.
-                raise
+            # Tier 2 errors (including EXIT_AUTH_ERROR per FR-CAM-4a)
+            # propagate unchanged; the verb has no further fallback.
+            result = client.execute_command(
+                camera.target_id,
+                _SDM_CMD_CAMERA_EVENT_IMAGE,
+                {"eventId": event_id},
+            )
+            url, token = _parse_image_url_and_token(result, mechanism="camera_event_image")
+            return _download_snapshot_bytes(url, token), "camera_event_image"
 
     # Tier 2 wasn't available (no CameraEventImage trait OR no recent
     # event in window). If tier 1 failed earlier, surface that error;

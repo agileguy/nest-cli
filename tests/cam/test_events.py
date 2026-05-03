@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
 
+import google.api_core.exceptions
 import pytest
 from click.testing import CliRunner
 
@@ -384,8 +385,6 @@ class TestAckFailureSurfaced:
         Fix logs a warning to stderr including the exception type and
         the count of un-acked messages.
         """
-        import google.api_core.exceptions
-
         fake_paths["config"].write_text(
             '[pubsub]\nsubscription_name = "projects/proj/subscriptions/sdm-events"\n',
             encoding="utf-8",
