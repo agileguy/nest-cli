@@ -6,11 +6,12 @@ This package wires every subcommand under a single ``click.Group`` named
 
 Subcommand layout:
 
-- ``auth``     — Engineer A's OAuth credentials management.
-- ``cam``      — Engineer B's camera commands (list/info/capabilities).
-- ``config``   — Engineer B's config inspection (show/validate).
-- ``list``     — Engineer B's alias/group listing (FR-1..1d).
-- ``discover`` — Engineer B's live SDM device probe (FR-2/2a).
+- ``auth``     — OAuth (cam) + Foyer master token (wifi) credentials management.
+- ``cam``      — camera commands (list/info/capabilities/snapshot/stream/...).
+- ``config``   — config inspection (show/validate).
+- ``list``     — alias/group listing (FR-1..1d).
+- ``discover`` — live SDM device probe (FR-2/2a).
+- ``wifi``     — Wi-Fi mesh commands (FR-WIFI-1..3, EXPERIMENTAL).
 """
 
 from __future__ import annotations
@@ -29,6 +30,7 @@ from nest_cli.cli import list_cmd as _list_module
 from nest_cli.cli.auth_cmd import auth_group
 from nest_cli.cli.cam_cmd import cam_group
 from nest_cli.cli.config_cmd import config_group
+from nest_cli.cli.wifi_cmd import wifi_group
 
 _list_cmd = _list_module.list_cmd
 _discover_cmd = _list_module.discover_cmd
@@ -42,7 +44,7 @@ def cli(ctx: click.Context) -> None:
 
     The cam surface (``cam``, ``list``, ``discover``) ships in v0.1.0.
     The wifi surface is gated behind ``--experimental-wifi`` and ships
-    in Phase 3.
+    in v0.3.0 (Phase 3).
     """
     if ctx.invoked_subcommand is None:
         click.echo(ctx.get_help())
@@ -53,6 +55,7 @@ cli.add_command(cam_group)
 cli.add_command(config_group)
 cli.add_command(_list_cmd)
 cli.add_command(_discover_cmd)
+cli.add_command(wifi_group)
 
 
 __all__ = ["cli"]
