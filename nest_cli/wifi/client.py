@@ -60,7 +60,7 @@ Upstream googlewifi version notes
 from __future__ import annotations
 
 import asyncio
-from typing import Any
+from typing import Any, cast
 
 from nest_cli.errors import (
     EXIT_DEVICE_ERROR,
@@ -69,9 +69,20 @@ from nest_cli.errors import (
     EXIT_UNSUPPORTED_FEATURE,
     StructuredError,
 )
-from nest_cli.wifi.types import WifiClient, WifiGroup, WifiPoint
+from nest_cli.wifi.types import (
+    SpeedTest,
+    WifiClient,
+    WifiGroup,
+    WifiNetwork,
+    WifiPoint,
+    WifiPointHealth,
+)
 
 __all__ = ["FoyerClient"]
+
+# Default speed-test timeout in seconds (FR-WIFI-8). Foyer reports speed
+# tests typically complete in 30-90s; 180s is a safe default ceiling.
+_DEFAULT_SPEEDTEST_TIMEOUT_S = 180.0
 
 
 # ---------------------------------------------------------------------------
@@ -326,6 +337,204 @@ class FoyerClient:
         )
 
     # ------------------------------------------------------------------
+    # Phase 3.1 surface (FR-WIFI-8..15)
+    # ------------------------------------------------------------------
+
+    def run_speedtest(
+        self,
+        group_id: str,
+        *,
+        timeout_s: float = _DEFAULT_SPEEDTEST_TIMEOUT_S,
+    ) -> SpeedTest:
+        """Trigger a fresh speed test on ``group_id`` and block (FR-WIFI-8).
+
+        Wraps the upstream ``run_speed_test(system_id)`` coroutine, which
+        polls Foyer's speedtest operation every 5s and returns when it's
+        DONE. We bound the wall-clock with ``asyncio.wait_for(timeout=N)``
+        so the CLI can honor a ``--timeout`` flag rather than waiting
+        indefinitely on a stuck operation.
+
+        Args:
+            group_id: The mesh group to run the test on (typically the
+                group whose master router will execute the test).
+            timeout_s: Wall-clock ceiling. Default 180s. Exceeding this
+                raises ``StructuredError(EXIT_NETWORK_ERROR, family="wifi")``.
+
+        Returns:
+            One §10.9 ``SpeedTest`` record with download/upload Mbps,
+            ping ms, and the operating point id.
+
+        Raises:
+            StructuredError: exit 3 (network) on timeout or transport
+                failure; exit 1 (device) on upstream library shape rot;
+                exit 4 (not_found) only if the group lookup is wired
+                through (currently the upstream call doesn't validate
+                group_id locally).
+        """
+        result = self._run(lambda: self._action_run_speedtest(group_id, timeout_s))
+        try:
+            return SpeedTest.from_googlewifi_response(group_id=group_id, payload=result)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise self._upstream_shape_error(
+                "speed_test result",
+                f"normalizing speed-test record: {exc}",
+            ) from exc
+
+    def get_speedtest_history(self, group_id: str, *, limit: int) -> list[SpeedTest]:
+        """Return the most recent speed-test history (FR-WIFI-9).
+
+        Sorted descending by ``ts`` (most recent first). Foyer caps the
+        upstream ``maxResultCount`` at 365; the verb defaults to 30.
+
+        Args:
+            group_id: The mesh group to read history from.
+            limit: Maximum results to return. Caller-validated;
+                this method trusts the input.
+
+        Returns:
+            A list of §10.9 SpeedTest records, descending by ``ts``,
+            capped at ``limit``. Empty list if the group has no history.
+        """
+        results = self._run(lambda: self._action_speedtest_history(group_id))
+        records: list[SpeedTest] = []
+        for entry in results:
+            try:
+                records.append(SpeedTest.from_googlewifi_response(group_id=group_id, payload=entry))
+            except (KeyError, TypeError, ValueError) as exc:
+                raise self._upstream_shape_error(
+                    "speed_test_results",
+                    f"normalizing history entry: {exc}",
+                ) from exc
+        records.sort(key=lambda r: r.ts, reverse=True)
+        return records[:limit]
+
+    def reboot_point(self, point_id: str) -> None:
+        """Reboot a single point (FR-WIFI-10).
+
+        Validates that the point exists in any of the operator's groups
+        before issuing the upstream ``restart_ap`` call — that way the
+        operator gets a clean exit-4 on a typo rather than a silent
+        no-op.
+        """
+        self._run(lambda: self._action_reboot_point(point_id))
+
+    def reboot_group(self, group_id: str) -> list[str]:
+        """Reboot every point in ``group_id`` (FR-WIFI-11).
+
+        Returns the list of point ids that were rebooted (resolved
+        from ``get_systems()`` before the upstream ``restart_system``
+        call) so the CLI verb can echo them on stderr per FR-WIFI-11.
+
+        Group not found → exit 4 (family=wifi). Network/shape errors
+        map per ``_run``.
+        """
+        return cast("list[str]", self._run(lambda: self._action_reboot_group(group_id)))
+
+    def get_network_info(self, group_id: str) -> WifiNetwork:
+        """Emit network-level config for ``group_id`` (FR-WIFI-13).
+
+        Reads from ``get_systems()`` (no separate Foyer endpoint exists
+        for network-info specifically) and projects the result onto the
+        §10.10 WifiNetwork record. Group not found → exit 4 (family=wifi).
+        """
+        systems = self._run(self._fetch_systems)
+        if group_id not in systems:
+            raise StructuredError(
+                code=EXIT_NOT_FOUND,
+                message=f"wifi group {group_id!r} not found",
+                hint=(
+                    "Run `nest-cli wifi list groups --experimental-wifi` "
+                    "to see the groups your account owns."
+                ),
+                family="wifi",
+                details={"group_id": group_id},
+            )
+        try:
+            return WifiNetwork.from_googlewifi_response(group_id, systems[group_id])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise self._upstream_shape_error(
+                "network_info",
+                f"normalizing group {group_id!r}: {exc}",
+            ) from exc
+
+    def set_guest_enabled(self, group_id: str, *, enabled: bool) -> None:
+        """Toggle the guest network on a mesh group (FR-WIFI-14).
+
+        Phase 3.1 status: ``googlewifi`` does NOT expose a guest-toggle
+        method (the Foyer endpoint exists but isn't wrapped). Mirrors
+        ``set_station_group``'s posture — the CLI surface ships, the
+        verb wires through, the operator sees a clean exit-5
+        (unsupported_feature, family="wifi") with a hint pointing at
+        the upstream gap. Once a ``set_guest_network`` (or similar)
+        method lands upstream, this stub gets replaced with the real
+        async call and the verb starts succeeding without any
+        operator-visible interface change.
+
+        Args:
+            group_id: The mesh group whose guest network to toggle.
+                Captured on ``details`` for jq pipelines.
+            enabled: True to enable, False to disable. Captured on
+                ``details``.
+        """
+        raise StructuredError(
+            code=EXIT_UNSUPPORTED_FEATURE,
+            message=(
+                "wifi guest enable/disable is not yet supported by the "
+                "upstream googlewifi library (no guest-network setter "
+                "method exposed)."
+            ),
+            hint=(
+                "The Foyer endpoint exists but is not wrapped by "
+                "googlewifi as of the version pinned in nest-cli's "
+                "[wifi] extra. Track upstream at "
+                "https://pypi.org/project/googlewifi/ — once a "
+                "guest-network mutator method ships, this verb will be "
+                "re-enabled."
+            ),
+            family="wifi",
+            details={"group_id": group_id, "requested_enabled": enabled},
+        )
+
+    def get_point_health(self, point_id: str) -> WifiPointHealth:
+        """Return the health snapshot for a single point (FR-WIFI-15).
+
+        Walks the same ``get_systems()`` payload that ``list_points``
+        uses, locates the point by id across all groups, and projects
+        it onto the §10.11 WifiPointHealth record. Unknown point → exit 4.
+        """
+        systems = self._run(self._fetch_systems)
+        for _group_id, record in systems.items():
+            if not isinstance(record, dict):
+                continue
+            ap_payload = _find_ap(record, point_id)
+            if ap_payload is None:
+                continue
+            devices = record.get("devices") or record.get("stations") or {}
+            per_ap_count = _count_clients_per_ap(devices)
+            try:
+                point = WifiPoint.from_googlewifi_response(
+                    ap_payload,
+                    connected_clients_count=per_ap_count.get(point_id, 0),
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                raise self._upstream_shape_error(
+                    "access_points",
+                    f"normalizing point {point_id!r}: {exc}",
+                ) from exc
+            return WifiPointHealth.from_wifi_point(point)
+
+        raise StructuredError(
+            code=EXIT_NOT_FOUND,
+            message=f"wifi point {point_id!r} not found in any mesh group",
+            hint=(
+                "Run `nest-cli wifi list points <group> --experimental-wifi` "
+                "to see the points in each of your groups."
+            ),
+            family="wifi",
+            details={"point_id": point_id},
+        )
+
+    # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
 
@@ -352,6 +561,97 @@ class FoyerClient:
             systems = await gw.get_systems()
             group_id = _resolve_group_for_client(systems, client_id)
             await gw.prioritize_device(group_id, client_id, duration_hours)
+        finally:
+            await _maybe_close(gw)
+
+    async def _action_run_speedtest(self, group_id: str, timeout_s: float) -> Any:
+        """Drive the upstream ``run_speed_test`` with a wall-clock ceiling.
+
+        ``run_speed_test`` polls ``check_operation`` every 5s until DONE
+        and returns the first speed-test result. We bound it with
+        ``asyncio.wait_for(timeout=N)`` so a stuck or rotating Foyer
+        operation surfaces as a clean exit-3 rather than hanging the CLI.
+        """
+        gw = self._gw_class(refresh_token=self._master_token)
+        try:
+            try:
+                return await asyncio.wait_for(
+                    gw.run_speed_test(system_id=group_id),
+                    timeout=timeout_s,
+                )
+            except TimeoutError as exc:
+                raise StructuredError(
+                    code=EXIT_NETWORK_ERROR,
+                    message=(f"speed test did not complete within {timeout_s:g}s"),
+                    hint=(
+                        "Pass --timeout <seconds> to extend the wall-clock "
+                        "ceiling, or rerun the verb. A slow speed test is "
+                        "usually transient."
+                    ),
+                    family="wifi",
+                    details={"group_id": group_id, "timeout_s": timeout_s},
+                ) from exc
+        finally:
+            await _maybe_close(gw)
+
+    async def _action_speedtest_history(self, group_id: str) -> list[Any]:
+        """Drive the upstream ``speed_test_results(system_id)`` coroutine."""
+        gw = self._gw_class(refresh_token=self._master_token)
+        try:
+            results = await gw.speed_test_results(system_id=group_id)
+        finally:
+            await _maybe_close(gw)
+        if not isinstance(results, list):
+            raise self._upstream_shape_error(
+                "speed_test_results",
+                f"expected list, got {type(results).__name__}",
+            )
+        return results
+
+    async def _action_reboot_point(self, point_id: str) -> None:
+        """Locate the point in any group then call upstream ``restart_ap``.
+
+        ``restart_ap`` upstream takes only an ``ap_id`` (no group_id),
+        but we still resolve the point against ``get_systems()`` so a
+        typo surfaces as exit 4 instead of an opaque upstream success.
+        """
+        gw = self._gw_class(refresh_token=self._master_token)
+        try:
+            systems = await gw.get_systems()
+            if not _point_exists(systems, point_id):
+                raise StructuredError(
+                    code=EXIT_NOT_FOUND,
+                    message=f"wifi point {point_id!r} not found in any mesh group",
+                    hint=(
+                        "Run `nest-cli wifi list points <group> --experimental-wifi` "
+                        "for each group to see the available points."
+                    ),
+                    family="wifi",
+                    details={"point_id": point_id},
+                )
+            await gw.restart_ap(point_id)
+        finally:
+            await _maybe_close(gw)
+
+    async def _action_reboot_group(self, group_id: str) -> list[str]:
+        """Resolve ``group_id`` to its point list then ``restart_system``."""
+        gw = self._gw_class(refresh_token=self._master_token)
+        try:
+            systems = await gw.get_systems()
+            if group_id not in systems:
+                raise StructuredError(
+                    code=EXIT_NOT_FOUND,
+                    message=f"wifi group {group_id!r} not found",
+                    hint=(
+                        "Run `nest-cli wifi list groups --experimental-wifi` "
+                        "to see the groups your account owns."
+                    ),
+                    family="wifi",
+                    details={"group_id": group_id},
+                )
+            point_ids = _point_ids_for_group(systems, group_id)
+            await gw.restart_system(group_id)
+            return sorted(point_ids)
         finally:
             await _maybe_close(gw)
 
@@ -544,3 +844,55 @@ def _count_clients_per_ap(devices: Any) -> dict[str, int]:
         if isinstance(ap_id, str) and ap_id:
             counts[ap_id] = counts.get(ap_id, 0) + 1
     return counts
+
+
+def _find_ap(record: dict[str, Any], point_id: str) -> dict[str, Any] | None:
+    """Return the access-point payload with id == ``point_id`` from a group.
+
+    Walks both dict-of-aps and list-of-aps shapes. Returns ``None`` if
+    the point isn't present in this group.
+    """
+    aps = record.get("access_points") or record.get("accessPoints") or {}
+    if isinstance(aps, dict):
+        if point_id in aps and isinstance(aps[point_id], dict):
+            return cast("dict[str, Any]", aps[point_id])
+        for ap in aps.values():
+            if not isinstance(ap, dict):
+                continue
+            if (ap.get("id") or ap.get("apId")) == point_id:
+                return cast("dict[str, Any]", ap)
+    elif isinstance(aps, list):
+        for ap in aps:
+            if isinstance(ap, dict) and (ap.get("id") or ap.get("apId")) == point_id:
+                return cast("dict[str, Any]", ap)
+    return None
+
+
+def _point_exists(systems: dict[str, Any], point_id: str) -> bool:
+    """Return True if any group in ``systems`` contains a point with id ``point_id``."""
+    for record in systems.values():
+        if isinstance(record, dict) and _find_ap(record, point_id) is not None:
+            return True
+    return False
+
+
+def _point_ids_for_group(systems: dict[str, Any], group_id: str) -> list[str]:
+    """Return the access-point ids for a single group.
+
+    Walks both dict-of-aps and list-of-aps shapes. Returns ``[]`` if the
+    group has no points (which would be unusual; FoyerClient.reboot_group
+    treats an empty list as a still-valid no-op).
+    """
+    record = systems.get(group_id) or {}
+    if not isinstance(record, dict):
+        return []
+    aps = record.get("access_points") or record.get("accessPoints") or {}
+    if isinstance(aps, dict):
+        return [
+            (ap.get("id") or ap.get("apId") or key)
+            for key, ap in aps.items()
+            if isinstance(ap, dict)
+        ]
+    if isinstance(aps, list):
+        return [(ap.get("id") or ap.get("apId") or "") for ap in aps if isinstance(ap, dict)]
+    return []

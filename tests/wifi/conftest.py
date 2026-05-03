@@ -39,6 +39,8 @@ class _FakeGoogleWifi:
     Phase 3B surface (action verbs): ``connect``, ``pause_device``,
     ``prioritize_device``. Each action method records its call args
     on ``self.calls`` for spy-style assertion in tests.
+    Phase 3.1 surface: ``run_speed_test``, ``speed_test_results``,
+    ``restart_ap``, ``restart_system``. Same call-recording protocol.
     """
 
     # Class-level call recorder so tests can assert against the LAST
@@ -92,6 +94,81 @@ class _FakeGoogleWifi:
             )
         )
         return True
+
+    # ------------------------------------------------------------------
+    # Phase 3.1 surface (FR-WIFI-8..15)
+    # ------------------------------------------------------------------
+
+    async def run_speed_test(self, system_id: str) -> dict[str, Any]:
+        """Spy that records and returns one canned speed test result.
+
+        The returned shape matches what upstream's ``run_speed_test``
+        emits — one dict from ``speed_test_results`` (the upstream
+        method polls then returns ``results[0]``). Override on a
+        subclass to test timeout / error paths.
+        """
+        self.calls.append(("run_speed_test", (system_id,), {}))
+        return {
+            "downloadSpeedBps": 950_000_000,
+            "uploadSpeedBps": 110_000_000,
+            "pingMs": 8.5,
+            "timestamp": "2026-05-02T18:00:00Z",
+            "apId": _master_ap_for(self._systems, system_id),
+        }
+
+    async def speed_test_results(self, system_id: str) -> list[dict[str, Any]]:
+        """Spy that records and returns up to 30 canned history entries.
+
+        Returns a small descending-by-ts series so list-mode tests can
+        verify ordering. Override to control limit on a per-test basis.
+        """
+        self.calls.append(("speed_test_results", (system_id,), {}))
+        return [
+            {
+                "downloadSpeedBps": 900_000_000,
+                "uploadSpeedBps": 100_000_000,
+                "pingMs": 9.0,
+                "timestamp": "2026-05-02T18:00:00Z",
+                "apId": _master_ap_for(self._systems, system_id),
+            },
+            {
+                "downloadSpeedBps": 850_000_000,
+                "uploadSpeedBps": 95_000_000,
+                "pingMs": 12.0,
+                "timestamp": "2026-05-02T12:00:00Z",
+                "apId": _master_ap_for(self._systems, system_id),
+            },
+            {
+                "downloadSpeedBps": 920_000_000,
+                "uploadSpeedBps": 105_000_000,
+                "pingMs": 7.5,
+                "timestamp": "2026-05-02T06:00:00Z",
+                "apId": _master_ap_for(self._systems, system_id),
+            },
+        ]
+
+    async def restart_ap(self, ap_id: str) -> bool:
+        """Spy that records a restart_ap call. Returns True (success)."""
+        self.calls.append(("restart_ap", (ap_id,), {}))
+        return True
+
+    async def restart_system(self, system_id: str) -> bool:
+        """Spy that records a restart_system call. Returns True."""
+        self.calls.append(("restart_system", (system_id,), {}))
+        return True
+
+
+def _master_ap_for(systems: dict[str, Any], system_id: str) -> str:
+    """Return the master AP id for a given system (helper for fakes)."""
+    record = systems.get(system_id) or {}
+    aps = record.get("access_points") or {}
+    if isinstance(aps, dict):
+        for ap_id, ap in aps.items():
+            if isinstance(ap, dict) and ap.get("isMaster"):
+                return ap_id
+        if aps:
+            return next(iter(aps))
+    return system_id
 
 
 @pytest.fixture

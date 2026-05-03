@@ -23,6 +23,15 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_serializer
 
+__all__ = [
+    "SpeedTest",
+    "WifiClient",
+    "WifiGroup",
+    "WifiNetwork",
+    "WifiPoint",
+    "WifiPointHealth",
+]
+
 # ---------------------------------------------------------------------------
 # Shared helpers — googlewifi response normalizers
 # ---------------------------------------------------------------------------
@@ -452,3 +461,302 @@ def _normalize_group_assignment(
         if lowered in ("family", "parental", "guest"):
             return lowered  # type: ignore[return-value]
     return None
+
+
+# ---------------------------------------------------------------------------
+# SpeedTest (SRD §10.9)
+# ---------------------------------------------------------------------------
+
+
+class SpeedTest(BaseModel):
+    """One Wi-Fi speed-test result emitted by the master router (§10.9).
+
+    The Foyer router reports speeds in bits-per-second; the SRD field
+    contract is megabits-per-second so ``from_googlewifi_response`` divides
+    the upstream value by 1_000_000 at the boundary. ``ts`` is RFC 3339
+    UTC; the JSON serializer emits the literal ``Z`` suffix per FR-22.
+    ``source`` is locked to ``"router"`` — every speed test in v0.3.1
+    runs on the master router. Future surfaces (Ookla, Speedtest.net) will
+    be discriminated via this field.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    ts: datetime
+    group_id: str = Field(..., min_length=1)
+    point_id: str = Field(..., min_length=1)
+    download_mbps: float = Field(..., ge=0.0)
+    upload_mbps: float = Field(..., ge=0.0)
+    ping_ms: float = Field(..., ge=0.0)
+    source: Literal["router"] = "router"
+
+    @field_serializer("ts", when_used="json")
+    def _serialize_ts(self, dt: datetime) -> str:
+        """Render ``ts`` as RFC 3339 UTC with the literal ``Z`` (FR-22)."""
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        return dt.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+    @classmethod
+    def from_googlewifi_response(cls, *, group_id: str, payload: Any) -> SpeedTest:
+        """Build a SpeedTest from one ``speed_test_results`` entry.
+
+        Foyer's ``GET /v2/groups/{system_id}/speedTestResults`` returns
+        a list of objects shaped roughly like::
+
+            {
+              "downloadSpeedBps": 900_000_000,
+              "uploadSpeedBps":   120_000_000,
+              "pingMs":           12.5,
+              "timestamp":        "2026-05-02T12:00:00Z",
+              "apId":             "ap-master-living-room"
+            }
+
+        Field names rotate occasionally on the upstream side; the
+        helpers below try several plausible aliases. Bits-per-second
+        values are converted to Mbps (divide by 1_000_000) so downstream
+        consumers see the SRD §10.9 wire shape directly.
+        """
+        record = _as_mapping(payload)
+
+        download_bps = _opt_float(record, "downloadSpeedBps", "download_speed_bps")
+        upload_bps = _opt_float(record, "uploadSpeedBps", "upload_speed_bps")
+        # If upstream gives Mbps directly (older fork / future variant),
+        # accept it as the fallback path.
+        download_mbps = _opt_float(record, "downloadMbps", "download_mbps")
+        upload_mbps = _opt_float(record, "uploadMbps", "upload_mbps")
+        if download_mbps is None and download_bps is not None:
+            download_mbps = download_bps / 1_000_000.0
+        if upload_mbps is None and upload_bps is not None:
+            upload_mbps = upload_bps / 1_000_000.0
+        if download_mbps is None:
+            download_mbps = 0.0
+        if upload_mbps is None:
+            upload_mbps = 0.0
+
+        ping_ms = _opt_float(record, "pingMs", "ping_ms", "latencyMs")
+        if ping_ms is None:
+            ping_ms = 0.0
+
+        ts_raw = _opt_str(record, "timestamp", "ts", "time")
+        ts = _parse_rfc3339(ts_raw) if ts_raw else datetime.now(tz=UTC)
+
+        point_id = _opt_str(record, "apId", "ap_id", "point_id") or group_id
+
+        return cls(
+            ts=ts,
+            group_id=group_id,
+            point_id=point_id,
+            download_mbps=download_mbps,
+            upload_mbps=upload_mbps,
+            ping_ms=ping_ms,
+            source="router",
+        )
+
+
+def _parse_rfc3339(raw: str) -> datetime:
+    """Parse an RFC 3339 string with either ``Z`` or ``+HH:MM`` offset.
+
+    Falls back to a UTC ``now()`` if the string can't be parsed —
+    same defensive posture as ``_extract_priority_until``.
+    """
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return datetime.now(tz=UTC)
+
+
+# ---------------------------------------------------------------------------
+# WifiNetwork (SRD §10.10)
+# ---------------------------------------------------------------------------
+
+
+class WifiNetworkIPv4(BaseModel):
+    """Nested IPv4 block of WifiNetwork (SRD §10.10)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    wan: str = Field(..., min_length=1)
+    lan_subnet: str = Field(..., min_length=1)
+    dhcp_range_start: str = Field(..., min_length=1)
+    dhcp_range_end: str = Field(..., min_length=1)
+
+
+class WifiNetworkIPv6(BaseModel):
+    """Nested IPv6 block of WifiNetwork (SRD §10.10).
+
+    ``enabled`` is the toggle; ``wan`` and ``prefix_len`` are populated
+    only when IPv6 is on. A disabled IPv6 network surfaces as
+    ``{"enabled": false, "wan": null, "prefix_len": null}``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool
+    wan: str | None = None
+    prefix_len: int | None = Field(default=None, ge=0, le=128)
+
+
+class WifiNetwork(BaseModel):
+    """Network-level configuration for a Wi-Fi mesh group (SRD §10.10).
+
+    SRD fields exactly. The classmethod ``from_googlewifi_response``
+    extracts SSIDs, guest toggle, IPv4/IPv6 WAN+LAN settings, and DNS
+    servers from a ``get_systems()`` per-group entry. Missing nested
+    fields fall back to ``"<unknown>"`` (strings) or ``False`` (bools)
+    so the operator sees a populated record on a sparse Foyer payload
+    rather than a 500.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    group_id: str = Field(..., min_length=1)
+    ssid: str = Field(..., min_length=1)
+    guest_ssid: str | None = None
+    guest_enabled: bool
+    ipv4: WifiNetworkIPv4
+    ipv6: WifiNetworkIPv6
+    dns_servers: list[str]
+
+    @classmethod
+    def from_googlewifi_response(cls, group_id: str, payload: Any) -> WifiNetwork:
+        """Build a WifiNetwork from a ``get_systems()`` entry.
+
+        Defensive extraction: every nested block is treated as optional.
+        Foyer's payload occasionally omits ``wanSettings`` on offline
+        groups; we surface ``"<unknown>"`` rather than failing the model.
+        """
+        record = _as_mapping(payload)
+        group_settings = record.get("groupSettings") or {}
+        if not isinstance(group_settings, dict):
+            group_settings = {}
+
+        ap_settings = group_settings.get("apSettings") or {}
+        if not isinstance(ap_settings, dict):
+            ap_settings = {}
+        ssid = _opt_str(ap_settings, "ssid") or _opt_str(record, "ssid") or "<unknown-ssid>"
+
+        guest = group_settings.get("guestSsid") or {}
+        if not isinstance(guest, dict):
+            guest = {}
+        guest_enabled = _opt_bool(guest, "enabled") or False
+        guest_ssid = _opt_str(guest, "ssid")
+
+        ipv4 = _extract_ipv4(record, group_settings)
+        ipv6 = _extract_ipv6(record)
+        dns_servers = _extract_dns_servers(group_settings)
+
+        return cls(
+            group_id=group_id,
+            ssid=ssid,
+            guest_ssid=guest_ssid,
+            guest_enabled=guest_enabled,
+            ipv4=ipv4,
+            ipv6=ipv6,
+            dns_servers=dns_servers,
+        )
+
+
+def _extract_ipv4(record: dict[str, Any], group_settings: dict[str, Any]) -> WifiNetworkIPv4:
+    """Build a WifiNetworkIPv4 from a Foyer per-group record.
+
+    WAN address comes from ``wanSettings.ipv4Address``; LAN subnet and
+    DHCP range come from ``groupSettings.lanSettings``. Missing values
+    fall back to ``"<unknown>"`` so the model stays valid (the field
+    is non-empty per the SRD).
+    """
+    wan_settings = record.get("wanSettings") or {}
+    if not isinstance(wan_settings, dict):
+        wan_settings = {}
+    wan = _opt_str(wan_settings, "ipv4Address", "wan", "ipv4_address") or "<unknown>"
+
+    lan_settings = group_settings.get("lanSettings") or {}
+    if not isinstance(lan_settings, dict):
+        lan_settings = {}
+    lan_subnet = _opt_str(lan_settings, "subnet", "lan_subnet", "cidr") or "<unknown>"
+
+    dhcp_range = lan_settings.get("dhcpRange") or {}
+    if not isinstance(dhcp_range, dict):
+        dhcp_range = {}
+    dhcp_start = _opt_str(dhcp_range, "start", "dhcp_range_start") or "<unknown>"
+    dhcp_end = _opt_str(dhcp_range, "end", "dhcp_range_end") or "<unknown>"
+
+    return WifiNetworkIPv4(
+        wan=wan,
+        lan_subnet=lan_subnet,
+        dhcp_range_start=dhcp_start,
+        dhcp_range_end=dhcp_end,
+    )
+
+
+def _extract_ipv6(record: dict[str, Any]) -> WifiNetworkIPv6:
+    """Build a WifiNetworkIPv6 from a Foyer per-group record.
+
+    ``wanSettings.ipv6.enabled`` toggles the surface; the address and
+    prefix length only populate when enabled is true. Disabled / missing
+    paths return ``{enabled: false, wan: None, prefix_len: None}``.
+    """
+    wan_settings = record.get("wanSettings") or {}
+    if not isinstance(wan_settings, dict):
+        return WifiNetworkIPv6(enabled=False)
+    ipv6_block = wan_settings.get("ipv6") or {}
+    if not isinstance(ipv6_block, dict):
+        return WifiNetworkIPv6(enabled=False)
+    enabled = _opt_bool(ipv6_block, "enabled") or False
+    if not enabled:
+        return WifiNetworkIPv6(enabled=False)
+    wan = _opt_str(ipv6_block, "address", "wan")
+    prefix_len = _opt_int(ipv6_block, "prefixLength", "prefix_len")
+    return WifiNetworkIPv6(enabled=True, wan=wan, prefix_len=prefix_len)
+
+
+def _extract_dns_servers(group_settings: dict[str, Any]) -> list[str]:
+    """Extract DNS servers from ``groupSettings.dnsSettings.dnsServers``."""
+    dns_settings = group_settings.get("dnsSettings") or {}
+    if not isinstance(dns_settings, dict):
+        return []
+    raw = dns_settings.get("dnsServers")
+    if isinstance(raw, list):
+        return [item for item in raw if isinstance(item, str)]
+    return []
+
+
+# ---------------------------------------------------------------------------
+# WifiPointHealth (SRD §10.11)
+# ---------------------------------------------------------------------------
+
+
+class WifiPointHealth(BaseModel):
+    """Health snapshot of a single Wi-Fi point (SRD §10.11).
+
+    A health snapshot is a subset of the WifiPoint record (SRD §10.7) —
+    `point-health` is the operator-facing verb for one-shot status
+    diagnostics. ``signal_to_upstream_dbm`` is None on the master point
+    (no upstream node to measure against) and on offline satellites.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(..., min_length=1)
+    online: bool
+    uptime_s: int = Field(..., ge=0)
+    signal_to_upstream_dbm: int | None = None
+    connected_clients_count: int = Field(..., ge=0)
+    mesh_role: Literal["master", "satellite"]
+
+    @classmethod
+    def from_wifi_point(cls, point: WifiPoint) -> WifiPointHealth:
+        """Build a WifiPointHealth from an existing WifiPoint record.
+
+        FoyerClient.get_point_health uses this to project the existing
+        list_points result onto the §10.11 surface — single source of
+        upstream truth, no duplicated normalization logic.
+        """
+        return cls(
+            id=point.id,
+            online=point.online,
+            uptime_s=point.uptime_s,
+            signal_to_upstream_dbm=point.signal_strength_to_upstream_dbm,
+            connected_clients_count=point.connected_clients_count,
+            mesh_role=point.mesh_role,
+        )

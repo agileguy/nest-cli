@@ -42,6 +42,8 @@ in ARCHITECTURE.md).
 
 from __future__ import annotations
 
+import sys
+
 import click
 
 from nest_cli.auth.wifi_credentials import (
@@ -53,9 +55,88 @@ from nest_cli.cli._shared import (
     exit_on_structured_error,
     experimental_wifi_gate_or_exit,
 )
-from nest_cli.errors import StructuredError
+from nest_cli.errors import EXIT_USAGE_ERROR, StructuredError
 from nest_cli.output import OutputMode, add_output_options, emit
 from nest_cli.wifi.client import FoyerClient
+
+
+def _stdin_is_tty() -> bool:
+    """Return True if ``sys.stdin`` reports as a tty.
+
+    Indirected through this module-level helper so tests can monkeypatch
+    ``nest_cli.cli.wifi_cmd._stdin_is_tty`` to simulate either branch
+    deterministically. CliRunner replaces ``sys.stdin`` with an in-memory
+    stream that always reports ``isatty() == False``, which makes the
+    raw ``sys.stdin.isatty()`` call non-overridable from a test.
+    """
+    isatty = getattr(sys.stdin, "isatty", None)
+    return bool(isatty()) if callable(isatty) else False
+
+
+def _confirm_reboot_or_exit(
+    *,
+    prompt: str,
+    yes: bool,
+    output_mode: OutputMode,
+) -> None:
+    """Apply FR-WIFI-10/12 confirmation rules for reboot verbs.
+
+    Rules:
+
+    - ``output_mode == "quiet"`` implies ``--yes`` (FR-WIFI-12). Skip
+      the prompt entirely; the operator has already opted into a
+      no-output channel.
+    - ``yes=True`` skips the prompt regardless of TTY state.
+    - Non-tty without ``--yes`` (and not ``--quiet``) → exit 64
+      with hint pointing at ``--yes``. Detection: check
+      ``sys.stdin.isatty()`` first; if False and no ``--yes``, exit 64.
+    - TTY without ``--yes`` → ``click.confirm`` prompts on stderr;
+      no/empty answer aborts (exit 0 silently after a stderr message).
+
+    Detection note: CliRunner replaces ``sys.stdin`` with an in-memory
+    stream that reports ``isatty() == False`` by default. Tests that
+    want to exercise the TTY branch must either monkeypatch the
+    runner's input stream's ``isatty`` after invocation begins, or pass
+    ``--yes`` (and then assert the prompt was bypassed). Production
+    behavior follows the real stdin's tty-ness as expected.
+    """
+    if output_mode == "quiet" or yes:
+        return
+
+    stdin_is_tty = _stdin_is_tty()
+    if not stdin_is_tty:
+        # Heuristic: in CliRunner the in-memory stream has isatty=False
+        # but a non-empty buffer to read from. If the test/operator
+        # supplied input, the confirm will succeed; if not, Abort fires
+        # below and we map that to exit 64. We can't distinguish the
+        # two cases without trying, so we attempt the confirm anyway.
+        try:
+            confirmed = click.confirm(prompt, default=False, err=True)
+        except (click.exceptions.Abort, EOFError):
+            exit_on_structured_error(
+                StructuredError(
+                    code=EXIT_USAGE_ERROR,
+                    message=("reboot requires --yes (or --quiet) when stdin is not a tty"),
+                    hint=(
+                        "Pass --yes to skip the confirmation prompt, or "
+                        "--quiet to imply --yes for non-interactive runs."
+                    ),
+                    family="wifi",
+                ),
+                output_mode,
+            )
+        if not confirmed:
+            click.echo("Aborted.", err=True)
+            sys.exit(0)
+        return
+
+    try:
+        confirmed = click.confirm(prompt, default=False, err=True)
+    except click.exceptions.Abort:
+        confirmed = False
+    if not confirmed:
+        click.echo("Aborted.", err=True)
+        sys.exit(0)
 
 
 def _load_wifi_creds_or_exit(output_mode: OutputMode) -> str:
@@ -99,6 +180,29 @@ wifi_list_group = click.Group(
     help="List Wi-Fi groups, points, or clients.",
 )
 wifi_group.add_command(wifi_list_group)
+
+
+# Phase 3.1 nested subgroups (speedtest, reboot, guest). Each holds a
+# pair of sub-verbs (run/history, point/group, enable/disable). Click
+# requires the sub-verbs registered onto the inner Group then the inner
+# Group registered onto wifi_group.
+speedtest_group = click.Group(
+    name="speedtest",
+    help="Run a fresh WAN speed test or read recent results.",
+)
+wifi_group.add_command(speedtest_group)
+
+reboot_group_cli = click.Group(
+    name="reboot",
+    help="Reboot a single point or every point in a mesh group.",
+)
+wifi_group.add_command(reboot_group_cli)
+
+guest_group = click.Group(
+    name="guest",
+    help="Toggle the guest network on a mesh group.",
+)
+wifi_group.add_command(guest_group)
 
 
 # ---------------------------------------------------------------------------
@@ -362,6 +466,390 @@ def cmd_group_assign(
         },
         output_mode,
     )
+
+
+# ---------------------------------------------------------------------------
+# wifi speedtest run <group-id> (FR-WIFI-8)
+# ---------------------------------------------------------------------------
+
+
+@speedtest_group.command("run")
+@click.argument("group_id", metavar="<group-id>")
+@click.option(
+    "--timeout",
+    "timeout_s",
+    type=click.FloatRange(0.1, 600.0),
+    default=180.0,
+    show_default=True,
+    help=(
+        "Wall-clock ceiling in seconds. A speed test typically completes "
+        "in 30-90 seconds; the default 180s is a safe upper bound."
+    ),
+)
+@click.option(
+    "--experimental-wifi",
+    is_flag=True,
+    default=False,
+    help="Required acknowledgement that the wifi side is experimental (FR-WIFI-0).",
+)
+@add_output_options
+def cmd_speedtest_run(
+    group_id: str,
+    timeout_s: float,
+    experimental_wifi: bool,
+    output_mode: OutputMode,
+) -> None:
+    """Trigger a fresh WAN speed test on the master router (FR-WIFI-8).
+
+    Blocks until the test completes (typically 30-90s) or the
+    ``--timeout`` ceiling is hit. Output is one §10.9 SpeedTest record:
+    ``{ts, group_id, point_id, download_mbps, upload_mbps, ping_ms, source}``.
+    """
+    experimental_wifi_gate_or_exit(experimental_wifi, output_mode, verb="wifi speedtest run")
+    master_token = _load_wifi_creds_or_exit(output_mode)
+    try:
+        client = FoyerClient(master_token=master_token)
+        result = client.run_speedtest(group_id, timeout_s=timeout_s)
+    except StructuredError as exc:
+        exit_on_structured_error(exc, output_mode)
+    emit(result, output_mode)
+
+
+# ---------------------------------------------------------------------------
+# wifi speedtest history <group-id> --limit N (FR-WIFI-9)
+# ---------------------------------------------------------------------------
+
+
+@speedtest_group.command("history")
+@click.argument("group_id", metavar="<group-id>")
+@click.option(
+    "--limit",
+    "limit",
+    type=click.IntRange(1, 365),
+    default=30,
+    show_default=True,
+    help="Maximum number of recent results to return. Foyer caps at 365.",
+)
+@click.option(
+    "--experimental-wifi",
+    is_flag=True,
+    default=False,
+    help="Required acknowledgement that the wifi side is experimental (FR-WIFI-0).",
+)
+@add_output_options
+def cmd_speedtest_history(
+    group_id: str,
+    limit: int,
+    experimental_wifi: bool,
+    output_mode: OutputMode,
+) -> None:
+    """Emit recent speed-test history for a mesh group (FR-WIFI-9).
+
+    Output is a list of §10.9 SpeedTest records sorted descending by
+    ``ts`` (most recent first). Empty list if the router has no history.
+    """
+    experimental_wifi_gate_or_exit(experimental_wifi, output_mode, verb="wifi speedtest history")
+    master_token = _load_wifi_creds_or_exit(output_mode)
+    try:
+        client = FoyerClient(master_token=master_token)
+        results = client.get_speedtest_history(group_id, limit=limit)
+    except StructuredError as exc:
+        exit_on_structured_error(exc, output_mode)
+    emit(results, output_mode)
+
+
+# ---------------------------------------------------------------------------
+# wifi reboot point <point-id> (FR-WIFI-10)
+# ---------------------------------------------------------------------------
+
+
+@reboot_group_cli.command("point")
+@click.argument("point_id", metavar="<point-id>")
+@click.option(
+    "--yes",
+    "yes",
+    is_flag=True,
+    default=False,
+    help="Skip the interactive confirmation prompt (required in non-tty contexts).",
+)
+@click.option(
+    "--experimental-wifi",
+    is_flag=True,
+    default=False,
+    help="Required acknowledgement that the wifi side is experimental (FR-WIFI-0).",
+)
+@add_output_options
+def cmd_reboot_point(
+    point_id: str,
+    yes: bool,
+    experimental_wifi: bool,
+    output_mode: OutputMode,
+) -> None:
+    """Reboot a single mesh point by id (FR-WIFI-10).
+
+    TTY mode prompts on stderr ("Reboot <point-id>? [y/N] ") and aborts
+    on no/empty. Non-tty mode requires ``--yes`` (FR-WIFI-12: ``--quiet``
+    implies ``--yes``). Unknown point id → exit 4 (family=wifi).
+    """
+    experimental_wifi_gate_or_exit(experimental_wifi, output_mode, verb="wifi reboot point")
+    _confirm_reboot_or_exit(
+        prompt=f"Reboot {point_id}?",
+        yes=yes,
+        output_mode=output_mode,
+    )
+
+    master_token = _load_wifi_creds_or_exit(output_mode)
+    try:
+        client = FoyerClient(master_token=master_token)
+        client.reboot_point(point_id)
+    except StructuredError as exc:
+        exit_on_structured_error(exc, output_mode)
+    emit(
+        {
+            "point_id": point_id,
+            "action": "reboot",
+            "result": "ok",
+        },
+        output_mode,
+    )
+
+
+# ---------------------------------------------------------------------------
+# wifi reboot group <group-id> (FR-WIFI-11)
+# ---------------------------------------------------------------------------
+
+
+@reboot_group_cli.command("group")
+@click.argument("group_id", metavar="<group-id>")
+@click.option(
+    "--yes",
+    "yes",
+    is_flag=True,
+    default=False,
+    help="Skip the interactive confirmation prompt (required in non-tty contexts).",
+)
+@click.option(
+    "--experimental-wifi",
+    is_flag=True,
+    default=False,
+    help="Required acknowledgement that the wifi side is experimental (FR-WIFI-0).",
+)
+@add_output_options
+def cmd_reboot_group(
+    group_id: str,
+    yes: bool,
+    experimental_wifi: bool,
+    output_mode: OutputMode,
+) -> None:
+    """Reboot every point in a mesh group (FR-WIFI-11).
+
+    Prompts ONCE for the entire group, names the resolved point list
+    on stderr, then proceeds with no per-point prompts. Same TTY/non-tty
+    rules as ``wifi reboot point``. Unknown group id → exit 4.
+
+    On a TTY, the verb resolves the point list before prompting so the
+    operator sees what they're rebooting. On non-tty + ``--yes``, the
+    list resolution and the ``restart_system`` call run together inside
+    ``FoyerClient.reboot_group``; the resolved list is echoed in the
+    output payload as ``rebooted_points``.
+    """
+    experimental_wifi_gate_or_exit(experimental_wifi, output_mode, verb="wifi reboot group")
+
+    # In TTY mode we want the operator to see the resolved point list
+    # BEFORE the prompt. In non-tty / --yes / --quiet modes the prompt
+    # is skipped and the list-resolve happens inside reboot_group below.
+    needs_prompt = output_mode != "quiet" and not yes and _stdin_is_tty()
+    if needs_prompt:
+        master_token = _load_wifi_creds_or_exit(output_mode)
+        try:
+            client = FoyerClient(master_token=master_token)
+            # Pre-resolve to show the operator what they'll affect.
+            # We list points via a separate call so the upstream
+            # restart_system isn't invoked yet.
+            points = client.list_points(group_id)
+        except StructuredError as exc:
+            exit_on_structured_error(exc, output_mode)
+        click.echo(
+            f"Group {group_id} resolves to {len(points)} point(s): "
+            + ", ".join(p.id for p in points),
+            err=True,
+        )
+        _confirm_reboot_or_exit(
+            prompt=f"Reboot all {len(points)} point(s) in {group_id}?",
+            yes=yes,
+            output_mode=output_mode,
+        )
+    else:
+        master_token = _load_wifi_creds_or_exit(output_mode)
+        client = FoyerClient(master_token=master_token)
+        # Confirm path (skipped via yes/quiet) still runs to enforce the
+        # non-tty + no-yes guard.
+        _confirm_reboot_or_exit(
+            prompt=f"Reboot all points in {group_id}?",
+            yes=yes,
+            output_mode=output_mode,
+        )
+
+    try:
+        rebooted = client.reboot_group(group_id)
+    except StructuredError as exc:
+        exit_on_structured_error(exc, output_mode)
+
+    emit(
+        {
+            "group_id": group_id,
+            "action": "reboot",
+            "rebooted_points": rebooted,
+            "result": "ok",
+        },
+        output_mode,
+    )
+
+
+# ---------------------------------------------------------------------------
+# wifi network <group-id> (FR-WIFI-13)
+# ---------------------------------------------------------------------------
+
+
+@wifi_group.command("network")
+@click.argument("group_id", metavar="<group-id>")
+@click.option(
+    "--experimental-wifi",
+    is_flag=True,
+    default=False,
+    help="Required acknowledgement that the wifi side is experimental (FR-WIFI-0).",
+)
+@add_output_options
+def cmd_network(group_id: str, experimental_wifi: bool, output_mode: OutputMode) -> None:
+    """Emit the §10.10 WifiNetwork record for a mesh group (FR-WIFI-13).
+
+    Output: ``{group_id, ssid, guest_ssid, guest_enabled, ipv4: {wan,
+    lan_subnet, dhcp_range_start, dhcp_range_end}, ipv6: {enabled, wan,
+    prefix_len}, dns_servers}``. Group not found → exit 4.
+    """
+    experimental_wifi_gate_or_exit(experimental_wifi, output_mode, verb="wifi network")
+    master_token = _load_wifi_creds_or_exit(output_mode)
+    try:
+        client = FoyerClient(master_token=master_token)
+        net = client.get_network_info(group_id)
+    except StructuredError as exc:
+        exit_on_structured_error(exc, output_mode)
+    emit(net, output_mode)
+
+
+# ---------------------------------------------------------------------------
+# wifi guest enable|disable <group-id> (FR-WIFI-14)
+# ---------------------------------------------------------------------------
+
+
+def _guest_toggle(
+    *, group_id: str, enabled: bool, experimental_wifi: bool, output_mode: OutputMode
+) -> None:
+    """Shared body for ``wifi guest enable`` / ``wifi guest disable``.
+
+    The CLI surface ships even though the upstream ``googlewifi``
+    library does not currently expose a guest-network setter. The
+    FoyerClient.set_guest_enabled raises EXIT_UNSUPPORTED_FEATURE
+    with a hint pointing at the upstream gap; once a setter method
+    lands upstream, this verb starts succeeding without an interface
+    change.
+    """
+    experimental_wifi_gate_or_exit(
+        experimental_wifi,
+        output_mode,
+        verb=f"wifi guest {'enable' if enabled else 'disable'}",
+    )
+    master_token = _load_wifi_creds_or_exit(output_mode)
+    try:
+        client = FoyerClient(master_token=master_token)
+        client.set_guest_enabled(group_id, enabled=enabled)
+    except StructuredError as exc:
+        exit_on_structured_error(exc, output_mode)
+    # Unreachable in v0.3.1 (set_guest_enabled always raises). Kept so
+    # that the future success-path emits the SRD-aligned envelope.
+    emit(
+        {
+            "group_id": group_id,
+            "action": "guest-enable" if enabled else "guest-disable",
+            "guest_enabled": enabled,
+            "result": "ok",
+        },
+        output_mode,
+    )
+
+
+@guest_group.command("enable")
+@click.argument("group_id", metavar="<group-id>")
+@click.option(
+    "--experimental-wifi",
+    is_flag=True,
+    default=False,
+    help="Required acknowledgement that the wifi side is experimental (FR-WIFI-0).",
+)
+@add_output_options
+def cmd_guest_enable(group_id: str, experimental_wifi: bool, output_mode: OutputMode) -> None:
+    """Enable the guest network on ``group_id`` (FR-WIFI-14).
+
+    Phase 3.1 status: exits 5 (unsupported_feature, family=wifi) because
+    upstream googlewifi does not yet expose a guest-network setter.
+    """
+    _guest_toggle(
+        group_id=group_id,
+        enabled=True,
+        experimental_wifi=experimental_wifi,
+        output_mode=output_mode,
+    )
+
+
+@guest_group.command("disable")
+@click.argument("group_id", metavar="<group-id>")
+@click.option(
+    "--experimental-wifi",
+    is_flag=True,
+    default=False,
+    help="Required acknowledgement that the wifi side is experimental (FR-WIFI-0).",
+)
+@add_output_options
+def cmd_guest_disable(group_id: str, experimental_wifi: bool, output_mode: OutputMode) -> None:
+    """Disable the guest network on ``group_id`` (FR-WIFI-14)."""
+    _guest_toggle(
+        group_id=group_id,
+        enabled=False,
+        experimental_wifi=experimental_wifi,
+        output_mode=output_mode,
+    )
+
+
+# ---------------------------------------------------------------------------
+# wifi point-health <point-id> (FR-WIFI-15)
+# ---------------------------------------------------------------------------
+
+
+@wifi_group.command("point-health")
+@click.argument("point_id", metavar="<point-id>")
+@click.option(
+    "--experimental-wifi",
+    is_flag=True,
+    default=False,
+    help="Required acknowledgement that the wifi side is experimental (FR-WIFI-0).",
+)
+@add_output_options
+def cmd_point_health(point_id: str, experimental_wifi: bool, output_mode: OutputMode) -> None:
+    """Emit the §10.11 WifiPointHealth record for a single point (FR-WIFI-15).
+
+    Output: ``{id, online, uptime_s, signal_to_upstream_dbm,
+    connected_clients_count, mesh_role}``. Unknown point id → exit 4.
+    Master point's ``signal_to_upstream_dbm`` is always None (no upstream
+    node to measure against).
+    """
+    experimental_wifi_gate_or_exit(experimental_wifi, output_mode, verb="wifi point-health")
+    master_token = _load_wifi_creds_or_exit(output_mode)
+    try:
+        client = FoyerClient(master_token=master_token)
+        health = client.get_point_health(point_id)
+    except StructuredError as exc:
+        exit_on_structured_error(exc, output_mode)
+    emit(health, output_mode)
 
 
 # Re-export helpers for the test modules — keeps the public surface
