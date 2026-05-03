@@ -642,6 +642,12 @@ def _parse_image_url_and_token(result: dict[str, Any], mechanism: str) -> tuple[
     return ``{"results": {"url": ..., "token": ...}}``. Missing or
     malformed fields raise a device-error so the verb fails cleanly with
     exit 1 rather than crashing.
+
+    Reviewer feedback (C4): the raw ``result`` dict can carry a
+    short-lived SDM auth token (or a URL with ``?auth=<token>``). Putting
+    it in ``StructuredError.details`` exposes that token via stderr and
+    risks leaking into bug reports. Surface only the *shape* of the
+    response (sorted key list) instead of the values.
     """
     inner = result.get("results")
     if not isinstance(inner, dict):
@@ -651,7 +657,7 @@ def _parse_image_url_and_token(result: dict[str, Any], mechanism: str) -> tuple[
                 f"SDM GenerateImage ({mechanism}) returned malformed result: "
                 "missing 'results' object"
             ),
-            details={"mechanism": mechanism, "result": result},
+            details={"mechanism": mechanism, "result_keys": sorted(result.keys())},
         )
     url = inner.get("url")
     token = inner.get("token")
@@ -659,7 +665,7 @@ def _parse_image_url_and_token(result: dict[str, Any], mechanism: str) -> tuple[
         raise StructuredError(
             code=EXIT_DEVICE_ERROR,
             message=f"SDM GenerateImage ({mechanism}) result missing 'url'",
-            details={"mechanism": mechanism, "result": result},
+            details={"mechanism": mechanism, "result_keys": sorted(inner.keys())},
         )
     if not isinstance(token, str) or not token:
         raise StructuredError(
@@ -678,7 +684,12 @@ def _download_snapshot_bytes(url: str, token: str) -> bytes:
     exit 3 (network); HTTP non-2xx maps to exit 1 (device error) since
     the SDM token is short-lived and a non-2xx here means Google
     rejected our follow-up retrieval, which is a per-device condition.
+
+    Reviewer feedback (C4): never put the raw URL in error output —
+    SDM image URLs sometimes carry ``?auth=<token>`` in the query
+    string. Strip the query string before any error path uses the URL.
     """
+    redacted = url.split("?")[0] + ("?<redacted>" if "?" in url else "")
     try:
         response = requests.get(
             url,
@@ -706,7 +717,7 @@ def _download_snapshot_bytes(url: str, token: str) -> bytes:
     if response.status_code != 200:
         raise StructuredError(
             code=EXIT_DEVICE_ERROR,
-            message=(f"snapshot image fetch returned HTTP {response.status_code} for {url}"),
-            details={"status_code": response.status_code},
+            message=(f"snapshot image fetch returned HTTP {response.status_code} for {redacted}"),
+            details={"status_code": response.status_code, "url": redacted},
         )
     return response.content

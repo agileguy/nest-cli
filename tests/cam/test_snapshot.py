@@ -366,3 +366,110 @@ class TestSnapshotStdoutOutput:
             ["cam", "snapshot", device, "--output", "-", "--jsonl"],
         )
         assert result.exit_code == 64
+
+
+# --- C4 reviewer feedback: token leakage in error details -------------------
+
+
+class TestSnapshotErrorTokenRedaction:
+    """Reviewer feedback (C4): never put SDM tokens in error details.
+
+    SDM's GenerateImage response carries a short-lived auth token, and
+    the issued image URL sometimes encodes the token in the query string
+    (``?auth=<token>``). Putting the raw response dict OR the raw URL in
+    StructuredError.details exposes those tokens via stderr where they
+    can end up in pasted bug reports.
+    """
+
+    @responses.activate
+    def test_tier1_malformed_body_does_not_leak_token(
+        self,
+        fake_paths: dict[str, Path],
+        write_creds: Any,
+        indoor_payload: dict[str, Any],
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        write_creds(fake_paths["credentials"])
+        device = "enterprises/proj/devices/indoor-1"
+        out = tmp_path / "snap.jpg"
+        leaky_token = "leaky-tok-do-not-leak"  # noqa: S105 - test fixture token
+        responses.add(responses.GET, f"{SDM_API_ROOT}/{device}", json=indoor_payload, status=200)
+        # Tier-1 GenerateImage returns a result that *has* a token but
+        # *no* url — triggering the missing-'url' branch. Prior code
+        # surfaced the raw inner dict (token included) in details.
+        responses.add(
+            responses.POST,
+            f"{SDM_API_ROOT}/{device}:executeCommand",
+            json={"results": {"token": leaky_token}},
+            status=200,
+        )
+        # No CameraEventImage trait on indoor cam beyond what fixture
+        # provides; tier-2 may attempt a follow-up POST. Provide a
+        # fallback that also fails so the verb returns the tier-1
+        # error (or any error). We assert the redaction property on
+        # whichever error envelope is emitted.
+        responses.add(
+            responses.POST,
+            f"{SDM_API_ROOT}/{device}:executeCommand",
+            json={"results": {"token": leaky_token}},
+            status=200,
+        )
+        _patch_event_id(monkeypatch, "evt-recent-2")
+
+        runner = CliRunner()
+        result = runner.invoke(
+            cli_root,
+            ["cam", "snapshot", device, "--output", str(out), "--json"],
+        )
+        # Whatever the tier outcome, the token MUST NOT appear in
+        # stderr or stdout anywhere.
+        combined = (result.stderr or "") + (result.output or "")
+        assert leaky_token not in combined, (
+            "SDM token leaked into error output — see C4 reviewer feedback"
+        )
+
+    @responses.activate
+    def test_image_url_with_query_token_redacted_on_http_error(
+        self,
+        fake_paths: dict[str, Path],
+        write_creds: Any,
+        indoor_payload: dict[str, Any],
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """If image URL carries ?auth=<token>, error must redact the query."""
+        write_creds(fake_paths["credentials"])
+        device = "enterprises/proj/devices/indoor-1"
+        out = tmp_path / "snap.jpg"
+        leaky_query_token = "queryparam-token-leak"  # noqa: S105 - test fixture
+        responses.add(responses.GET, f"{SDM_API_ROOT}/{device}", json=indoor_payload, status=200)
+        responses.add(
+            responses.POST,
+            f"{SDM_API_ROOT}/{device}:executeCommand",
+            json={
+                "results": {
+                    "url": f"https://nest-fixture.example/img/abc?auth={leaky_query_token}",
+                    "token": "header-tok",
+                }
+            },
+            status=200,
+        )
+        # Image GET returns 503 — exercise the HTTP-non-200 branch where
+        # the URL was previously echoed verbatim into the error message.
+        responses.add(
+            responses.GET,
+            f"https://nest-fixture.example/img/abc?auth={leaky_query_token}",
+            status=503,
+        )
+        _patch_event_id(monkeypatch, None)
+
+        runner = CliRunner()
+        result = runner.invoke(
+            cli_root,
+            ["cam", "snapshot", device, "--output", str(out), "--json"],
+        )
+        combined = (result.stderr or "") + (result.output or "")
+        assert leaky_query_token not in combined
+        # Redacted form should appear in the message.
+        assert "<redacted>" in combined
