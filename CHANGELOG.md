@@ -7,6 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+Phase 3.1 (SRD §16.5) — wifi speedtest, reboot, network info,
+guest toggle, point-health verbs (FR-WIFI-8..15). All sub-verbs
+gated by `--experimental-wifi`; structured errors carry `family=wifi`.
+
+- `nest_cli/wifi/types.py` extended with three new pydantic records:
+  `SpeedTest` (§10.9) with bps→Mbps normalization at the
+  `from_googlewifi_response` boundary and FR-22 `Z`-suffix RFC 3339
+  serialization; `WifiNetwork` (§10.10) with nested
+  `WifiNetworkIPv4` / `WifiNetworkIPv6` sub-models and defensive
+  `<unknown>` fallbacks for sparse Foyer payloads;
+  `WifiPointHealth` (§10.11) with `from_wifi_point` projection.
+- `FoyerClient` extended with seven new methods —
+  `run_speedtest(group_id, timeout_s=180)` wraps upstream
+  `run_speed_test` inside `asyncio.wait_for`; `get_speedtest_history`
+  reads `speed_test_results`, sorts descending by `ts`, truncates
+  client-side; `reboot_point` validates the point exists then calls
+  upstream `restart_ap`; `reboot_group` resolves the point list,
+  calls `restart_system`, returns the rebooted ids; `get_network_info`
+  projects `get_systems()` onto §10.10; `set_guest_enabled` raises
+  EXIT_UNSUPPORTED_FEATURE (upstream gap, mirrors set_station_group);
+  `get_point_health` locates a point across groups and projects onto
+  §10.11.
+- `wifi speedtest run <group> --timeout <s> --experimental-wifi`
+  (FR-WIFI-8) — block until done; emit §10.9 SpeedTest record.
+- `wifi speedtest history <group> --limit <1..365>
+  --experimental-wifi` (FR-WIFI-9) — descending-by-ts results.
+- `wifi reboot point <point> --experimental-wifi` (FR-WIFI-10) —
+  TTY confirmation + non-tty `--yes` requirement.
+- `wifi reboot group <group> --experimental-wifi` (FR-WIFI-11) —
+  single confirmation, names the resolved point list on stderr.
+- `--quiet` implies `--yes` for both reboot verbs (FR-WIFI-12).
+- `wifi network <group> --experimental-wifi` (FR-WIFI-13) — emit
+  §10.10 WifiNetwork.
+- `wifi guest enable|disable <group> --experimental-wifi`
+  (FR-WIFI-14) — CLI surface ships; FoyerClient raises exit 5
+  pending upstream googlewifi guest-network setter.
+- `wifi point-health <point> --experimental-wifi` (FR-WIFI-15) —
+  emit §10.11 WifiPointHealth.
+- 69 new tests (327 → 396): types, client, gates, TTY/non-tty
+  confirmation paths, error envelopes, all family=wifi.
+
+### Changed
+
+- `nest_cli/cli/wifi_cmd.py` adds nested Click subgroups
+  (`speedtest`, `reboot`, `guest`) so two-level verb names like
+  `wifi speedtest run` register cleanly.
+
 ## [0.3.0] - 2026-05-03
 
 ### Added
