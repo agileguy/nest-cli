@@ -37,9 +37,20 @@ from nest_cli.errors import (
     EXIT_NOT_FOUND,
     StructuredError,
 )
+from nest_cli.sdm.stream_types import RtspStreamResult, WebRtcStreamResult
 from nest_cli.sdm.types import Camera
 
 SDM_API_ROOT = "https://smartdevicemanagement.googleapis.com/v1"
+
+# Per SRD §3.1.2 / Decision 18: stream commands live under the
+# CameraLiveStream trait. v0.2.0 ships RTSP-only extend/stop wired
+# (FR-CAM-13 / FR-CAM-14 spec wording is `--extension-token`); the
+# WebRTC extend/stop commands are kept reachable via the public method
+# surface but only the RTSP variants are exposed to the CLI for now.
+CMD_GENERATE_RTSP_STREAM = "sdm.devices.commands.CameraLiveStream.GenerateRtspStream"
+CMD_GENERATE_WEBRTC_STREAM = "sdm.devices.commands.CameraLiveStream.GenerateWebRtcStream"
+CMD_EXTEND_RTSP_STREAM = "sdm.devices.commands.CameraLiveStream.ExtendRtspStream"
+CMD_STOP_RTSP_STREAM = "sdm.devices.commands.CameraLiveStream.StopRtspStream"
 
 # Per-request timeout. SRD §7.4 puts the per-operation default at 10s;
 # we mirror that here. Long-running operations (snapshot, stream
@@ -103,6 +114,70 @@ class SdmClient:
         return Camera.from_sdm_response(payload)
 
     # ------------------------------------------------------------------
+    # Stream commands (FR-CAM-6..14 / SRD §3.1.2 / §10.2)
+    # ------------------------------------------------------------------
+    #
+    # Each method below issues an SDM ``executeCommand`` POST and parses
+    # the response into a stream_types record. The private
+    # ``_execute_command`` helper handles auth refresh + retry + error
+    # mapping, mirroring ``_get_with_refresh``.
+    #
+    # Engineer A is adding a public ``execute_command`` method on a
+    # parallel branch. To minimise merge conflict at the public surface,
+    # the helper here is private (``_execute_command``); when Engineer
+    # A's public version lands, these stream methods can switch to it
+    # in a one-line refactor and the private helper deleted.
+
+    def generate_rtsp_stream(self, target_id: str) -> RtspStreamResult:
+        """Issue ``GenerateRtspStream`` for ``target_id``; parse the response.
+
+        Implements the cam-side of FR-CAM-7. Caller (the verb) builds
+        the §10.2 Stream record from the parsed result.
+        """
+        payload = self._execute_command(target_id, CMD_GENERATE_RTSP_STREAM, {})
+        return RtspStreamResult.from_sdm_response(payload)
+
+    def generate_webrtc_stream(self, target_id: str, *, offer_sdp: str) -> WebRtcStreamResult:
+        """Issue ``GenerateWebRtcStream`` with ``offer_sdp`` in params.
+
+        Implements the cam-side of FR-CAM-8. Decision 6: the operator
+        supplies the offer SDP; the CLI does NOT generate it. Verb
+        layer enforces FR-CAM-9 (missing ``--offer-sdp`` exits 64).
+        """
+        payload = self._execute_command(
+            target_id,
+            CMD_GENERATE_WEBRTC_STREAM,
+            {"offerSdp": offer_sdp},
+        )
+        return WebRtcStreamResult.from_sdm_response(payload)
+
+    def extend_stream(self, target_id: str, *, extension_token: str) -> RtspStreamResult:
+        """Issue ``ExtendRtspStream`` to refresh an active session.
+
+        Implements the cam-side of FR-CAM-13. v0.2.0 wires only the RTSP
+        extend path; WebRTC extend (``mediaSessionId`` keyed) is reachable
+        via SDM but not yet exposed by the CLI verb.
+        """
+        payload = self._execute_command(
+            target_id,
+            CMD_EXTEND_RTSP_STREAM,
+            {"streamExtensionToken": extension_token},
+        )
+        return RtspStreamResult.from_sdm_response(payload)
+
+    def stop_stream(self, target_id: str, *, extension_token: str) -> None:
+        """Issue ``StopRtspStream`` to invalidate an active session.
+
+        Implements the cam-side of FR-CAM-14. Returns ``None`` on
+        success (SDM returns an empty ``results`` object).
+        """
+        self._execute_command(
+            target_id,
+            CMD_STOP_RTSP_STREAM,
+            {"streamExtensionToken": extension_token},
+        )
+
+    # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
 
@@ -144,6 +219,103 @@ class SdmClient:
                 )
 
         return _interpret_status(url, status, body)
+
+    def _execute_command(
+        self,
+        target_id: str,
+        command: str,
+        params: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Issue an SDM ``executeCommand`` POST and return the parsed JSON.
+
+        The POST body shape per SDM is::
+
+            {"command": "<full.command.id>", "params": {...}}
+
+        Auth refresh + 401-retry + status interpretation reuse the same
+        rules as ``_get_with_refresh``. Per-command parsing of the
+        response shape is the caller's responsibility.
+
+        This helper is intentionally private; Engineer A is adding a
+        public ``execute_command`` method on a parallel branch (a
+        general-purpose entry point used by snapshot/chime). When that
+        merges, the four stream methods above can switch to the public
+        version in a one-liner.
+        """
+        url = f"{SDM_API_ROOT}/{target_id}:executeCommand"
+        body = {"command": command, "params": params}
+        return self._post_with_refresh(url, body)
+
+    def _post_with_refresh(self, url: str, body: dict[str, Any]) -> dict[str, Any]:
+        """POST ``body`` to ``url`` with a single auto-refresh-on-401 retry.
+
+        Symmetrical to ``_get_with_refresh``. Lazy near-expiry refresh,
+        then retry once on 401 with a forced refresh, then surface as
+        auth error if still 401.
+        """
+        self._credentials = refresh_access_token_if_needed(
+            self._credentials,
+            self._credentials_path,
+        )
+
+        status, body_bytes = self._do_post(url, self._credentials.access_token, body)
+        if status == 401:
+            self._credentials = refresh_access_token_if_needed(
+                self._credentials,
+                self._credentials_path,
+                force=True,
+            )
+            save_credentials(self._credentials_path, self._credentials)
+            status, body_bytes = self._do_post(url, self._credentials.access_token, body)
+            if status == 401:
+                raise StructuredError(
+                    code=EXIT_AUTH_ERROR,
+                    message="SDM API rejected access token even after refresh",
+                    hint=(
+                        "Run `nest-cli auth refresh`; if that fails, "
+                        "`nest-cli auth setup --overwrite`."
+                    ),
+                )
+
+        return _interpret_status(url, status, body_bytes)
+
+    def _do_post(
+        self,
+        url: str,
+        access_token: str,
+        body: dict[str, Any],
+    ) -> tuple[int, bytes]:
+        """Issue a single POST with JSON body. Returns (status_code, raw_body)."""
+        try:
+            response = requests.post(
+                url,
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "Accept": "application/json",
+                    "Content-Type": "application/json",
+                },
+                json=body,
+                timeout=self._timeout,
+            )
+        except requests.exceptions.ConnectionError as exc:
+            raise StructuredError(
+                code=EXIT_NETWORK_ERROR,
+                message=f"network error contacting SDM API: {exc}",
+                hint="Check your internet connection and retry.",
+            ) from exc
+        except requests.exceptions.Timeout as exc:
+            raise StructuredError(
+                code=EXIT_NETWORK_ERROR,
+                message=f"timed out contacting SDM API after {self._timeout}s",
+                hint="Google's SDM endpoint is slow or unreachable; retry shortly.",
+            ) from exc
+        except requests.exceptions.RequestException as exc:
+            raise StructuredError(
+                code=EXIT_NETWORK_ERROR,
+                message=f"unexpected requests error contacting SDM API: {exc}",
+            ) from exc
+
+        return response.status_code, response.content
 
     def _do_get(self, url: str, access_token: str) -> tuple[int, bytes]:
         """Issue a single GET. Returns (status_code, raw_body)."""
