@@ -31,21 +31,71 @@ def _load_fixture(name: str) -> Any:
 class _FakeGoogleWifi:
     """Async test double for ``googlewifi.GoogleWifi``.
 
-    Mirrors the surface ``FoyerClient`` actually calls — only
-    ``get_systems()`` for v0.3.0 Phase 3A. The fake reads the fixture
-    corpus on construction and replays it on demand. The
+    Mirrors the surface ``FoyerClient`` actually calls. The fake reads
+    the fixture corpus on construction and replays it on demand. The
     ``refresh_token`` constructor arg is accepted but unused.
+
+    Phase 3A surface: ``get_systems`` + ``close``.
+    Phase 3B surface (action verbs): ``connect``, ``pause_device``,
+    ``prioritize_device``. Each action method records its call args
+    on ``self.calls`` for spy-style assertion in tests.
     """
+
+    # Class-level call recorder so tests can assert against the LAST
+    # constructed instance even though each FoyerClient method spins
+    # up a fresh GoogleWifi internally. Tests reset this in fixtures.
+    last_instance: "_FakeGoogleWifi | None" = None
 
     def __init__(self, refresh_token: str | None = None, **_: Any) -> None:
         self.refresh_token = refresh_token
         self._systems = _load_fixture("groups.json")
+        self.calls: list[tuple[str, tuple[Any, ...], dict[str, Any]]] = []
+        type(self).last_instance = self
 
     async def get_systems(self) -> dict[str, Any]:
         return self._systems
 
     async def close(self) -> None:
         return None
+
+    # ------------------------------------------------------------------
+    # Phase 3B action surface (FR-WIFI-4..7)
+    # ------------------------------------------------------------------
+
+    async def connect(self) -> bool:
+        """Real upstream gates every action method behind ``connect()``.
+
+        Returns True so the action method's body executes during tests.
+        """
+        return True
+
+    async def pause_device(
+        self, system_id: str, device_id: str, pause_state: bool
+    ) -> bool:
+        """Spy that records the call and returns success.
+
+        Records ``("pause_device", (system_id, device_id, pause_state), {})``
+        on ``self.calls`` so tests can assert the FoyerClient passed the
+        right args. Returns True (mirrors upstream's "operationState ==
+        CREATED" success path).
+        """
+        self.calls.append(
+            ("pause_device", (system_id, device_id, pause_state), {})
+        )
+        return True
+
+    async def prioritize_device(
+        self, system_id: str, device_id: str, duration_hours: int = 1
+    ) -> bool:
+        """Spy that records the call and returns success."""
+        self.calls.append(
+            (
+                "prioritize_device",
+                (system_id, device_id, duration_hours),
+                {},
+            )
+        )
+        return True
 
 
 @pytest.fixture
