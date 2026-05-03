@@ -1,18 +1,18 @@
 """``nest-cli cam`` subgroup — camera-side commands.
 
-v0.1.0 implements three verbs from SRD §5.3:
+v0.1.0 shipped three verbs from SRD §5.3 (``list``, ``info``, ``capabilities``).
 
-- ``cam list`` (FR-CAM-1) — synonym for ``list --family cam``.
-- ``cam info <target>`` (FR-CAM-2) — issue SDM ``devices.get`` and emit
-  the §10.1 Camera record.
-- ``cam capabilities <target>`` (FR-CAM-28) — emit the camera's traits
-  array plus a derived ``supported_verbs`` field listing which
-  ``nest-cli cam`` sub-verbs are supported on the device.
+Phase 2 (v0.2.0) adds the direct-command verbs that the SDM
+``executeCommand`` endpoint backs:
 
-Future phases extend the subgroup with ``snapshot``, ``stream``,
-``stream-extend``, ``stream-stop``, ``chime``, ``events``, ``battery``,
-``signal``. The ``supported_verbs`` mapping table below grows as those
-verbs land.
+- ``cam snapshot`` (FR-CAM-3..5) — JPEG capture with two-tier fallback.
+- ``cam chime`` (FR-CAM-15..16) — invoke ``DoorbellChime.Chime``.
+- ``cam battery`` (FR-CAM-26) — emit battery state for battery-powered cams.
+- ``cam signal`` (FR-CAM-27) — emit RSSI / last-online metadata.
+
+The streaming and events verbs (``stream``, ``stream-extend``, ``stream-stop``,
+``events``) are owned by Engineer B and land alongside in the same v0.2.0
+release.
 
 Target resolution
 -----------------
@@ -40,36 +40,57 @@ from nest_cli.cli._shared import (
 )
 from nest_cli.cli.list_cmd import _probe_records
 from nest_cli.config import default_config_path, load_config, resolve_alias
-from nest_cli.errors import StructuredError
+from nest_cli.errors import EXIT_UNSUPPORTED_FEATURE, StructuredError
 from nest_cli.output import OutputMode, add_output_options, emit
 from nest_cli.sdm.client import SdmClient
 from nest_cli.sdm.types import Camera
+
+# ---------------------------------------------------------------------------
+# SDM command names (executeCommand body's ``command`` field)
+# ---------------------------------------------------------------------------
+
+_SDM_CMD_DOORBELL_CHIME = "sdm.devices.commands.DoorbellChime.Chime"
+_SDM_CMD_CAMERA_IMAGE = "sdm.devices.commands.CameraImage.GenerateImage"
+_SDM_CMD_CAMERA_EVENT_IMAGE = "sdm.devices.commands.CameraEventImage.GenerateImage"
+
+# Trait names that gate verb support.
+_TRAIT_DOORBELL_CHIME = "sdm.devices.traits.DoorbellChime"
+_TRAIT_CAMERA_IMAGE = "sdm.devices.traits.CameraImage"
+_TRAIT_CAMERA_EVENT_IMAGE = "sdm.devices.traits.CameraEventImage"
 
 # ---------------------------------------------------------------------------
 # Trait → supported-verb mapping (SRD §5.3, FR-CAM-28)
 # ---------------------------------------------------------------------------
 #
 # Each entry maps an SDM trait name to the list of ``nest-cli cam`` verbs
-# that depend on it. v0.1.0 lists only verbs that exist in v0.1.0; future
-# phases extend the mapping as new verbs land. The SRD names the trait →
-# verb relationships in §5.3.2 (snapshot), §5.3.3 (stream), §5.3.5
-# (chime), §5.3.8 (events).
+# that depend on it. The SRD names the trait → verb relationships in
+# §5.3.2 (snapshot), §5.3.3 (stream), §5.3.5 (chime), §5.3.8 (events).
+#
+# Phase 2 adds entries for the direct-command verbs (snapshot, chime).
+# Streaming and events verbs are extended by Engineer B in the parallel
+# Phase 2 effort.
 #
 # Two verbs are universal — every camera supports them — and don't need
 # a trait gate:
 #
-# - ``info``      — every camera responds to ``devices.get``
+# - ``info``         — every camera responds to ``devices.get``
 # - ``capabilities`` — local computation over the trait list
 #
 # These are added unconditionally to ``supported_verbs``.
+#
+# Two verbs (battery, signal) are gated on data presence rather than
+# trait presence: SDM does not currently expose a documented trait for
+# battery state or RSSI. ``Camera.battery_pct`` and ``Camera.signal_strength``
+# are nullable fields populated when the upstream payload includes them.
+# ``_supported_verbs_for`` consults the parsed Camera object directly for
+# these two verbs (see ``_PREDICATE_VERBS`` below).
 
 _TRAIT_TO_VERBS: dict[str, list[str]] = {
-    # v0.1.0 — only ``info`` and ``capabilities`` are wired.
-    # Future phases extend this table:
-    # "sdm.devices.traits.CameraImage": ["snapshot"],
-    # "sdm.devices.traits.CameraEventImage": ["snapshot"],
+    "sdm.devices.traits.CameraEventImage": ["snapshot"],
+    "sdm.devices.traits.CameraImage": ["snapshot"],
+    "sdm.devices.traits.DoorbellChime": ["chime"],
+    # Future phases extend this table — Engineer B owns the stream / events rows:
     # "sdm.devices.traits.CameraLiveStream": ["stream", "stream-extend", "stream-stop"],
-    # "sdm.devices.traits.DoorbellChime": ["chime"],
     # "sdm.devices.traits.CameraMotion": ["events"],
     # "sdm.devices.traits.CameraPerson": ["events"],
     # "sdm.devices.traits.CameraSound": ["events"],
@@ -77,6 +98,14 @@ _TRAIT_TO_VERBS: dict[str, list[str]] = {
 
 # Verbs every camera has (no trait gate).
 _UNIVERSAL_VERBS = ("info", "capabilities")
+
+# Verbs gated on Camera-record predicates rather than SDM trait names.
+# Each entry is (verb_name, predicate) — predicate takes a Camera and
+# returns True if the verb is supported. Used by ``_supported_verbs_for``.
+_PREDICATE_VERBS: tuple[tuple[str, str], ...] = (
+    ("battery", "battery_pct"),
+    ("signal", "signal_strength"),
+)
 
 
 cam_group = click.Group(
@@ -159,24 +188,62 @@ def cam_capabilities(target: str, output_mode: OutputMode) -> None:
     emit(payload, output_mode)
 
 
+@cam_group.command("chime")
+@click.argument("target")
+@add_output_options
+def cam_chime(target: str, output_mode: OutputMode) -> None:
+    """Invoke ``DoorbellChime.Chime`` on a doorbell.
+
+    Implements FR-CAM-15 / FR-CAM-16. Cameras lacking the
+    ``sdm.devices.traits.DoorbellChime`` trait exit 5 with a hint
+    enumerating the operator-configured aliases that DO support the
+    chime command.
+    """
+    camera = _fetch_camera(target, output_mode)
+    if not camera.has_trait(_TRAIT_DOORBELL_CHIME):
+        hint = _doorbell_capable_hint(target, output_mode)
+        err = StructuredError(
+            code=EXIT_UNSUPPORTED_FEATURE,
+            message=(f"camera {target!r} does not support chime (missing {_TRAIT_DOORBELL_CHIME})"),
+            hint=hint,
+            details={"target": target, "missing_trait": _TRAIT_DOORBELL_CHIME},
+        )
+        exit_on_structured_error(err, output_mode)
+
+    creds = load_credentials_or_exit(output_mode)
+    client = SdmClient(creds)
+    try:
+        client.execute_command(camera.target_id, _SDM_CMD_DOORBELL_CHIME, {})
+    except StructuredError as exc:
+        exit_on_structured_error(exc, output_mode)
+    emit({"target": target, "command": _SDM_CMD_DOORBELL_CHIME, "result": "ok"}, output_mode)
+
+
 # ---------------------------------------------------------------------------
 # Internals
 # ---------------------------------------------------------------------------
 
 
 def _supported_verbs_for(camera: Camera) -> list[str]:
-    """Compute the verb list for ``camera`` from its trait set.
+    """Compute the verb list for ``camera`` from its trait set + predicates.
 
     Algorithm:
 
     1. Start with the universal verbs (``info``, ``capabilities``).
     2. For each trait the camera has, union in the verbs listed under
        that trait in ``_TRAIT_TO_VERBS``.
-    3. De-dupe and return.
+    3. For each predicate verb in ``_PREDICATE_VERBS``, add the verb if
+       the corresponding ``Camera`` field is non-null. SDM does not
+       expose a documented trait for battery/signal state, so these
+       verbs are gated on parsed-record presence rather than trait name.
+    4. De-dupe and return.
     """
     verbs: set[str] = set(_UNIVERSAL_VERBS)
     for trait in camera.traits:
         verbs.update(_TRAIT_TO_VERBS.get(trait.name, ()))
+    for verb, attr in _PREDICATE_VERBS:
+        if getattr(camera, attr, None) is not None:
+            verbs.add(verb)
     return list(verbs)
 
 
@@ -204,3 +271,49 @@ def _fetch_camera(target: str, output_mode: OutputMode) -> Camera:
     except StructuredError as exc:
         exit_on_structured_error(exc, output_mode)
         raise  # unreachable — for type-checkers
+
+
+def _doorbell_capable_hint(failing_target: str, output_mode: OutputMode) -> str:
+    """Return the FR-CAM-16 hint enumerating doorbell-capable aliases.
+
+    Walks the ``[aliases]`` table and queries each cam target to see
+    which carry the ``DoorbellChime`` trait. Aliases that fail to fetch
+    (404, network, etc.) are silently skipped so a single broken alias
+    doesn't block the hint. ``failing_target`` is excluded from the
+    result (we already know it isn't doorbell-capable). If no aliases
+    are doorbell-capable (or there's no config), return a generic hint.
+    """
+    try:
+        config = load_config(default_config_path())
+    except StructuredError:
+        return (
+            "Run `nest-cli cam capabilities <target>` against your other "
+            "cameras to find one with DoorbellChime."
+        )
+
+    cam_aliases = filter_aliases_by_family(config.aliases, "cam")
+    if not cam_aliases:
+        return (
+            "Run `nest-cli cam capabilities <target>` against your other "
+            "cameras to find one with DoorbellChime."
+        )
+
+    creds = load_credentials_or_exit(output_mode)
+    client = SdmClient(creds)
+    capable: list[str] = []
+    for alias_name, alias_target in sorted(cam_aliases.items()):
+        if alias_name == failing_target or alias_target == failing_target:
+            continue
+        try:
+            cam = client.get_device(alias_target)
+        except StructuredError:
+            continue
+        if cam.has_trait(_TRAIT_DOORBELL_CHIME):
+            capable.append(alias_name)
+
+    if not capable:
+        return (
+            "No doorbell-capable cameras found in your config. The chime "
+            "verb only works on devices carrying sdm.devices.traits.DoorbellChime."
+        )
+    return f"Doorbell-capable aliases in your config: {', '.join(capable)}."
