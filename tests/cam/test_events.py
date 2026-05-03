@@ -315,6 +315,32 @@ class TestMaxMessages:
             assert req["max_messages"] == 7
 
 
+class TestPullFailureExitCode:
+    def test_pull_failure_exits_3_via_constant(self, fake_paths: dict[str, Path]) -> None:
+        """Reviewer feedback (C1): exit 3 must come from EXIT_NETWORK_ERROR constant.
+
+        Regression: prior to the fix the verb hard-coded ``code=3``; this
+        test asserts the exit code is 3 (the constant's value) AND that
+        the JSON envelope's ``error`` enum is the SRD-mapped
+        ``network_error`` for that code, which only happens if the code
+        is wired through ``error_enum_for_code``.
+        """
+        fake_paths["config"].write_text(
+            '[pubsub]\nsubscription_name = "projects/proj/subscriptions/sdm-events"\n',
+            encoding="utf-8",
+        )
+        with patch("nest_cli.cli.cam_events_cmd._build_subscriber") as mk:
+            subscriber = MagicMock()
+            subscriber.pull.side_effect = RuntimeError("pubsub broke")
+            mk.return_value = subscriber
+            runner = CliRunner()
+            result = runner.invoke(cli_root, ["cam", "events", "--json"])
+            assert result.exit_code == 3
+            envelope = json.loads(result.stderr)
+            assert envelope["exit_code"] == 3
+            assert envelope["error"] == "network_error"
+
+
 class TestHasImageDetection:
     def test_no_event_id_means_has_image_false(self, fake_paths: dict[str, Path]) -> None:
         fake_paths["config"].write_text(

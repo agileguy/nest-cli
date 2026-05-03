@@ -49,7 +49,7 @@ import click
 
 from nest_cli.cli._shared import exit_on_structured_error
 from nest_cli.config import default_config_path, load_config, resolve_alias
-from nest_cli.errors import EXIT_CONFIG_ERROR, StructuredError
+from nest_cli.errors import EXIT_CONFIG_ERROR, EXIT_NETWORK_ERROR, StructuredError
 from nest_cli.output import OutputMode, add_output_options, emit
 from nest_cli.sdm.event_types import parse_pubsub_event
 
@@ -131,7 +131,7 @@ def cam_events(
     except Exception as exc:  # noqa: BLE001 - convert any client error to structured
         exit_on_structured_error(
             StructuredError(
-                code=3,  # EXIT_NETWORK_ERROR per SRD §11.1
+                code=EXIT_NETWORK_ERROR,
                 message=f"Pub/Sub pull failed: {exc}",
                 hint=(
                     "Verify ADC are configured "
