@@ -38,6 +38,7 @@ from nest_cli.cli._shared import (
     filter_aliases_by_family,
     load_credentials_or_exit,
 )
+from nest_cli.cli.cam_events_cmd import cam_events
 from nest_cli.cli.cam_stream_cmd import cam_stream, cam_stream_extend, cam_stream_stop
 from nest_cli.cli.list_cmd import _probe_records
 from nest_cli.config import default_config_path, load_config, resolve_alias
@@ -99,6 +100,10 @@ cam_group = click.Group(
 cam_group.add_command(cam_stream)
 cam_group.add_command(cam_stream_extend)
 cam_group.add_command(cam_stream_stop)
+
+# Phase 2 events verb (FR-CAM-19..25 one-shot drain). --follow is
+# Phase 2.1 and not yet implemented.
+cam_group.add_command(cam_events)
 
 
 @cam_group.command("list")

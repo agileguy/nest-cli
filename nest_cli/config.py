@@ -28,8 +28,27 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 from nest_cli.errors import EXIT_CONFIG_ERROR, StructuredError
 
 
+class PubsubConfig(BaseModel):
+    """``[pubsub]`` section of the config (Phase 2 / FR-CAM-25).
+
+    The ``cam events`` verb reads its subscription path from this
+    section. Per SRD Decision 10 / §3.1.3 the operator owns the GCP
+    subscription; the CLI only consumes it. ``auth setup --pubsub``
+    is a Phase 2+ stretch that automates the subscription-creation
+    walkthrough; until it ships, the operator configures
+    ``subscription_name`` here manually.
+
+    ``subscription_name`` is the full Pub/Sub subscription path:
+    ``projects/{project-id}/subscriptions/{sub-name}``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    subscription_name: str | None = None
+
+
 class Config(BaseModel):
-    """Resolved nest-cli config (subset for v0.1.0).
+    """Resolved nest-cli config (subset for v0.1.0+).
 
     ``extra="forbid"`` ensures unknown top-level sections raise on
     validation, which the loader translates into exit 6.
@@ -39,6 +58,7 @@ class Config(BaseModel):
 
     aliases: dict[str, str] = {}
     groups: dict[str, list[str]] = {}
+    pubsub: PubsubConfig = PubsubConfig()
 
 
 def default_config_path() -> Path:
