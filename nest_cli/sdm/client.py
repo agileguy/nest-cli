@@ -102,6 +102,36 @@ class SdmClient:
         payload = self._get_with_refresh(url)
         return Camera.from_sdm_response(payload)
 
+    def execute_command(
+        self,
+        device_name: str,
+        command: str,
+        params: dict[str, Any],
+    ) -> dict[str, Any]:
+        """POST to ``{device_name}:executeCommand`` and return the parsed result.
+
+        Mirrors the SDM ``executeCommand`` REST contract (SRD §3.1; used by
+        FR-CAM-3..27). The request body is ``{"command": "<dotted>", "params": {...}}``;
+        the response body is whatever the per-command result envelope is — this
+        wrapper does not interpret it, just hands it back to the caller as a dict.
+
+        HTTP failure mappings exactly mirror ``_get_with_refresh``:
+
+        - 401 → force-refresh access token, retry once; second 401 raises ``EXIT_AUTH_ERROR``.
+        - 404 → ``EXIT_NOT_FOUND``.
+        - Other 4xx → ``EXIT_DEVICE_ERROR``.
+        - 5xx → ``EXIT_NETWORK_ERROR``.
+        - Connection / DNS / TLS / timeout → ``EXIT_NETWORK_ERROR``.
+
+        The verbs that depend on this (snapshot, chime, stream, etc.) layer their
+        own application-level error handling on top — e.g. SDM may return HTTP 200
+        with a per-device error body for some failure modes; the verb is responsible
+        for inspecting the returned dict's shape.
+        """
+        url = f"{SDM_API_ROOT}/{device_name}:executeCommand"
+        body = {"command": command, "params": params}
+        return self._post_with_refresh(url, body)
+
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
@@ -154,6 +184,78 @@ class SdmClient:
                     "Authorization": f"Bearer {access_token}",
                     "Accept": "application/json",
                 },
+                timeout=self._timeout,
+            )
+        except requests.exceptions.ConnectionError as exc:
+            raise StructuredError(
+                code=EXIT_NETWORK_ERROR,
+                message=f"network error contacting SDM API: {exc}",
+                hint="Check your internet connection and retry.",
+            ) from exc
+        except requests.exceptions.Timeout as exc:
+            raise StructuredError(
+                code=EXIT_NETWORK_ERROR,
+                message=f"timed out contacting SDM API after {self._timeout}s",
+                hint="Google's SDM endpoint is slow or unreachable; retry shortly.",
+            ) from exc
+        except requests.exceptions.RequestException as exc:
+            raise StructuredError(
+                code=EXIT_NETWORK_ERROR,
+                message=f"unexpected requests error contacting SDM API: {exc}",
+            ) from exc
+
+        return response.status_code, response.content
+
+    def _post_with_refresh(self, url: str, body: dict[str, Any]) -> dict[str, Any]:
+        """POST ``body`` to ``url`` with a single auto-refresh-on-401 retry.
+
+        Same retry semantics as ``_get_with_refresh``: lazy-refresh the access
+        token on near-expiry, attempt the POST, and on 401 force-refresh and
+        retry once. A second 401 is fatal (auth error). Other HTTP statuses
+        are interpreted by ``_interpret_status``.
+        """
+        self._credentials = refresh_access_token_if_needed(
+            self._credentials,
+            self._credentials_path,
+        )
+
+        status, response_body = self._do_post(url, self._credentials.access_token, body)
+        if status == 401:
+            self._credentials = refresh_access_token_if_needed(
+                self._credentials,
+                self._credentials_path,
+                force=True,
+            )
+            save_credentials(self._credentials_path, self._credentials)
+            status, response_body = self._do_post(url, self._credentials.access_token, body)
+            if status == 401:
+                raise StructuredError(
+                    code=EXIT_AUTH_ERROR,
+                    message="SDM API rejected access token even after refresh",
+                    hint=(
+                        "Run `nest-cli auth refresh`; if that fails, "
+                        "`nest-cli auth setup --overwrite`."
+                    ),
+                )
+
+        return _interpret_status(url, status, response_body)
+
+    def _do_post(
+        self,
+        url: str,
+        access_token: str,
+        body: dict[str, Any],
+    ) -> tuple[int, bytes]:
+        """Issue a single POST with JSON body. Returns (status_code, raw_body)."""
+        try:
+            response = requests.post(
+                url,
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "Accept": "application/json",
+                    "Content-Type": "application/json",
+                },
+                json=body,
                 timeout=self._timeout,
             )
         except requests.exceptions.ConnectionError as exc:
