@@ -38,6 +38,7 @@ from nest_cli.cli._shared import (
     filter_aliases_by_family,
     load_credentials_or_exit,
 )
+from nest_cli.cli.cam_stream_cmd import cam_stream, cam_stream_extend, cam_stream_stop
 from nest_cli.cli.list_cmd import _probe_records
 from nest_cli.config import default_config_path, load_config, resolve_alias
 from nest_cli.errors import StructuredError
@@ -64,15 +65,23 @@ from nest_cli.sdm.types import Camera
 # These are added unconditionally to ``supported_verbs``.
 
 _TRAIT_TO_VERBS: dict[str, list[str]] = {
-    # v0.1.0 — only ``info`` and ``capabilities`` are wired.
-    # Future phases extend this table:
-    # "sdm.devices.traits.CameraImage": ["snapshot"],
-    # "sdm.devices.traits.CameraEventImage": ["snapshot"],
-    # "sdm.devices.traits.CameraLiveStream": ["stream", "stream-extend", "stream-stop"],
-    # "sdm.devices.traits.DoorbellChime": ["chime"],
-    # "sdm.devices.traits.CameraMotion": ["events"],
-    # "sdm.devices.traits.CameraPerson": ["events"],
-    # "sdm.devices.traits.CameraSound": ["events"],
+    # Phase 2 stream verbs (Engineer B / FR-CAM-6..14).
+    "sdm.devices.traits.CameraLiveStream": ["stream", "stream-extend", "stream-stop"],
+    # Phase 2 events verbs (Engineer B / FR-CAM-19..25). Any of the
+    # event-emitting traits enables the events verb.
+    "sdm.devices.traits.CameraMotion": ["events"],
+    "sdm.devices.traits.CameraPerson": ["events"],
+    "sdm.devices.traits.CameraSound": ["events"],
+    # NOTE: DoorbellChime emits doorbell-press events, but the trait is
+    # also the chime-verb gate (Engineer A's work). To avoid a merge
+    # collision on the same dict key, this table omits DoorbellChime
+    # entirely; Engineer A's branch will land that key with
+    # ``["chime"]`` and the PM merger will widen it to
+    # ``["chime", "events"]`` at integration time.
+    # Phase 2 snapshot / chime / battery / signal verbs land via
+    # Engineer A's parallel work; their entries are intentionally not
+    # included here so the two parallel branches don't collide on this
+    # mapping.
 }
 
 # Verbs every camera has (no trait gate).
@@ -83,6 +92,13 @@ cam_group = click.Group(
     name="cam",
     help="Nest camera commands (SDM API). Implements FR-CAM-1, FR-CAM-2, FR-CAM-28.",
 )
+
+# Phase 2 stream verbs (FR-CAM-6..14). Defined in the sibling
+# ``cam_stream_cmd`` module to keep the merge surface small while two
+# engineers extend ``cam_cmd`` in parallel.
+cam_group.add_command(cam_stream)
+cam_group.add_command(cam_stream_extend)
+cam_group.add_command(cam_stream_stop)
 
 
 @cam_group.command("list")
