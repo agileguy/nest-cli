@@ -12,7 +12,7 @@ The ``add_output_options`` decorator stacks four Click flags — ``--json``,
 target command and resolves them into a single ``output_mode`` keyword
 argument passed to the command body. Any combination of flags that names
 two different modes (e.g. ``--json --jsonl``) exits 64 with a structured
-error per SRD §5.10 / §11.2.
+error per SRD §5.10 / §11.3.
 
 The ``emit`` function is the dispatch point: command bodies build a
 result (a Pydantic model, a dict, a list of either) and call

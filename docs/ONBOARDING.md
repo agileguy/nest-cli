@@ -181,6 +181,8 @@ If Google invalidates your token out-of-band, the next cam verb returns exit 2 w
 
 **"Address already in use" during `auth setup`** — port 8765 is busy. Pick another with `--callback-port 8766`. Make sure you also update the redirect URI in your OAuth client config if you persistently change it.
 
+**Browser doesn't open during `auth setup`** — pass `--no-browser` to print the consent URL on stderr instead of trying to launch a browser. Useful on headless boxes (SSH sessions, CI runners). You then open the URL on a workstation, complete consent, and the local callback listener still receives the redirect.
+
 **"credentials file mode is too permissive"** — `~/.config/nest-cli/credentials-cam.json` is not chmod 0600. Fix: `chmod 600 ~/.config/nest-cli/credentials-cam.json`. The chmod-enforce check is intentional (SRD §FR-CRED-2 / threat model §4.7).
 
 **"SDM API rejected access token"** after a successful setup — refresh-token-revoked by Google, or your Device Access registration lapsed. Re-run `auth setup --overwrite`.

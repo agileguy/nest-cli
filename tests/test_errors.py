@@ -1,6 +1,6 @@
 """Tests for ``nest_cli.errors`` — exit codes and StructuredError contract.
 
-Covers SRD §11.1 (exit-code constants) and §11.2 (stderr envelope).
+Covers SRD §11.1 (exit-code constants) and §11.3 (stderr envelope).
 """
 
 from __future__ import annotations
@@ -45,7 +45,7 @@ class TestExitCodeConstants:
 
 
 class TestErrorEnumForCode:
-    """SRD §11.2 — closed enum mapping exit code → wire-format string."""
+    """SRD §11.3 — closed enum mapping exit code → wire-format string."""
 
     @pytest.mark.parametrize(
         "code, expected",

@@ -27,7 +27,7 @@ Output mode
 Every verb stacks the standard ``add_output_options`` decorator from
 ``nest_cli.output``, so ``--json``, ``--jsonl``, ``--quiet``, and
 ``--output text|json|jsonl|quiet`` are all honored uniformly across the
-CLI (FR-11..15). Failure paths are emitted via the SRD §11.2 envelope
+CLI (FR-11..15). Failure paths are emitted via the SRD §11.3 envelope
 through ``exit_on_structured_error``.
 """
 
@@ -65,9 +65,9 @@ def _redact_client_id(client_id: str) -> str:
 
 
 def _credential_error_to_structured(exc: CredentialError) -> StructuredError:
-    """Convert a CredentialError into the SRD §11.2 StructuredError envelope.
+    """Convert a CredentialError into the SRD §11.3 StructuredError envelope.
 
-    The ``family`` discriminator does not belong in the §11.2 error
+    The ``family`` discriminator does not belong in the §11.3 error
     envelope (the closed enum + exit_code carry the disambiguation). It
     surfaces in the ``auth status`` payload instead.
     """

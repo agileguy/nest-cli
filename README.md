@@ -84,7 +84,7 @@ nest-cli cam info front-door --json
 | 130  | SIGINT               | Ctrl-C during a long-running verb                      |
 | 143  | SIGTERM              | Process terminated                                     |
 
-Errors emit a structured JSON envelope on stderr (`{"error": {"code", "message", "hint", "details"}}`) per SRD §11.2.
+Errors emit a structured JSON envelope on stderr (`{"error": "<enum>", "exit_code": <int>, "message": "...", "hint": "...", "details": {...}}`) per SRD §11.3. The `error` field is a closed enum string (`auth_failed`, `device_error`, etc.); `exit_code` is the integer mirror of the table above.
 
 ## License
 

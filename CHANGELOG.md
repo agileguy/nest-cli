@@ -65,7 +65,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   uniformly with the rest of the CLI. The local `_emit`,
   `_exit_with_credential_error`, and `_OUTPUT_*` helpers were removed.
   Error envelopes no longer carry a `family` discriminator (not in SRD
-  §11.2); the discriminator surfaces in the `auth status` payload only.
+  §11.3); the discriminator surfaces in the `auth status` payload only.
 - `nest_cli/cli/auth_cmd.py` — `auth status` emits a JSON array per
   FR-CRED-10 (one element for the cam family; Phase 3 will add the wifi
   element).

@@ -105,9 +105,9 @@ sdm/types.py:Camera               ← Pydantic record
 output.py:emit                    ← per-mode formatter, RFC 3339 Z timestamps
 ```
 
-Errors at any layer raise `StructuredError(code, message, hint, details)` which `cli/_shared.py:exit_on_structured_error` formats to stderr per SRD §11.2 and exits with the mapped code.
+Errors at any layer raise `StructuredError(code, message, hint, details)` which `cli/_shared.py:exit_on_structured_error` formats to stderr per SRD §11.3 and exits with the mapped code.
 
-### Output and error contract (SRD §5.8 / §11.2)
+### Output and error contract (SRD §5.8 / §11.3)
 
 Every verb that produces structured output uses the `@add_output_options` decorator and the `emit()` function from `nest_cli/output.py`. This guarantees:
 
@@ -121,10 +121,12 @@ Every verb that produces structured output uses the `@add_output_options` decora
 Error envelopes are uniform across all verbs:
 
 ```json
-{"error": {"code": 2, "message": "credentials not found", "hint": "run `nest-cli auth setup`"}}
+{"error": "auth_failed", "exit_code": 2, "message": "credentials not found", "hint": "run `nest-cli auth setup`"}
 ```
 
-Optional `details` field for context. **No `family` discriminator in the error envelope** — the family of the originating verb is implicit in the verb path; only payloads (e.g. `auth status`) carry it.
+The `error` field is the closed enum string from SRD §11.3 (one of `device_error`, `auth_failed`, `network_error`, `not_found`, `unsupported_feature`, `config_error`, `partial_failure`, `usage_error`, `interrupted`); `exit_code` is the integer mirror of the §11.1 table. Tooling MAY pattern-match on either field; both are guaranteed-consistent. Optional `details` field for additional context (status code, target id, etc.).
+
+**No `family` discriminator in the error envelope** — the family of the originating verb is implicit in the verb path; only payloads (e.g. `auth status`) carry it. This is a deliberate Phase 1 deviation from SRD §11.3, which lists `family` and `credential` fields on the envelope. The as-shipped envelope omits both; future SRD revisions should reconcile.
 
 ### Threat model (excerpt)
 

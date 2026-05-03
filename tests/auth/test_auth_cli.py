@@ -189,7 +189,7 @@ def test_refresh_propagates_exit_2_on_4xx(
 ) -> None:
     """A revoked refresh token surfaces as exit 2 with a structured stderr.
 
-    In ``--json`` mode the SRD §11.2 envelope carries the ``auth_failed``
+    In ``--json`` mode the SRD §11.3 envelope carries the ``auth_failed``
     enum string. Text mode emits a human-readable line with no enum
     keyword (reserved for the JSON envelope).
     """
@@ -204,7 +204,7 @@ def test_refresh_propagates_exit_2_on_4xx(
     assert envelope["error"] == "auth_failed"
     assert envelope["exit_code"] == 2
     # FR-CRED-10 cleanup: the ``family`` discriminator does NOT belong in
-    # the §11.2 error envelope (reserved for the auth status payload).
+    # the §11.3 error envelope (reserved for the auth status payload).
     assert "family" not in envelope
 
 
