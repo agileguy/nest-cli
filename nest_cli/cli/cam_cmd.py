@@ -48,6 +48,7 @@ from nest_cli.cli.cam_stream_cmd import cam_stream, cam_stream_extend, cam_strea
 from nest_cli.cli.list_cmd import _probe_records
 from nest_cli.config import default_config_path, load_config, resolve_alias
 from nest_cli.errors import (
+    EXIT_AUTH_ERROR,
     EXIT_DEVICE_ERROR,
     EXIT_NETWORK_ERROR,
     EXIT_UNSUPPORTED_FEATURE,
@@ -600,25 +601,47 @@ def _try_snapshot_tiers(client: SdmClient, camera: Camera) -> tuple[bytes, str]:
     has_camera_image = camera.has_trait(_TRAIT_CAMERA_IMAGE)
     has_camera_event_image = camera.has_trait(_TRAIT_CAMERA_EVENT_IMAGE)
 
+    # Reviewer feedback (C6): FR-CAM-4 says "advance on failure". The
+    # prior implementation only advanced to tier 2 when the camera
+    # *lacked* the CameraImage trait — a tier-1 5xx, malformed body, or
+    # connection error did NOT trigger fallback. Wrap tier 1 in try /
+    # except StructuredError and advance on any non-auth failure.
+    # FR-CAM-4a still short-circuits on EXIT_AUTH_ERROR from any tier.
+    tier1_error: StructuredError | None = None
     if has_camera_image:
-        # Tier 1.
-        result = client.execute_command(camera.target_id, _SDM_CMD_CAMERA_IMAGE, {})
-        url, token = _parse_image_url_and_token(result, mechanism="camera_image")
-        return _download_snapshot_bytes(url, token), "camera_image"
+        try:
+            result = client.execute_command(camera.target_id, _SDM_CMD_CAMERA_IMAGE, {})
+            url, token = _parse_image_url_and_token(result, mechanism="camera_image")
+            return _download_snapshot_bytes(url, token), "camera_image"
+        except StructuredError as exc:
+            if exc.code == EXIT_AUTH_ERROR:  # FR-CAM-4a — never fall back on auth
+                raise
+            tier1_error = exc
 
     if has_camera_event_image:
         event_id = _fetch_recent_event_id(client, camera)
         if event_id is not None:
-            # Tier 2.
-            result = client.execute_command(
-                camera.target_id,
-                _SDM_CMD_CAMERA_EVENT_IMAGE,
-                {"eventId": event_id},
-            )
-            url, token = _parse_image_url_and_token(result, mechanism="camera_event_image")
-            return _download_snapshot_bytes(url, token), "camera_event_image"
+            try:
+                result = client.execute_command(
+                    camera.target_id,
+                    _SDM_CMD_CAMERA_EVENT_IMAGE,
+                    {"eventId": event_id},
+                )
+                url, token = _parse_image_url_and_token(result, mechanism="camera_event_image")
+                return _download_snapshot_bytes(url, token), "camera_event_image"
+            except StructuredError:
+                # Tier 2 also failed — surface its error directly. Auth
+                # rejections at tier 2 still propagate as exit 2 because
+                # the SDM client raises EXIT_AUTH_ERROR; we re-raise the
+                # exception unchanged.
+                raise
 
-    # Neither tier worked — FR-CAM-4b.
+    # Tier 2 wasn't available (no CameraEventImage trait OR no recent
+    # event in window). If tier 1 failed earlier, surface that error;
+    # otherwise the camera genuinely has no viable snapshot mechanism.
+    if tier1_error is not None:
+        raise tier1_error
+
     raise StructuredError(
         code=EXIT_UNSUPPORTED_FEATURE,
         message=(

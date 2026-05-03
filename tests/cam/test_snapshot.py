@@ -389,6 +389,215 @@ class TestSnapshotStdoutOutput:
         assert "--quiet" in result.stderr or "--quiet" in result.output
 
 
+# --- C6 reviewer feedback: FR-CAM-4 advance-on-failure ----------------------
+
+
+class TestSnapshotTierAdvanceOnFailure:
+    """Reviewer feedback (C6): SRD FR-CAM-4 says "advance on failure".
+
+    Prior implementation only advanced to tier 2 when the camera lacked
+    the CameraImage trait — a tier-1 5xx, malformed body, or connection
+    error never triggered fallback. The fix wraps tier 1 in
+    try/except StructuredError; non-auth failures advance to tier 2.
+    EXIT_AUTH_ERROR from any tier still short-circuits per FR-CAM-4a.
+    """
+
+    @responses.activate
+    def test_tier1_503_falls_back_to_tier2_success(
+        self,
+        fake_paths: dict[str, Path],
+        write_creds: Any,
+        indoor_payload: dict[str, Any],
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Tier 1 returns 503 → tier 2 attempted → tier 2 succeeds."""
+        write_creds(fake_paths["credentials"])
+        device = "enterprises/proj/devices/indoor-1"
+        out = tmp_path / "snap.jpg"
+        responses.add(responses.GET, f"{SDM_API_ROOT}/{device}", json=indoor_payload, status=200)
+        # Tier 1 GenerateImage POST → 503 (mapped to EXIT_NETWORK_ERROR).
+        responses.add(
+            responses.POST,
+            f"{SDM_API_ROOT}/{device}:executeCommand",
+            json={"error": "service unavailable"},
+            status=503,
+        )
+        # Tier 2 GenerateImage POST → 200 with a valid result.
+        responses.add(
+            responses.POST,
+            f"{SDM_API_ROOT}/{device}:executeCommand",
+            json={
+                "results": {
+                    "url": "https://nest-fixture.example/event-img/xyz",
+                    "token": "tok-tier2",
+                }
+            },
+            status=200,
+        )
+        responses.add(
+            responses.GET,
+            "https://nest-fixture.example/event-img/xyz",
+            body=_FAKE_JPEG,
+            status=200,
+            content_type="image/jpeg",
+        )
+        _patch_event_id(monkeypatch, "evt-recent-1")
+
+        runner = CliRunner()
+        result = runner.invoke(
+            cli_root,
+            ["cam", "snapshot", device, "--output", str(out), "--json"],
+        )
+        assert result.exit_code == 0, result.output + result.stderr
+        payload = json.loads(result.output)
+        assert payload["mechanism"] == "camera_event_image"
+        assert out.read_bytes() == _FAKE_JPEG
+
+    @responses.activate
+    def test_tier1_malformed_body_falls_back_to_tier2(
+        self,
+        fake_paths: dict[str, Path],
+        write_creds: Any,
+        indoor_payload: dict[str, Any],
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Tier 1 returns 200 with no 'results' object → fall back to tier 2."""
+        write_creds(fake_paths["credentials"])
+        device = "enterprises/proj/devices/indoor-1"
+        out = tmp_path / "snap.jpg"
+        responses.add(responses.GET, f"{SDM_API_ROOT}/{device}", json=indoor_payload, status=200)
+        # Tier 1: malformed (no 'results' key).
+        responses.add(
+            responses.POST,
+            f"{SDM_API_ROOT}/{device}:executeCommand",
+            json={"unexpected": "shape"},
+            status=200,
+        )
+        # Tier 2: well-formed.
+        responses.add(
+            responses.POST,
+            f"{SDM_API_ROOT}/{device}:executeCommand",
+            json={
+                "results": {
+                    "url": "https://nest-fixture.example/event-img/zzz",
+                    "token": "tok-tier2",
+                }
+            },
+            status=200,
+        )
+        responses.add(
+            responses.GET,
+            "https://nest-fixture.example/event-img/zzz",
+            body=_FAKE_JPEG,
+            status=200,
+            content_type="image/jpeg",
+        )
+        _patch_event_id(monkeypatch, "evt-recent-2")
+
+        runner = CliRunner()
+        result = runner.invoke(
+            cli_root,
+            ["cam", "snapshot", device, "--output", str(out), "--json"],
+        )
+        assert result.exit_code == 0, result.output + result.stderr
+        payload = json.loads(result.output)
+        assert payload["mechanism"] == "camera_event_image"
+
+    @responses.activate
+    def test_tier1_and_tier2_both_fail_surfaces_tier2_error(
+        self,
+        fake_paths: dict[str, Path],
+        write_creds: Any,
+        indoor_payload: dict[str, Any],
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Tier 1 503 → tier 2 also returns malformed body → exit 1 with tier-2 error."""
+        write_creds(fake_paths["credentials"])
+        device = "enterprises/proj/devices/indoor-1"
+        out = tmp_path / "snap.jpg"
+        responses.add(responses.GET, f"{SDM_API_ROOT}/{device}", json=indoor_payload, status=200)
+        # Tier 1: 503.
+        responses.add(
+            responses.POST,
+            f"{SDM_API_ROOT}/{device}:executeCommand",
+            json={"error": "service unavailable"},
+            status=503,
+        )
+        # Tier 2: malformed body → EXIT_DEVICE_ERROR.
+        responses.add(
+            responses.POST,
+            f"{SDM_API_ROOT}/{device}:executeCommand",
+            json={"unexpected": "shape"},
+            status=200,
+        )
+        _patch_event_id(monkeypatch, "evt-recent-3")
+
+        runner = CliRunner()
+        result = runner.invoke(
+            cli_root,
+            ["cam", "snapshot", device, "--output", str(out), "--json"],
+        )
+        assert result.exit_code == 1, result.output + result.stderr
+        envelope = json.loads(result.stderr)
+        # The error message should reference camera_event_image (tier 2),
+        # not camera_image (tier 1) — proving tier-2 error is the one
+        # that surfaces.
+        assert "camera_event_image" in envelope["message"]
+
+    @responses.activate
+    def test_tier2_401_exits_2_per_fr_cam_4a(
+        self,
+        fake_paths: dict[str, Path],
+        write_creds: Any,
+        indoor_payload: dict[str, Any],
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """FR-CAM-4a: auth-rejection at any tier exits 2 immediately.
+
+        Reviewer (Gemini) flagged this case as missing: tier 1 fails
+        with a non-auth error, tier 2 attempted, tier 2 returns 401.
+        Even though tier 2 is the fallback, FR-CAM-4a still applies —
+        no further fallback after auth.
+        """
+        write_creds(fake_paths["credentials"])
+        device = "enterprises/proj/devices/indoor-1"
+        out = tmp_path / "snap.jpg"
+        responses.add(responses.GET, f"{SDM_API_ROOT}/{device}", json=indoor_payload, status=200)
+        # Tier 1: 503 → advance to tier 2.
+        responses.add(
+            responses.POST,
+            f"{SDM_API_ROOT}/{device}:executeCommand",
+            json={"error": "service unavailable"},
+            status=503,
+        )
+        # Tier 2 first POST: 401 → SDM client force-refreshes and retries.
+        responses.add(
+            responses.POST,
+            f"{SDM_API_ROOT}/{device}:executeCommand",
+            json={"error": "unauth"},
+            status=401,
+        )
+        # Tier 2 retry POST: still 401 → SDM client raises EXIT_AUTH_ERROR.
+        responses.add(
+            responses.POST,
+            f"{SDM_API_ROOT}/{device}:executeCommand",
+            json={"error": "still unauth"},
+            status=401,
+        )
+        _patch_event_id(monkeypatch, "evt-recent-4")
+
+        runner = CliRunner()
+        result = runner.invoke(
+            cli_root,
+            ["cam", "snapshot", device, "--output", str(out)],
+        )
+        assert result.exit_code == 2
+
+
 # --- C4 reviewer feedback: token leakage in error details -------------------
 
 
