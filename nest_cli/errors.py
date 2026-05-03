@@ -48,7 +48,7 @@ from __future__ import annotations
 import json
 import sys
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 # ---------------------------------------------------------------------------
 # Exit codes (SRD §11.1)
@@ -111,12 +111,23 @@ class StructuredError(Exception):
     next step. ``details`` is an optional structured payload — used for
     things like ``{"target": "front-door", "credential": "oauth_refresh_token"}``
     which are surfaced in JSON output but not in text-mode stderr.
+
+    The ``family`` field is the SRD §11.3 family discriminator
+    (``"cam"`` | ``"wifi"`` | ``"shared"``). It is intentionally
+    optional and defaults to ``None`` so the v0.1.0 / v0.2.x cam-side
+    error envelope (which never carried ``family``) stays bit-for-bit
+    backward-compatible. Phase 3 wifi verbs construct errors with
+    ``family="wifi"`` so the §11.3-aligned field starts appearing on
+    the wifi side of the wire format. The cam side is documented as a
+    deliberate deviation (no ``family`` field) until a follow-up
+    retrofit lands.
     """
 
     code: int
     message: str
     hint: str | None = None
     details: dict[str, Any] | None = field(default=None)
+    family: Literal["cam", "wifi", "shared"] | None = None
 
     def __str__(self) -> str:  # noqa: D401 - stdlib Exception protocol
         return self.message
@@ -158,4 +169,10 @@ def emit_structured_error_to_stderr(err: StructuredError, output_mode: str) -> N
         payload["hint"] = err.hint
     if err.details:
         payload["details"] = err.details
+    # SRD §11.3 names ``family`` as the closed-set discriminator. Emit only
+    # when the constructor set it explicitly. Cam-side errors (which omit
+    # ``family``) stay bit-identical to the v0.1.0 / v0.2.x envelope so any
+    # operator script pinned to that shape keeps working.
+    if err.family is not None:
+        payload["family"] = err.family
     print(json.dumps(payload, sort_keys=True), file=sys.stderr)

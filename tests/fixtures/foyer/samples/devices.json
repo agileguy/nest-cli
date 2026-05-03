@@ -1,0 +1,56 @@
+{
+  "group-home-001": {
+    "sta-laptop": {
+      "id": "sta-laptop",
+      "friendlyName": "Operator Laptop",
+      "macAddress": "aa:bb:cc:00:00:01",
+      "ipAddress": "192.0.2.10",
+      "apId": "ap-master-living-room",
+      "connectionType": "WIRELESS",
+      "frequencyBand": "BAND_5_GHZ",
+      "txRateMbps": 432.1,
+      "rxRateMbps": 405.0,
+      "paused": false
+    },
+    "sta-phone": {
+      "id": "sta-phone",
+      "friendlyName": "Operator Phone",
+      "macAddress": "aa:bb:cc:00:00:02",
+      "ipAddress": "192.0.2.11",
+      "apId": "ap-master-living-room",
+      "connectionType": "WIRELESS",
+      "frequencyBand": "BAND_5_GHZ",
+      "paused": false
+    },
+    "sta-kid-tablet": {
+      "id": "sta-kid-tablet",
+      "friendlyName": "Kid Tablet",
+      "macAddress": "aa:bb:cc:00:00:03",
+      "ipAddress": "192.0.2.12",
+      "apId": "ap-sat-office",
+      "connectionType": "WIRELESS",
+      "frequencyBand": "BAND_2_4_GHZ",
+      "paused": true,
+      "priorityUntil": "2026-05-03T13:30:00Z",
+      "groupAssignment": "PARENTAL"
+    },
+    "sta-nas-wired": {
+      "id": "sta-nas-wired",
+      "friendlyName": "Wired NAS",
+      "apId": "ap-master-living-room",
+      "connectionType": "ETHERNET",
+      "paused": false
+    }
+  },
+  "group-cottage-002": {
+    "sta-thermostat": {
+      "id": "sta-thermostat",
+      "friendlyName": "Cottage Thermostat",
+      "macAddress": "aa:bb:cc:00:00:04",
+      "apId": "ap-master-cottage",
+      "connectionType": "WIRELESS",
+      "frequencyBand": "BAND_2_4_GHZ",
+      "paused": false
+    }
+  }
+}

@@ -1,0 +1,108 @@
+{
+  "group-home-001": {
+    "id": "group-home-001",
+    "name": "Home Mesh",
+    "status": "ONLINE",
+    "wanConnectionStatus": "ONLINE",
+    "access_points": {
+      "ap-master-living-room": {
+        "id": "ap-master-living-room",
+        "isMaster": true,
+        "displayName": "Living Room",
+        "model": "AC-1304",
+        "firmwareVersion": "13371.95.84",
+        "status": {"apState": "ONLINE", "uptimeSeconds": 86400}
+      },
+      "ap-sat-office": {
+        "id": "ap-sat-office",
+        "isMaster": false,
+        "displayName": "Office",
+        "model": "AC-1304",
+        "firmwareVersion": "13371.95.84",
+        "status": {
+          "apState": "ONLINE",
+          "uptimeSeconds": 43200,
+          "signalStrengthDbm": -52
+        }
+      }
+    },
+    "devices": {
+      "sta-laptop": {
+        "id": "sta-laptop",
+        "friendlyName": "Operator Laptop",
+        "macAddress": "aa:bb:cc:00:00:01",
+        "ipAddress": "192.0.2.10",
+        "apId": "ap-master-living-room",
+        "connectionType": "WIRELESS",
+        "frequencyBand": "BAND_5_GHZ",
+        "txRateMbps": 432.1,
+        "rxRateMbps": 405.0,
+        "paused": false
+      },
+      "sta-phone": {
+        "id": "sta-phone",
+        "friendlyName": "Operator Phone",
+        "macAddress": "aa:bb:cc:00:00:02",
+        "ipAddress": "192.0.2.11",
+        "apId": "ap-master-living-room",
+        "connectionType": "WIRELESS",
+        "frequencyBand": "BAND_5_GHZ",
+        "paused": false
+      },
+      "sta-kid-tablet": {
+        "id": "sta-kid-tablet",
+        "friendlyName": "Kid Tablet",
+        "macAddress": "aa:bb:cc:00:00:03",
+        "ipAddress": "192.0.2.12",
+        "apId": "ap-sat-office",
+        "connectionType": "WIRELESS",
+        "frequencyBand": "BAND_2_4_GHZ",
+        "paused": true,
+        "priorityUntil": "2026-05-03T13:30:00Z",
+        "groupAssignment": "PARENTAL"
+      },
+      "sta-nas-wired": {
+        "id": "sta-nas-wired",
+        "friendlyName": "Wired NAS",
+        "apId": "ap-master-living-room",
+        "connectionType": "ETHERNET",
+        "paused": false
+      }
+    },
+    "groupSettings": {
+      "apSettings": {"ssid": "HomeMeshNet"},
+      "guestSsid": {"enabled": false}
+    }
+  },
+  "group-cottage-002": {
+    "id": "group-cottage-002",
+    "name": "Cottage Mesh",
+    "status": "ONLINE",
+    "wanConnectionStatus": "ONLINE",
+    "access_points": {
+      "ap-master-cottage": {
+        "id": "ap-master-cottage",
+        "isMaster": true,
+        "displayName": "Cottage",
+        "model": "AC-1304",
+        "firmwareVersion": "13371.95.84",
+        "status": {"apState": "ONLINE", "uptimeSeconds": 1800}
+      }
+    },
+    "devices": {
+      "sta-thermostat": {
+        "id": "sta-thermostat",
+        "friendlyName": "Cottage Thermostat",
+        "macAddress": "aa:bb:cc:00:00:04",
+        "apId": "ap-master-cottage",
+        "connectionType": "WIRELESS",
+        "frequencyBand": "BAND_2_4_GHZ",
+        "paused": false
+      }
+    },
+    "groupSettings": {
+      "apSettings": {"ssid": "CottageNet"},
+      "guestSsid": {"enabled": true}
+    }
+  }
+}
