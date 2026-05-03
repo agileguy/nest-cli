@@ -101,6 +101,29 @@ wifi_list_group = click.Group(
 wifi_group.add_command(wifi_list_group)
 
 
+# Phase 3.1 nested subgroups (speedtest, reboot, guest). Each holds a
+# pair of sub-verbs (run/history, point/group, enable/disable). Click
+# requires the sub-verbs registered onto the inner Group then the inner
+# Group registered onto wifi_group.
+speedtest_group = click.Group(
+    name="speedtest",
+    help="Run a fresh WAN speed test or read recent results.",
+)
+wifi_group.add_command(speedtest_group)
+
+reboot_group_cli = click.Group(
+    name="reboot",
+    help="Reboot a single point or every point in a mesh group.",
+)
+wifi_group.add_command(reboot_group_cli)
+
+guest_group = click.Group(
+    name="guest",
+    help="Toggle the guest network on a mesh group.",
+)
+wifi_group.add_command(guest_group)
+
+
 # ---------------------------------------------------------------------------
 # wifi list groups (FR-WIFI-1)
 # ---------------------------------------------------------------------------
@@ -362,6 +385,96 @@ def cmd_group_assign(
         },
         output_mode,
     )
+
+
+# ---------------------------------------------------------------------------
+# wifi speedtest run <group-id> (FR-WIFI-8)
+# ---------------------------------------------------------------------------
+
+
+@speedtest_group.command("run")
+@click.argument("group_id", metavar="<group-id>")
+@click.option(
+    "--timeout",
+    "timeout_s",
+    type=click.FloatRange(0.1, 600.0),
+    default=180.0,
+    show_default=True,
+    help=(
+        "Wall-clock ceiling in seconds. A speed test typically completes "
+        "in 30-90 seconds; the default 180s is a safe upper bound."
+    ),
+)
+@click.option(
+    "--experimental-wifi",
+    is_flag=True,
+    default=False,
+    help="Required acknowledgement that the wifi side is experimental (FR-WIFI-0).",
+)
+@add_output_options
+def cmd_speedtest_run(
+    group_id: str,
+    timeout_s: float,
+    experimental_wifi: bool,
+    output_mode: OutputMode,
+) -> None:
+    """Trigger a fresh WAN speed test on the master router (FR-WIFI-8).
+
+    Blocks until the test completes (typically 30-90s) or the
+    ``--timeout`` ceiling is hit. Output is one §10.9 SpeedTest record:
+    ``{ts, group_id, point_id, download_mbps, upload_mbps, ping_ms, source}``.
+    """
+    experimental_wifi_gate_or_exit(experimental_wifi, output_mode, verb="wifi speedtest run")
+    master_token = _load_wifi_creds_or_exit(output_mode)
+    try:
+        client = FoyerClient(master_token=master_token)
+        result = client.run_speedtest(group_id, timeout_s=timeout_s)
+    except StructuredError as exc:
+        exit_on_structured_error(exc, output_mode)
+    emit(result, output_mode)
+
+
+# ---------------------------------------------------------------------------
+# wifi speedtest history <group-id> --limit N (FR-WIFI-9)
+# ---------------------------------------------------------------------------
+
+
+@speedtest_group.command("history")
+@click.argument("group_id", metavar="<group-id>")
+@click.option(
+    "--limit",
+    "limit",
+    type=click.IntRange(1, 365),
+    default=30,
+    show_default=True,
+    help="Maximum number of recent results to return. Foyer caps at 365.",
+)
+@click.option(
+    "--experimental-wifi",
+    is_flag=True,
+    default=False,
+    help="Required acknowledgement that the wifi side is experimental (FR-WIFI-0).",
+)
+@add_output_options
+def cmd_speedtest_history(
+    group_id: str,
+    limit: int,
+    experimental_wifi: bool,
+    output_mode: OutputMode,
+) -> None:
+    """Emit recent speed-test history for a mesh group (FR-WIFI-9).
+
+    Output is a list of §10.9 SpeedTest records sorted descending by
+    ``ts`` (most recent first). Empty list if the router has no history.
+    """
+    experimental_wifi_gate_or_exit(experimental_wifi, output_mode, verb="wifi speedtest history")
+    master_token = _load_wifi_creds_or_exit(output_mode)
+    try:
+        client = FoyerClient(master_token=master_token)
+        results = client.get_speedtest_history(group_id, limit=limit)
+    except StructuredError as exc:
+        exit_on_structured_error(exc, output_mode)
+    emit(results, output_mode)
 
 
 # Re-export helpers for the test modules — keeps the public surface
