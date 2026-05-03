@@ -552,3 +552,90 @@ class TestWaitForOperation:
             v3_client._wait_for_operation("op-123", timeout_s=10.0)
         assert exc_info.value.code == EXIT_NETWORK_ERROR
         assert exc_info.value.family == "wifi"
+
+    # ------------------------------------------------------------------
+    # PR #9 review fix #3 — poll-first, terminal-failure states, jitter
+    # ------------------------------------------------------------------
+
+    def test_poll_first_returns_immediately_when_done(
+        self, v3_client: FoyerClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """First poll returns DONE; sleep is never called.
+
+        Confirms the loop polls before sleeping (preserving the invariant
+        that a fast operation is observed without a 5-second blind spot).
+        """
+        sleep_calls: list[float] = []
+
+        def fake_sleep(s: float) -> None:
+            sleep_calls.append(s)
+
+        def fake_rest(self: FoyerClient, method: str, path: str, **_: Any) -> Any:
+            return {"operationState": "DONE", "result": {"download_mbps": 950}}
+
+        monkeypatch.setattr(FoyerClient, "_rest", fake_rest)
+        monkeypatch.setattr(wifi_client_mod.time, "sleep", fake_sleep)
+
+        payload = v3_client._wait_for_operation("op-fast", timeout_s=60.0)
+        assert payload["operationState"] == "DONE"
+        # Sleep should never have been invoked because the first poll
+        # returned DONE.
+        assert sleep_calls == []
+
+    def test_terminal_failed_state_raises_structured_error(
+        self, v3_client: FoyerClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Terminal failure states map to EXIT_DEVICE_ERROR immediately."""
+
+        def fake_rest(self: FoyerClient, method: str, path: str, **_: Any) -> Any:
+            return {"operationState": "FAILED", "error": {"code": "UPSTREAM_FAILURE"}}
+
+        monkeypatch.setattr(FoyerClient, "_rest", fake_rest)
+        monkeypatch.setattr(wifi_client_mod.time, "sleep", lambda s: None)
+
+        with pytest.raises(StructuredError) as exc_info:
+            v3_client._wait_for_operation("op-bad", timeout_s=60.0)
+        err = exc_info.value
+        assert err.code == EXIT_DEVICE_ERROR
+        assert err.family == "wifi"
+        assert "FAILED" in err.message
+        assert "speedtest history" in (err.hint or "")
+
+    def test_terminal_cancelled_state_raises_structured_error(
+        self, v3_client: FoyerClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``CANCELLED`` is also a terminal state; same exit-1 mapping."""
+
+        def fake_rest(self: FoyerClient, method: str, path: str, **_: Any) -> Any:
+            return {"operationState": "CANCELLED"}
+
+        monkeypatch.setattr(FoyerClient, "_rest", fake_rest)
+        monkeypatch.setattr(wifi_client_mod.time, "sleep", lambda s: None)
+
+        with pytest.raises(StructuredError) as exc_info:
+            v3_client._wait_for_operation("op-cancel", timeout_s=60.0)
+        assert exc_info.value.code == EXIT_DEVICE_ERROR
+
+    def test_sleep_includes_jitter(
+        self, v3_client: FoyerClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Sleep duration includes the jitter from ``random.uniform(0, 1.0)``.
+
+        Patches ``random.uniform`` in the client module to a fixed 0.5
+        and asserts the sleep call is invoked with ``5.0 + 0.5 == 5.5``.
+        """
+        sleep_calls: list[float] = []
+        responses = [
+            {"operationState": "PENDING"},
+            {"operationState": "DONE"},
+        ]
+
+        def fake_rest(self: FoyerClient, method: str, path: str, **_: Any) -> Any:
+            return responses.pop(0)
+
+        monkeypatch.setattr(FoyerClient, "_rest", fake_rest)
+        monkeypatch.setattr(wifi_client_mod.time, "sleep", lambda s: sleep_calls.append(s))
+        monkeypatch.setattr(wifi_client_mod.random, "uniform", lambda lo, hi: 0.5)
+
+        v3_client._wait_for_operation("op-jitter", timeout_s=60.0)
+        assert sleep_calls == [5.5]

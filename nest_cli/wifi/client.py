@@ -53,6 +53,7 @@ Failure mapping
 
 from __future__ import annotations
 
+import random
 import threading
 import time
 from typing import Any, Literal, cast
@@ -139,6 +140,10 @@ FOYER_REST_BASE = "https://googlehomefoyer-pa.googleapis.com"
 # Async operation poll interval + default ceiling.
 _OPERATION_POLL_INTERVAL_S = 5.0
 _DEFAULT_OPERATION_TIMEOUT_S = 180.0
+# PR #9 review fix #3 — terminal failure states the poller must
+# recognize so a server-side hardware failure surfaces immediately
+# instead of looping until the operator-level timeout trips.
+_OPERATION_TERMINAL_FAILED_STATES: frozenset[str] = frozenset({"FAILED", "CANCELLED", "ERROR"})
 
 
 # ---------------------------------------------------------------------------
@@ -1017,9 +1022,27 @@ class FoyerClient:
 
         Returns the final operation payload. Used by ``run_speedtest``,
         which kicks off an async wanSpeedTest operation server-side.
-        Raises ``EXIT_NETWORK_ERROR`` on timeout (the operation may
-        eventually complete server-side; the operator can re-poll via
-        ``speedtest history`` once it does).
+
+        Loop ordering (PR #9 review fix #3): poll FIRST, then check
+        terminal states, then check the deadline, then sleep with jitter.
+        This guarantees a fast operation (e.g. a 2-second server-side
+        speedtest) is observed on the first iteration without a
+        five-second blind spot.
+
+        Failure modes:
+        - ``DONE`` → return the payload.
+        - ``FAILED`` / ``CANCELLED`` / ``ERROR`` (the terminal-failure
+          states) → raise ``EXIT_DEVICE_ERROR`` immediately rather than
+          looping until ``timeout_s`` trips. Foyer reported an upstream
+          failure; spinning is wasted polling.
+        - Timeout → raise ``EXIT_NETWORK_ERROR``. The operation may still
+          complete server-side; the operator can re-poll via
+          ``wifi speedtest history`` once it does.
+
+        Sleep jitter (``random.uniform(0, 1.0)``) added to
+        ``_OPERATION_POLL_INTERVAL_S`` so two clients polling the same
+        operation don't synchronize their requests on the same 5-second
+        boundary (thundering-herd mitigation).
         """
         deadline = time.time() + timeout_s
         while True:
@@ -1027,6 +1050,17 @@ class FoyerClient:
             state = (payload or {}).get("operationState")
             if state == "DONE":
                 return payload
+            if isinstance(state, str) and state in _OPERATION_TERMINAL_FAILED_STATES:
+                raise StructuredError(
+                    code=EXIT_DEVICE_ERROR,
+                    message=f"operation {operation_id} ended in state {state}",
+                    hint=(
+                        "The Foyer operation reported an upstream failure; "
+                        "rerun and check 'wifi speedtest history' for prior "
+                        "results."
+                    ),
+                    family=WIFI_FAMILY,
+                )
             if time.time() >= deadline:
                 raise StructuredError(
                     code=EXIT_NETWORK_ERROR,
@@ -1041,7 +1075,7 @@ class FoyerClient:
                     ),
                     family=WIFI_FAMILY,
                 )
-            time.sleep(_OPERATION_POLL_INTERVAL_S)
+            time.sleep(_OPERATION_POLL_INTERVAL_S + random.uniform(0, 1.0))
 
     @staticmethod
     def _rest_error(method: str, path: str, response: Any) -> StructuredError:
