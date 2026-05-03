@@ -10,6 +10,10 @@ Mocks all HTTP via the ``responses`` library; no real network. Covers:
 - 404 → exit 4.
 - 5xx → exit 3.
 - Connection error → exit 3.
+- ``execute_command`` POSTs to ``:executeCommand`` and parses the result.
+- ``execute_command`` 401 → refresh → retry → success.
+- ``execute_command`` 401 twice → exit 2.
+- ``execute_command`` 404 / 5xx / connection-error mappings.
 
 Token-refresh integration is mocked via monkeypatch on
 ``refresh_access_token_if_needed`` so we don't need to stub Google's
@@ -335,4 +339,171 @@ class TestHttpFailureMappings:
         client = SdmClient(fresh_credentials, credentials_path=credentials_path)
         with pytest.raises(StructuredError) as exc_info:
             client.get_device("enterprises/proj/devices/d1")
+        assert exc_info.value.code == EXIT_NETWORK_ERROR
+
+
+# ---------------------------------------------------------------------------
+# execute_command (POST)
+# ---------------------------------------------------------------------------
+
+
+class TestExecuteCommand:
+    """SDM ``executeCommand`` POST surface (FR-CAM-3..27 use this)."""
+
+    @responses.activate
+    def test_posts_command_and_returns_parsed_result(
+        self,
+        fresh_credentials: CamCredentials,
+        credentials_path: Path,
+        patch_refresh: list[CamCredentials],
+    ) -> None:
+        device = "enterprises/proj/devices/doorbell-1"
+        url = f"{SDM_API_ROOT}/{device}:executeCommand"
+        responses.add(
+            responses.POST,
+            url,
+            json={"results": {"answerSdp": "v=0\r\n..."}},
+            status=200,
+        )
+
+        client = SdmClient(fresh_credentials, credentials_path=credentials_path)
+        result = client.execute_command(
+            device,
+            "sdm.devices.commands.CameraLiveStream.GenerateRtspStream",
+            {},
+        )
+        assert result == {"results": {"answerSdp": "v=0\r\n..."}}
+        # Body the client sent should be the SDM-shaped {command, params}.
+        request = responses.calls[0].request
+        assert request.headers["Authorization"] == "Bearer access-tok-current"
+        assert request.headers["Content-Type"] == "application/json"
+        body = json.loads(request.body or b"{}")
+        assert body == {
+            "command": "sdm.devices.commands.CameraLiveStream.GenerateRtspStream",
+            "params": {},
+        }
+
+    @responses.activate
+    def test_passes_params_through(
+        self,
+        fresh_credentials: CamCredentials,
+        credentials_path: Path,
+        patch_refresh: list[CamCredentials],
+    ) -> None:
+        device = "enterprises/proj/devices/cam-1"
+        url = f"{SDM_API_ROOT}/{device}:executeCommand"
+        responses.add(responses.POST, url, json={"results": {}}, status=200)
+
+        client = SdmClient(fresh_credentials, credentials_path=credentials_path)
+        client.execute_command(
+            device,
+            "sdm.devices.commands.CameraEventImage.GenerateImage",
+            {"eventId": "evt-abc-123"},
+        )
+        body = json.loads(responses.calls[0].request.body or b"{}")
+        assert body == {
+            "command": "sdm.devices.commands.CameraEventImage.GenerateImage",
+            "params": {"eventId": "evt-abc-123"},
+        }
+
+    @responses.activate
+    def test_401_then_refresh_then_success(
+        self,
+        fresh_credentials: CamCredentials,
+        credentials_path: Path,
+        patch_refresh: list[CamCredentials],
+        patch_save: list[CamCredentials],
+    ) -> None:
+        device = "enterprises/proj/devices/d1"
+        url = f"{SDM_API_ROOT}/{device}:executeCommand"
+        responses.add(responses.POST, url, json={"error": "unauth"}, status=401)
+        responses.add(responses.POST, url, json={"results": {"ok": True}}, status=200)
+
+        client = SdmClient(fresh_credentials, credentials_path=credentials_path)
+        result = client.execute_command(device, "sdm.devices.commands.X.Y", {})
+        assert result == {"results": {"ok": True}}
+        assert len(patch_refresh) == 2  # lazy + force
+        assert len(patch_save) == 1
+
+    @responses.activate
+    def test_401_twice_raises_auth_error(
+        self,
+        fresh_credentials: CamCredentials,
+        credentials_path: Path,
+        patch_refresh: list[CamCredentials],
+        patch_save: list[CamCredentials],
+    ) -> None:
+        device = "enterprises/proj/devices/d1"
+        url = f"{SDM_API_ROOT}/{device}:executeCommand"
+        responses.add(responses.POST, url, json={"error": "unauth"}, status=401)
+        responses.add(responses.POST, url, json={"error": "still unauth"}, status=401)
+
+        client = SdmClient(fresh_credentials, credentials_path=credentials_path)
+        with pytest.raises(StructuredError) as exc_info:
+            client.execute_command(device, "sdm.devices.commands.X.Y", {})
+        assert exc_info.value.code == EXIT_AUTH_ERROR
+
+    @responses.activate
+    def test_404_raises_exit_4(
+        self,
+        fresh_credentials: CamCredentials,
+        credentials_path: Path,
+        patch_refresh: list[CamCredentials],
+    ) -> None:
+        device = "enterprises/proj/devices/missing"
+        url = f"{SDM_API_ROOT}/{device}:executeCommand"
+        responses.add(responses.POST, url, json={"error": "not found"}, status=404)
+
+        client = SdmClient(fresh_credentials, credentials_path=credentials_path)
+        with pytest.raises(StructuredError) as exc_info:
+            client.execute_command(device, "sdm.devices.commands.X.Y", {})
+        assert exc_info.value.code == EXIT_NOT_FOUND
+
+    @responses.activate
+    def test_5xx_raises_exit_3(
+        self,
+        fresh_credentials: CamCredentials,
+        credentials_path: Path,
+        patch_refresh: list[CamCredentials],
+    ) -> None:
+        device = "enterprises/proj/devices/d1"
+        url = f"{SDM_API_ROOT}/{device}:executeCommand"
+        responses.add(responses.POST, url, json={"error": "internal"}, status=503)
+
+        client = SdmClient(fresh_credentials, credentials_path=credentials_path)
+        with pytest.raises(StructuredError) as exc_info:
+            client.execute_command(device, "sdm.devices.commands.X.Y", {})
+        assert exc_info.value.code == EXIT_NETWORK_ERROR
+
+    @responses.activate
+    def test_other_4xx_raises_exit_1(
+        self,
+        fresh_credentials: CamCredentials,
+        credentials_path: Path,
+        patch_refresh: list[CamCredentials],
+    ) -> None:
+        device = "enterprises/proj/devices/d1"
+        url = f"{SDM_API_ROOT}/{device}:executeCommand"
+        responses.add(responses.POST, url, json={"error": "bad request"}, status=400)
+
+        client = SdmClient(fresh_credentials, credentials_path=credentials_path)
+        with pytest.raises(StructuredError) as exc_info:
+            client.execute_command(device, "sdm.devices.commands.X.Y", {})
+        assert exc_info.value.code == EXIT_DEVICE_ERROR
+
+    @responses.activate
+    def test_connection_error_raises_exit_3(
+        self,
+        fresh_credentials: CamCredentials,
+        credentials_path: Path,
+        patch_refresh: list[CamCredentials],
+    ) -> None:
+        # No response registered → ConnectionError → exit 3.
+        client = SdmClient(fresh_credentials, credentials_path=credentials_path)
+        with pytest.raises(StructuredError) as exc_info:
+            client.execute_command(
+                "enterprises/proj/devices/d1",
+                "sdm.devices.commands.X.Y",
+                {},
+            )
         assert exc_info.value.code == EXIT_NETWORK_ERROR
