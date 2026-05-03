@@ -1,24 +1,45 @@
-"""Shared fixtures for the wifi-side test modules.
+"""Shared fixtures for the wifi-side test modules (Phase B, 2026-05-03).
 
-The FoyerClient lazy-imports ``googlewifi`` inside ``__init__``. Tests
-inject a fake ``GoogleWifi`` class via ``sys.modules`` BEFORE the
-FoyerClient is constructed; that fake reads the on-disk fixture
-corpus under ``tests/fixtures/foyer/samples/`` and emits the same
-shape the real upstream library would.
+The Phase B FoyerClient talks to Foyer via gpsoauth + gRPC instead of
+``googlewifi``. Tests mock the ``_fetch_systems`` method on
+``FoyerClient`` directly — that's the single seam between credential-mint
++ transport and the legacy googlewifi-shaped dict the model classmethods
+consume. By patching at that seam we avoid having to fake gpsoauth and
+the gRPC stack on every test.
 
-This conftest does NOT touch the real ``googlewifi`` or
-``glocaltokens`` packages — the tests run in any environment, including
-ones where the optional ``[wifi]`` extra is uninstalled.
+Fixtures:
+
+- ``fake_foyer_client``     — patches ``FoyerClient.__init__`` to skip the
+                              optional-extra import check + makes
+                              ``_fetch_systems`` return the existing
+                              ``tests/fixtures/foyer/samples/groups.json``
+                              corpus. Tests construct
+                              ``FoyerClient(_make_v2_creds())`` normally.
+- ``empty_foyer_client``    — same patching but ``_fetch_systems`` returns
+                              ``{}`` (account with no mesh groups).
+- ``missing_extras``        — forces the optional-extra import to raise
+                              ``ImportError`` so we can test the exit-5
+                              missing-extra path.
+- ``rotated_foyer_client``  — ``_fetch_systems`` returns a list (wrong
+                              shape, simulating SRD §3.2.3 rotation).
+- ``network_error_foyer_client`` — ``_fetch_systems`` raises
+                              ConnectionError (network failure path).
 """
 
 from __future__ import annotations
 
+import builtins
 import json
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import pytest
+
+from nest_cli.auth.wifi_types import WifiCredentials
+from nest_cli.wifi import client as wifi_client_mod
+from nest_cli.wifi.client import FoyerClient
 
 _FIXTURES_DIR = Path(__file__).parent.parent / "fixtures" / "foyer" / "samples"
 
@@ -28,198 +49,172 @@ def _load_fixture(name: str) -> Any:
     return json.loads((_FIXTURES_DIR / name).read_text(encoding="utf-8"))
 
 
-class _FakeGoogleWifi:
-    """Async test double for ``googlewifi.GoogleWifi``.
+def _make_v2_creds(
+    *,
+    google_account_email: str = "operator@example.com",
+    master_token: str = "aas_et/dummy-master-token",  # noqa: S107 - fixture
+    android_id: str = "0123456789abcdef",
+) -> WifiCredentials:
+    """Construct a v2 WifiCredentials suitable for FoyerClient(creds)."""
+    return WifiCredentials(
+        version=2,
+        type="foyer",
+        google_account_email=google_account_email,
+        master_token=master_token,
+        android_id=android_id,
+        issued_at=datetime(2026, 5, 3, 12, 0, 0, tzinfo=UTC),
+    )
 
-    Mirrors the surface ``FoyerClient`` actually calls. The fake reads
-    the fixture corpus on construction and replays it on demand. The
-    ``refresh_token`` constructor arg is accepted but unused.
 
-    Phase 3A surface: ``get_systems`` + ``close``.
-    Phase 3B surface (action verbs): ``connect``, ``pause_device``,
-    ``prioritize_device``. Each action method records its call args
-    on ``self.calls`` for spy-style assertion in tests.
-    Phase 3.1 surface: ``run_speed_test``, ``speed_test_results``,
-    ``restart_ap``, ``restart_system``. Same call-recording protocol.
+def _patch_skip_extras_check(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Patch FoyerClient.__init__ to skip the optional-extra import probe.
+
+    The real ``__init__`` lazy-imports gpsoauth + grpc + ghome_foyer_api so
+    a cam-only install gets a clean exit-5. Tests usually have those
+    installed (they're in dev-deps via uv), but the import probe also
+    creates an unnecessary side-effect for unit tests that never actually
+    talk to gRPC. We replace the probe with a no-op, then store the same
+    state the original __init__ does.
     """
 
-    # Class-level call recorder so tests can assert against the LAST
-    # constructed instance even though each FoyerClient method spins
-    # up a fresh GoogleWifi internally. Tests reset this in fixtures.
-    last_instance: _FakeGoogleWifi | None = None
+    def _init(
+        self: FoyerClient,
+        creds: WifiCredentials,
+    ) -> None:
+        self._creds = creds
+        self._access_token = None
+        self._access_token_expiry = 0.0
 
-    def __init__(self, refresh_token: str | None = None, **_: Any) -> None:
-        self.refresh_token = refresh_token
-        self._systems = _load_fixture("groups.json")
-        self.calls: list[tuple[str, tuple[Any, ...], dict[str, Any]]] = []
-        type(self).last_instance = self
-
-    async def get_systems(self) -> dict[str, Any]:
-        return self._systems
-
-    async def close(self) -> None:
-        return None
-
-    # ------------------------------------------------------------------
-    # Phase 3B action surface (FR-WIFI-4..7)
-    # ------------------------------------------------------------------
-
-    async def connect(self) -> bool:
-        """Real upstream gates every action method behind ``connect()``.
-
-        Returns True so the action method's body executes during tests.
-        """
-        return True
-
-    async def pause_device(self, system_id: str, device_id: str, pause_state: bool) -> bool:
-        """Spy that records the call and returns success.
-
-        Records ``("pause_device", (system_id, device_id, pause_state), {})``
-        on ``self.calls`` so tests can assert the FoyerClient passed the
-        right args. Returns True (mirrors upstream's "operationState ==
-        CREATED" success path).
-        """
-        self.calls.append(("pause_device", (system_id, device_id, pause_state), {}))
-        return True
-
-    async def prioritize_device(
-        self, system_id: str, device_id: str, duration_hours: int = 1
-    ) -> bool:
-        """Spy that records the call and returns success."""
-        self.calls.append(
-            (
-                "prioritize_device",
-                (system_id, device_id, duration_hours),
-                {},
-            )
-        )
-        return True
-
-    # ------------------------------------------------------------------
-    # Phase 3.1 surface (FR-WIFI-8..15)
-    # ------------------------------------------------------------------
-
-    async def run_speed_test(self, system_id: str) -> dict[str, Any]:
-        """Spy that records and returns one canned speed test result.
-
-        The returned shape matches what upstream's ``run_speed_test``
-        emits — one dict from ``speed_test_results`` (the upstream
-        method polls then returns ``results[0]``). Override on a
-        subclass to test timeout / error paths.
-        """
-        self.calls.append(("run_speed_test", (system_id,), {}))
-        return {
-            "downloadSpeedBps": 950_000_000,
-            "uploadSpeedBps": 110_000_000,
-            "pingMs": 8.5,
-            "timestamp": "2026-05-02T18:00:00Z",
-            "apId": _master_ap_for(self._systems, system_id),
-        }
-
-    async def speed_test_results(self, system_id: str) -> list[dict[str, Any]]:
-        """Spy that records and returns up to 30 canned history entries.
-
-        Returns a small descending-by-ts series so list-mode tests can
-        verify ordering. Override to control limit on a per-test basis.
-        """
-        self.calls.append(("speed_test_results", (system_id,), {}))
-        return [
-            {
-                "downloadSpeedBps": 900_000_000,
-                "uploadSpeedBps": 100_000_000,
-                "pingMs": 9.0,
-                "timestamp": "2026-05-02T18:00:00Z",
-                "apId": _master_ap_for(self._systems, system_id),
-            },
-            {
-                "downloadSpeedBps": 850_000_000,
-                "uploadSpeedBps": 95_000_000,
-                "pingMs": 12.0,
-                "timestamp": "2026-05-02T12:00:00Z",
-                "apId": _master_ap_for(self._systems, system_id),
-            },
-            {
-                "downloadSpeedBps": 920_000_000,
-                "uploadSpeedBps": 105_000_000,
-                "pingMs": 7.5,
-                "timestamp": "2026-05-02T06:00:00Z",
-                "apId": _master_ap_for(self._systems, system_id),
-            },
-        ]
-
-    async def restart_ap(self, ap_id: str) -> bool:
-        """Spy that records a restart_ap call. Returns True (success)."""
-        self.calls.append(("restart_ap", (ap_id,), {}))
-        return True
-
-    async def restart_system(self, system_id: str) -> bool:
-        """Spy that records a restart_system call. Returns True."""
-        self.calls.append(("restart_system", (system_id,), {}))
-        return True
-
-
-def _master_ap_for(systems: dict[str, Any], system_id: str) -> str:
-    """Return the master AP id for a given system (helper for fakes)."""
-    record = systems.get(system_id) or {}
-    aps = record.get("access_points") or {}
-    if isinstance(aps, dict):
-        for ap_id, ap in aps.items():
-            if isinstance(ap, dict) and ap.get("isMaster"):
-                return ap_id
-        if aps:
-            return next(iter(aps))
-    return system_id
+    monkeypatch.setattr(FoyerClient, "__init__", _init)
 
 
 @pytest.fixture
-def fake_googlewifi(monkeypatch: pytest.MonkeyPatch) -> type[_FakeGoogleWifi]:
-    """Inject ``_FakeGoogleWifi`` as ``googlewifi.GoogleWifi``.
+def make_v2_creds() -> Any:
+    """Expose the ``_make_v2_creds`` factory to tests as a fixture."""
+    return _make_v2_creds
 
-    Replaces ``sys.modules['googlewifi']`` with a module shim whose
-    ``GoogleWifi`` attribute is the fake. Any prior real-package import
-    is shadowed for the duration of the test (monkeypatch reverses on
-    teardown). ``FoyerClient.__init__`` performs ``from googlewifi
-    import GoogleWifi``, so the lazy-import path picks up our fake.
+
+@pytest.fixture
+def fake_foyer_client(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make ``FoyerClient._fetch_systems`` return the test corpus.
+
+    Tests construct ``FoyerClient(_make_v2_creds())`` then call read
+    methods (``list_groups``, ``list_points``, etc.). Those methods route
+    through ``_fetch_systems``, which now returns the same fixture dict
+    the old fake produced. The legacy classmethods consume it unchanged.
     """
-    fake_module = type(sys)("googlewifi")
-    fake_module.GoogleWifi = _FakeGoogleWifi  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, "googlewifi", fake_module)
-    return _FakeGoogleWifi
+    _patch_skip_extras_check(monkeypatch)
+    systems = _load_fixture("groups.json")
+
+    def _fetch(self: FoyerClient) -> dict[str, dict[str, Any]]:
+        return systems
+
+    monkeypatch.setattr(FoyerClient, "_fetch_systems", _fetch)
 
 
 @pytest.fixture
-def empty_googlewifi(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Inject a fake ``googlewifi`` whose ``get_systems`` returns ``{}``."""
+def empty_foyer_client(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``_fetch_systems`` returns an empty dict (no mesh groups)."""
+    _patch_skip_extras_check(monkeypatch)
 
-    class _EmptyGoogleWifi(_FakeGoogleWifi):
-        async def get_systems(self) -> dict[str, Any]:
-            return {}
+    def _fetch(self: FoyerClient) -> dict[str, dict[str, Any]]:
+        return {}
 
-    fake_module = type(sys)("googlewifi")
-    fake_module.GoogleWifi = _EmptyGoogleWifi  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, "googlewifi", fake_module)
+    monkeypatch.setattr(FoyerClient, "_fetch_systems", _fetch)
 
 
 @pytest.fixture
-def missing_googlewifi(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Force ``import googlewifi`` to raise ``ImportError``.
+def rotated_foyer_client(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``_fetch_systems`` returns a list (wrong shape — SRD §3.2.3)."""
+    _patch_skip_extras_check(monkeypatch)
+
+    def _fetch(self: FoyerClient) -> Any:
+        # Simulate upstream-shape rotation; FoyerClient.list_groups
+        # iterates `.items()` which fails on a list and surfaces as
+        # exit 1.
+        return ["this", "is", "the", "wrong", "shape"]
+
+    monkeypatch.setattr(FoyerClient, "_fetch_systems", _fetch)
+
+
+@pytest.fixture
+def network_error_foyer_client(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``_fetch_systems`` raises ConnectionError (network failure)."""
+    _patch_skip_extras_check(monkeypatch)
+
+    def _fetch(self: FoyerClient) -> Any:
+        raise ConnectionError("DNS resolution failed")
+
+    monkeypatch.setattr(FoyerClient, "_fetch_systems", _fetch)
+
+
+@pytest.fixture
+def missing_extras(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Force ``import gpsoauth`` (or grpc, ghome_foyer_api) to raise.
 
     Used to verify the ``FoyerClient.__init__`` exit-5 path when the
-    operator's install lacks the ``[wifi]`` extra. We replace
-    ``builtins.__import__`` because ``sys.modules['googlewifi'] = None``
-    is not enough — Python's import machinery raises ``ModuleNotFoundError``
-    on a None-valued module entry only on the FIRST import attempt; a
-    cached "module under construction" sentinel can still be reused.
-    Replacing the import hook is the unambiguous path.
+    operator's install lacks the ``[wifi]`` extra. Replaces
+    ``builtins.__import__`` because the lazy-import path inside
+    ``__init__`` runs at construction time and we want the very next
+    ``FoyerClient(creds)`` call to fail.
     """
-    import builtins
-
-    monkeypatch.delitem(sys.modules, "googlewifi", raising=False)
+    monkeypatch.delitem(sys.modules, "gpsoauth", raising=False)
+    monkeypatch.delitem(sys.modules, "grpc", raising=False)
+    monkeypatch.delitem(sys.modules, "ghome_foyer_api", raising=False)
     real_import = builtins.__import__
 
     def fake_import(name: str, *args: Any, **kwargs: Any) -> Any:
-        if name == "googlewifi" or name.startswith("googlewifi."):
-            raise ImportError("No module named 'googlewifi'")
+        if name in ("gpsoauth", "grpc") or name.startswith("ghome_foyer_api"):
+            raise ImportError(f"No module named {name!r}")
         return real_import(name, *args, **kwargs)
 
     monkeypatch.setattr(builtins, "__import__", fake_import)
+
+
+# ---------------------------------------------------------------------------
+# Backward-compat fixture aliases — older tests reference these names but
+# the Phase B replacement is functionally equivalent. Aliasing keeps the
+# action-verb test suites running without per-file rewrites of fixture
+# parameter names.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def fake_googlewifi(fake_foyer_client: None) -> None:
+    """Phase B compat alias for ``fake_foyer_client``.
+
+    The action-verb test suites still reference ``fake_googlewifi`` as a
+    fixture parameter; the new client makes the fixture a no-op for those
+    suites (the action verbs raise exit-5 before ever hitting the fetch
+    path) but keeping the fixture name avoids per-test signature churn.
+    """
+    return None
+
+
+@pytest.fixture
+def empty_googlewifi(empty_foyer_client: None) -> None:
+    """Phase B compat alias for ``empty_foyer_client``."""
+    return None
+
+
+@pytest.fixture
+def missing_googlewifi(missing_extras: None) -> None:
+    """Phase B compat alias for ``missing_extras``."""
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Helpers used by tests that need to access ``wifi_client_mod`` constants
+# (e.g. action verb tests asserting on the ``_PHASE_C_HINT`` text).
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def phase_c_hint_substring() -> str:
+    """Return a stable substring of the Phase-B unsupported-feature hint.
+
+    Lets action-verb tests assert that the exit-5 hint text references the
+    Phase-C deferral without being brittle to wording tweaks.
+    """
+    # Pull from the live module so a future rewording auto-propagates.
+    return "Phase B" if "Phase B" in wifi_client_mod._PHASE_C_HINT else "deferred"

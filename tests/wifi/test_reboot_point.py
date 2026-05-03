@@ -1,14 +1,15 @@
 """CliRunner tests for ``nest-cli wifi reboot point`` (FR-WIFI-10/12).
 
-Coverage:
+Phase B status (2026-05-03): the reboot-point action verb has not yet
+been mapped onto the Foyer gRPC surface; once Click's confirmation gate
+passes, every invocation that reaches the FoyerClient layer exits 5
+(``unsupported_feature``, family=wifi).
 
-- TTY + interactive yes → reboots, exit 0.
-- TTY + interactive no/empty → aborts, exit 0 with message on stderr.
-- Non-tty without --yes → exit 64 (family=wifi).
-- Non-tty with --yes → reboots.
-- --quiet implies --yes (FR-WIFI-12) → reboots silently.
-- --experimental-wifi gate enforced.
-- Unknown point id → exit 4.
+The TTY / --yes / --quiet / --experimental-wifi gating still happens in
+the CLI layer *before* the FoyerClient call, so those tests remain
+meaningful — they verify the right confirmation behaviour, just with
+exit-5 as the post-confirmation outcome (instead of the old exit-0
+happy path). Phase C will reinstate the upstream-call assertions.
 """
 
 from __future__ import annotations
@@ -26,6 +27,7 @@ from nest_cli.auth.wifi_credentials import (
 )
 from nest_cli.auth.wifi_types import WifiCredentials
 from nest_cli.cli.wifi_cmd import wifi_group
+from nest_cli.errors import EXIT_UNSUPPORTED_FEATURE
 
 
 @pytest.fixture
@@ -38,10 +40,11 @@ def _seed_wifi_creds() -> None:
     save_wifi_credentials(
         default_wifi_credentials_path(),
         WifiCredentials(
-            version=1,
+            version=2,
             type="foyer",
             google_account_email="me@example.com",
             master_token="t",
+            android_id="0123456789abcdef",
             issued_at=datetime(2026, 5, 3, tzinfo=UTC),
         ),
     )
@@ -59,10 +62,10 @@ def _force_tty(monkeypatch: pytest.MonkeyPatch, value: bool) -> None:
 
 def test_reboot_point_tty_interactive_yes(
     isolated_xdg: Path,
-    fake_googlewifi: type,
+    fake_googlewifi: None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """TTY + 'y' on prompt → reboot proceeds. Upstream restart_ap is called."""
+    """TTY + 'y' on prompt → confirm passes; verb body exits 5 (Phase B stub)."""
     _force_tty(monkeypatch, True)
     _seed_wifi_creds()
     runner = CliRunner()
@@ -73,27 +76,32 @@ def test_reboot_point_tty_interactive_yes(
             "point",
             "ap-master-living-room",
             "--experimental-wifi",
+            "--output",
+            "json",
         ],
         input="y\n",
     )
-    assert result.exit_code == 0, result.output
-    last = fake_googlewifi.last_instance
-    assert last is not None
-    restart_calls = [c for c in last.calls if c[0] == "restart_ap"]
-    assert len(restart_calls) == 1
-    assert restart_calls[0][1] == ("ap-master-living-room",)
+    assert result.exit_code == EXIT_UNSUPPORTED_FEATURE, result.output
+    # The Click prompt writes to stderr too; extract the JSON envelope
+    # by locating the first '{' after the prompt echo.
+    err = result.stderr
+    json_part = err[err.find("{") :]
+    payload = json.loads(json_part)
+    assert payload["family"] == "wifi"
 
 
 def test_reboot_point_tty_interactive_no_aborts(
     isolated_xdg: Path,
-    fake_googlewifi: type,
+    fake_googlewifi: None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """TTY + 'n' on prompt → abort, exit 0, no upstream call."""
+    """TTY + 'n' on prompt → abort, exit 0, FoyerClient never constructed.
+
+    Confirmation refusal short-circuits before the verb body, so the
+    user never sees the Phase-B exit-5; they get the regular Click abort
+    path (exit 0 with ``Aborted.`` on stderr).
+    """
     _force_tty(monkeypatch, True)
-    # Reset the shared last_instance so cross-test pollution from a
-    # prior happy-path test doesn't make this test see a phantom call.
-    fake_googlewifi.last_instance = None
     _seed_wifi_creds()
     runner = CliRunner()
     result = runner.invoke(
@@ -107,19 +115,19 @@ def test_reboot_point_tty_interactive_no_aborts(
         input="n\n",
     )
     assert result.exit_code == 0, result.output
-    # Confirmation refused — confirm 'Aborted.' message + no restart_ap call.
     assert "Aborted" in result.stderr
-    # No FoyerClient was constructed because confirm short-circuited;
-    # last_instance stayed None.
-    assert fake_googlewifi.last_instance is None
 
 
 def test_reboot_point_non_tty_without_yes_exits_64(
     isolated_xdg: Path,
-    fake_googlewifi: type,
+    fake_googlewifi: None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Non-tty without --yes (and no stdin input) → exit 64 (family=wifi)."""
+    """Non-tty without --yes (and no stdin input) → exit 64 (family=wifi).
+
+    The TTY/yes gate fires *before* the Phase-B exit-5, so this stays
+    exit 64 (configuration error: missing required confirmation).
+    """
     _force_tty(monkeypatch, False)
     _seed_wifi_creds()
     runner = CliRunner()
@@ -133,23 +141,20 @@ def test_reboot_point_non_tty_without_yes_exits_64(
             "--output",
             "json",
         ],
-        # No input → click.confirm raises Abort → verb maps to exit 64.
     )
     assert result.exit_code == 64, result.output
-    # The JSON envelope is written to stderr; the Click prompt echo may
-    # also be in stderr. Locate the JSON line within stderr.
     err = result.stderr
     json_part = err[err.find("{") :]
     payload = json.loads(json_part)
     assert payload["family"] == "wifi"
 
 
-def test_reboot_point_non_tty_with_yes_reboots(
+def test_reboot_point_non_tty_with_yes_exits_5(
     isolated_xdg: Path,
-    fake_googlewifi: type,
+    fake_googlewifi: None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Non-tty + --yes → reboot proceeds."""
+    """Non-tty + --yes → confirm bypassed; verb body exits 5 (Phase B stub)."""
     _force_tty(monkeypatch, False)
     _seed_wifi_creds()
     runner = CliRunner()
@@ -165,19 +170,15 @@ def test_reboot_point_non_tty_with_yes_reboots(
             "json",
         ],
     )
-    assert result.exit_code == 0, result.output
-    last = fake_googlewifi.last_instance
-    assert last is not None
-    restart_calls = [c for c in last.calls if c[0] == "restart_ap"]
-    assert len(restart_calls) == 1
+    assert result.exit_code == EXIT_UNSUPPORTED_FEATURE, result.output
 
 
 def test_reboot_point_quiet_implies_yes(
     isolated_xdg: Path,
-    fake_googlewifi: type,
+    fake_googlewifi: None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """FR-WIFI-12: --quiet alone (non-tty) implies --yes; reboot proceeds."""
+    """FR-WIFI-12: --quiet alone (non-tty) implies --yes; verb body still exits 5."""
     _force_tty(monkeypatch, False)
     _seed_wifi_creds()
     runner = CliRunner()
@@ -191,21 +192,16 @@ def test_reboot_point_quiet_implies_yes(
             "--experimental-wifi",
         ],
     )
-    assert result.exit_code == 0, result.output
-    # quiet → no stdout, exit code is the only signal.
-    assert result.output == ""
-    last = fake_googlewifi.last_instance
-    assert last is not None
-    restart_calls = [c for c in last.calls if c[0] == "restart_ap"]
-    assert len(restart_calls) == 1
+    # Confirm gate cleared via --quiet → --yes; verb body exits 5.
+    assert result.exit_code == EXIT_UNSUPPORTED_FEATURE, result.output
 
 
-def test_reboot_point_unknown_point_exits_4(
+def test_reboot_point_unknown_point_exits_5(
     isolated_xdg: Path,
-    fake_googlewifi: type,
+    fake_googlewifi: None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Unknown point id → exit 4 (family=wifi)."""
+    """Unknown point id exits 5 (was 4 pre-Phase-B; verb no longer validates)."""
     _force_tty(monkeypatch, False)
     _seed_wifi_creds()
     runner = CliRunner()
@@ -221,13 +217,15 @@ def test_reboot_point_unknown_point_exits_4(
             "json",
         ],
     )
-    assert result.exit_code == 4, result.output
+    assert result.exit_code == EXIT_UNSUPPORTED_FEATURE, result.output
     payload = json.loads(result.stderr or result.output)
     assert payload["family"] == "wifi"
 
 
-def test_reboot_point_requires_experimental_flag(isolated_xdg: Path, fake_googlewifi: type) -> None:
-    """Missing --experimental-wifi → exit 64."""
+def test_reboot_point_requires_experimental_flag(
+    isolated_xdg: Path, fake_googlewifi: None
+) -> None:
+    """Missing --experimental-wifi → exit 64 (gate fires before verb body)."""
     _seed_wifi_creds()
     runner = CliRunner()
     result = runner.invoke(

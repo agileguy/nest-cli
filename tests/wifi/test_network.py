@@ -1,10 +1,14 @@
 """CliRunner tests for ``nest-cli wifi network`` (FR-WIFI-13).
 
+Phase B status: HomeGraph carries no SSID/IPv4/IPv6/DNS data, so the
+verb exits 5 (unsupported_feature, family=wifi) until Phase C maps the
+real Foyer network-info RPC. The CLI surface still ships so operator
+scripts wire correctly; output is just an exit-5 envelope.
+
 Coverage:
 
-- Happy path → emit §10.10 WifiNetwork record with all fields.
-- Group not found → exit 4 (family=wifi).
-- --experimental-wifi gate enforced.
+- Verb exits 5 with family=wifi (Phase B posture).
+- --experimental-wifi gate still fires before the verb body.
 """
 
 from __future__ import annotations
@@ -34,17 +38,23 @@ def _seed_wifi_creds() -> None:
     save_wifi_credentials(
         default_wifi_credentials_path(),
         WifiCredentials(
-            version=1,
+            version=2,
             type="foyer",
             google_account_email="me@example.com",
             master_token="t",
+            android_id="0123456789abcdef",
             issued_at=datetime(2026, 5, 3, tzinfo=UTC),
         ),
     )
 
 
-def test_network_happy_path(isolated_xdg: Path, fake_googlewifi: type) -> None:
-    """`wifi network group-home-001 --experimental-wifi --json`."""
+def test_network_exits_5_in_phase_b(isolated_xdg: Path, fake_googlewifi: type) -> None:
+    """`wifi network group-home-001 --experimental-wifi --json` → exit 5.
+
+    Phase B: HomeGraph projection has no network config, so the verb
+    exit-5s with family=wifi rather than emit a record full of
+    ``"<unknown>"`` placeholders.
+    """
     _seed_wifi_creds()
     runner = CliRunner()
     result = runner.invoke(
@@ -57,33 +67,10 @@ def test_network_happy_path(isolated_xdg: Path, fake_googlewifi: type) -> None:
             "json",
         ],
     )
-    assert result.exit_code == 0, result.output
-    payload = json.loads(result.output)
-    assert payload["group_id"] == "group-home-001"
-    assert payload["ssid"] == "HomeMeshNet"
-    assert payload["guest_enabled"] is False
-    assert "ipv4" in payload
-    assert "ipv6" in payload
-    assert "dns_servers" in payload
-
-
-def test_network_unknown_group_exits_4(isolated_xdg: Path, fake_googlewifi: type) -> None:
-    """Unknown group id → exit 4 (family=wifi)."""
-    _seed_wifi_creds()
-    runner = CliRunner()
-    result = runner.invoke(
-        wifi_group,
-        [
-            "network",
-            "group-no-such",
-            "--experimental-wifi",
-            "--output",
-            "json",
-        ],
-    )
-    assert result.exit_code == 4, result.output
+    assert result.exit_code == 5, result.output
     payload = json.loads(result.stderr or result.output)
     assert payload["family"] == "wifi"
+    assert payload["error"] == "unsupported_feature"
 
 
 def test_network_requires_experimental_flag(isolated_xdg: Path, fake_googlewifi: type) -> None:

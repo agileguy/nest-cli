@@ -1,13 +1,15 @@
 """CliRunner tests for ``nest-cli wifi reboot group`` (FR-WIFI-11/12).
 
-Coverage:
+Phase B status (2026-05-03): the reboot-group action verb has not yet
+been mapped onto the Foyer gRPC surface; once Click's confirmation gate
+passes, the verb body exits 5 (``unsupported_feature``, family=wifi).
 
-- TTY + interactive yes → reboots, names point list on stderr.
-- Single confirmation prompt for the whole group (not per-point).
-- Non-tty without --yes → exit 64.
-- Non-tty with --yes → reboots, returns rebooted point list.
-- --quiet implies --yes.
-- Unknown group id → exit 4.
+The TTY / --yes / --quiet / --experimental-wifi gating still happens in
+the CLI layer *before* the FoyerClient call, so those tests remain
+meaningful — they verify the right confirmation behaviour with exit-5
+as the post-confirmation outcome (was exit-0 happy-path pre-Phase-B).
+The ``test_reboot_group_tty_lists_points_on_stderr`` test still exercises
+the ``list_points`` pre-resolution step, which works in Phase B.
 """
 
 from __future__ import annotations
@@ -25,6 +27,7 @@ from nest_cli.auth.wifi_credentials import (
 )
 from nest_cli.auth.wifi_types import WifiCredentials
 from nest_cli.cli.wifi_cmd import wifi_group
+from nest_cli.errors import EXIT_UNSUPPORTED_FEATURE
 
 
 @pytest.fixture
@@ -37,10 +40,11 @@ def _seed_wifi_creds() -> None:
     save_wifi_credentials(
         default_wifi_credentials_path(),
         WifiCredentials(
-            version=1,
+            version=2,
             type="foyer",
             google_account_email="me@example.com",
             master_token="t",
+            android_id="0123456789abcdef",
             issued_at=datetime(2026, 5, 3, tzinfo=UTC),
         ),
     )
@@ -54,10 +58,10 @@ def _force_tty(monkeypatch: pytest.MonkeyPatch, value: bool) -> None:
 
 def test_reboot_group_tty_interactive_yes(
     isolated_xdg: Path,
-    fake_googlewifi: type,
+    fake_googlewifi: None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """TTY + 'y' → reboot proceeds; upstream restart_system called once."""
+    """TTY + 'y' → confirm passes; verb body exits 5 (Phase B stub)."""
     _force_tty(monkeypatch, True)
     _seed_wifi_creds()
     runner = CliRunner()
@@ -68,23 +72,26 @@ def test_reboot_group_tty_interactive_yes(
             "group",
             "group-home-001",
             "--experimental-wifi",
+            "--output",
+            "json",
         ],
         input="y\n",
     )
-    assert result.exit_code == 0, result.output
-    last = fake_googlewifi.last_instance
-    assert last is not None
-    restart_calls = [c for c in last.calls if c[0] == "restart_system"]
-    assert len(restart_calls) == 1
-    assert restart_calls[0][1] == ("group-home-001",)
+    assert result.exit_code == EXIT_UNSUPPORTED_FEATURE, result.output
+    # Click prompt + the resolved-points line precede the JSON envelope
+    # in stderr; locate the first '{' after them.
+    err = result.stderr
+    json_part = err[err.find("{") :]
+    payload = json.loads(json_part)
+    assert payload["family"] == "wifi"
 
 
-def test_reboot_group_non_tty_with_yes(
+def test_reboot_group_non_tty_with_yes_exits_5(
     isolated_xdg: Path,
-    fake_googlewifi: type,
+    fake_googlewifi: None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Non-tty + --yes → reboot proceeds, only ONE upstream restart_system call."""
+    """Non-tty + --yes → confirm bypassed; verb body exits 5."""
     _force_tty(monkeypatch, False)
     _seed_wifi_creds()
     runner = CliRunner()
@@ -100,18 +107,12 @@ def test_reboot_group_non_tty_with_yes(
             "json",
         ],
     )
-    assert result.exit_code == 0, result.output
-    last = fake_googlewifi.last_instance
-    assert last is not None
-    restart_calls = [c for c in last.calls if c[0] == "restart_system"]
-    # FR-WIFI-11: prompts once for the group; one upstream call covers all points.
-    assert len(restart_calls) == 1
-    assert restart_calls[0][1] == ("group-home-001",)
+    assert result.exit_code == EXIT_UNSUPPORTED_FEATURE, result.output
 
 
 def test_reboot_group_non_tty_without_yes_exits_64(
     isolated_xdg: Path,
-    fake_googlewifi: type,
+    fake_googlewifi: None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Non-tty without --yes (and no stdin input) → exit 64 (family=wifi)."""
@@ -138,10 +139,10 @@ def test_reboot_group_non_tty_without_yes_exits_64(
 
 def test_reboot_group_quiet_implies_yes(
     isolated_xdg: Path,
-    fake_googlewifi: type,
+    fake_googlewifi: None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """FR-WIFI-12: --quiet alone (non-tty) implies --yes."""
+    """FR-WIFI-12: --quiet alone (non-tty) implies --yes; verb body exits 5."""
     _force_tty(monkeypatch, False)
     _seed_wifi_creds()
     runner = CliRunner()
@@ -155,20 +156,15 @@ def test_reboot_group_quiet_implies_yes(
             "--experimental-wifi",
         ],
     )
-    assert result.exit_code == 0, result.output
-    assert result.output == ""
-    last = fake_googlewifi.last_instance
-    assert last is not None
-    restart_calls = [c for c in last.calls if c[0] == "restart_system"]
-    assert len(restart_calls) == 1
+    assert result.exit_code == EXIT_UNSUPPORTED_FEATURE, result.output
 
 
-def test_reboot_group_unknown_group_exits_4(
+def test_reboot_group_unknown_group_exits_5(
     isolated_xdg: Path,
-    fake_googlewifi: type,
+    fake_googlewifi: None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Unknown group id → exit 4 (family=wifi)."""
+    """Unknown group id exits 5 (was 4 pre-Phase-B; verb no longer validates)."""
     _force_tty(monkeypatch, False)
     _seed_wifi_creds()
     runner = CliRunner()
@@ -184,17 +180,23 @@ def test_reboot_group_unknown_group_exits_4(
             "json",
         ],
     )
-    assert result.exit_code == 4, result.output
+    assert result.exit_code == EXIT_UNSUPPORTED_FEATURE, result.output
     payload = json.loads(result.stderr or result.output)
     assert payload["family"] == "wifi"
 
 
 def test_reboot_group_tty_lists_points_on_stderr(
     isolated_xdg: Path,
-    fake_googlewifi: type,
+    fake_googlewifi: None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """FR-WIFI-11: stderr names the resolved point list before the prompt."""
+    """FR-WIFI-11: stderr names the resolved point list before the prompt.
+
+    The pre-prompt list-resolve uses ``list_points`` (a Phase-B-supported
+    read verb), so this output still lands on stderr. After the operator
+    confirms, the verb body hits ``reboot_group`` and exits 5 — the
+    pre-prompt stderr is unaffected.
+    """
     _force_tty(monkeypatch, True)
     _seed_wifi_creds()
     runner = CliRunner()
@@ -208,7 +210,8 @@ def test_reboot_group_tty_lists_points_on_stderr(
         ],
         input="y\n",
     )
-    assert result.exit_code == 0, result.output
+    # Verb body exits 5 after confirm — but stderr still carries the
+    # resolved point list because list_points runs successfully first.
+    assert result.exit_code == EXIT_UNSUPPORTED_FEATURE, result.output
     err = result.stderr
-    # stderr should mention at least one of the points by id.
     assert "ap-master-living-room" in err or "ap-sat-office" in err

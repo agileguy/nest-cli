@@ -12,7 +12,6 @@ Coverage:
 from __future__ import annotations
 
 import json
-import sys
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -26,6 +25,7 @@ from nest_cli.auth.wifi_credentials import (
 )
 from nest_cli.auth.wifi_types import WifiCredentials
 from nest_cli.cli.wifi_cmd import wifi_group
+from nest_cli.wifi.client import FoyerClient
 
 
 @pytest.fixture
@@ -38,10 +38,11 @@ def _seed_wifi_creds() -> None:
     save_wifi_credentials(
         default_wifi_credentials_path(),
         WifiCredentials(
-            version=1,
+            version=2,
             type="foyer",
             google_account_email="me@example.com",
             master_token="t",
+            android_id="0123456789abcdef",
             issued_at=datetime(2026, 5, 3, tzinfo=UTC),
         ),
     )
@@ -111,41 +112,44 @@ def test_point_health_unknown_point_exits_4(isolated_xdg: Path, fake_googlewifi:
 
 
 def test_point_health_offline_point(isolated_xdg: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Offline point fixture → online=false, uptime_s=0."""
+    """Offline point fixture → online=false, uptime_s=0.
 
-    class _OfflineGW:
-        last_instance: _OfflineGW | None = None
+    Injects a single offline AP via a one-off ``_fetch_systems`` patch.
+    The conftest fixtures don't expose an offline shape (they use the
+    full happy-path corpus), so we inline the patch here. We also short-
+    circuit the optional-extra import probe in ``__init__`` so the test
+    runs without needing gpsoauth/grpc on the import path.
+    """
 
-        def __init__(self, refresh_token: str | None = None, **_: Any) -> None:
-            type(self).last_instance = self
+    def _init(
+        self: FoyerClient,
+        creds: Any,
+    ) -> None:
+        self._creds = creds
+        self._access_token = None
+        self._access_token_expiry = 0.0
 
-        async def connect(self) -> bool:
-            return True
+    monkeypatch.setattr(FoyerClient, "__init__", _init)
 
-        async def get_systems(self) -> dict[str, Any]:
-            return {
-                "group-home-001": {
-                    "id": "group-home-001",
-                    "access_points": {
-                        "ap-offline": {
-                            "id": "ap-offline",
-                            "isMaster": False,
-                            "displayName": "Offline AP",
-                            "status": {
-                                "apState": "OFFLINE",
-                            },
+    def _fetch(self: FoyerClient) -> dict[str, dict[str, Any]]:
+        return {
+            "group-home-001": {
+                "id": "group-home-001",
+                "access_points": {
+                    "ap-offline": {
+                        "id": "ap-offline",
+                        "isMaster": False,
+                        "displayName": "Offline AP",
+                        "status": {
+                            "apState": "OFFLINE",
                         },
                     },
-                    "devices": {},
-                }
+                },
+                "devices": {},
             }
+        }
 
-        async def close(self) -> None:
-            return None
-
-    fake_module = type(sys)("googlewifi")
-    fake_module.GoogleWifi = _OfflineGW  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, "googlewifi", fake_module)
+    monkeypatch.setattr(FoyerClient, "_fetch_systems", _fetch)
 
     _seed_wifi_creds()
     runner = CliRunner()

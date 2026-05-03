@@ -1416,4 +1416,41 @@ These items are NOT in v1 scope but are tracked here so future SRD revisions can
 
 ---
 
+## §17 Phase B implementation note (2026-05-03 — wifi side)
+
+This section documents how the wifi-side implementation diverged from the v1 SRD plan (§3.2.1, §3.2.2, §15 Decision 7, §15 Decision 23) when the spec collided with empirical reality during Phase 3 hardening.
+
+### What the SRD originally planned
+
+The SRD called for wrapping `googlewifi` (PyPI) for the Foyer mesh control surface and `glocaltokens` (PyPI) for the master-token bootstrap (§3.2.2, §15 Decision 7). Both libraries were to be pinned tight (§15 Decision 23) and gated behind `--experimental-wifi` (§16.4). Phase 3 (v0.3.x) shipped this design.
+
+### What broke
+
+Empirical validation against a live Active T1 + Nest Wifi Pro mesh on 2026-05-03 proved the layered design fundamentally cannot work on AAS-bootstrapped tokens:
+
+1. **Token-type mismatch.** `googlewifi.GoogleWifi.get_access_token()` calls `https://www.googleapis.com/oauth2/v4/token` with `grant_type=refresh_token`, expecting a standard OAuth2 refresh token (`1//09xxx...`). The token operators extract from a paired Android device via the `glocaltokens` / `gpsoauth` bootstrap is an AAS master token (`aas_et/...`). Google's auth backend rejects the AAS token at the `oauth2/v4/token` endpoint with "Authorization Error". The two flows are not interchangeable — `refresh_token` is for OAuth user-consent flows; AAS is for Android device-pair flows. The SRD did not catch this because both tokens are colloquially called "refresh tokens" in community documentation.
+
+2. **`glocaltokens` 0.7.x bug.** `GLocalAuthenticationTokens.get_access_token()` calls `get_master_token()`, which has an early-return `if username is None or password is None` even when `self.master_token` is already populated by the constructor. Workaround: bypass `glocaltokens` entirely and call `gpsoauth.perform_oauth()` directly.
+
+### What Phase B (post-v0.4.0) ships instead
+
+- **Direct `gpsoauth.perform_oauth(email, master_token, android_id, ...)`** to mint a 1-hour Foyer access token (signed against `com.google.android.apps.chromecast.app`).
+- **Direct gRPC** to `googlehomefoyer-pa.googleapis.com:443` via the protobuf stubs from `ghome-foyer-api` (PyPI). `StructuresServiceStub.GetHomeGraph()` returns the inventory the CLI projects onto the existing `WifiGroup` / `WifiPoint` models.
+- **`googlewifi` and `glocaltokens` dropped** from `[wifi]` extras. Replaced with `gpsoauth`, `grpcio`, `googleapis-common-protos`, `ghome-foyer-api`.
+- **`WifiCredentials` schema bumped 1 → 2** with required `android_id` (16-char hex from the rooted Android device's `gservices.db`). v1 files fail load-time validation.
+
+### What the FRs now mean
+
+- **FR-WIFI-1, FR-WIFI-2, FR-WIFI-15** (list groups, list points, point-health) ship implemented in Phase B — the data is derivable from `GetHomeGraph` alone.
+- **FR-WIFI-3, FR-WIFI-4..14** (list clients, action verbs, network info, guest, speedtest, reboot) ship as exit-5 (`unsupported_feature`, `family="wifi"`) stubs in Phase B. The CLI surface is fully wired so operator scripts work; the FoyerClient method body raises a structured error pointing at the Phase-C deferral. Phase C will map each Foyer RPC and replace the stubs.
+- **FR-WIFI-13** (network info) is specifically deferred because `GetHomeGraph` carries no SSID, IPv4/IPv6, DHCP, or DNS data — the verb would have to return placeholder `"<unknown>"` records, which the simplify-pass review flagged as actively misleading.
+
+### Source updates
+
+- §3.2.1 / §3.2.2 / §15 Decision 7 / §15 Decision 23 / §16.4 are accurate as a record of v0.3.x implementation. They are superseded by this §17 for the post-v0.4.0 wifi side.
+- §13.2 wifi optional-extra deps are updated in `pyproject.toml`; the v1 list (`googlewifi`, `glocaltokens`) is replaced by `gpsoauth`, `grpcio`, `googleapis-common-protos`, `ghome-foyer-api`.
+- §11 fixture corpus references (`mock googlewifi`, `mock glocaltokens`) are now `mock _fetch_systems` (the gRPC seam) — see `tests/wifi/conftest.py` Phase B rewrite.
+
+---
+
 **End of document.**

@@ -27,10 +27,11 @@ def _seed_wifi_creds() -> None:
     save_wifi_credentials(
         default_wifi_credentials_path(),
         WifiCredentials(
-            version=1,
+            version=2,
             type="foyer",
             google_account_email="me@example.com",
             master_token="t",
+            android_id="0123456789abcdef",
             issued_at=datetime(2026, 5, 3, tzinfo=UTC),
         ),
     )

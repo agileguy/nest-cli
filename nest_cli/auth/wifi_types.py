@@ -23,9 +23,13 @@ class WifiCredentials(BaseModel):
 
     Field constraints are encoded in the schema so ``model_validate`` is
     the single source of truth for "is this credentials file usable".
-    The ``version`` field is bounded to ``1`` for v0.3.0; if/when a v2
-    layout is introduced, the bound is widened and a migration helper
-    is added.
+
+    Phase B (v2): ``android_id`` is required. The Foyer access-token mint
+    path (``gpsoauth.perform_oauth``) needs a real Android ``android_id``
+    in addition to the master token; we persist it alongside so subsequent
+    invocations don't have to re-prompt. v1 files (no ``android_id``) fail
+    schema validation; the loader maps that to a config-error exit with a
+    hint pointing at ``auth wifi-setup --overwrite``.
 
     ``extra="forbid"`` means unknown keys raise ``ValidationError``,
     which the credentials loader maps to exit 6 (FR-CRED-8).
@@ -33,10 +37,11 @@ class WifiCredentials(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    version: int = Field(..., ge=1, le=1)
+    version: int = Field(..., ge=2, le=2)
     type: str = Field(..., pattern="^foyer$")
     google_account_email: str = Field(..., min_length=3)
     master_token: str = Field(..., min_length=1)
+    android_id: str = Field(..., min_length=16, max_length=16, pattern=r"^[0-9a-f]{16}$")
     issued_at: datetime
 
     @field_serializer("issued_at", when_used="json")

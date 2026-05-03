@@ -1,13 +1,14 @@
 """CliRunner tests for ``nest-cli wifi prioritize`` (FR-WIFI-6).
 
-Coverage:
+Phase B status (2026-05-03): the prioritize action verb has not yet been
+mapped onto the Foyer gRPC surface; every invocation that reaches the
+client layer exits 5 (``unsupported_feature``, family=wifi).
 
-- Happy path with default duration (60 minutes → 1 hour upstream).
-- Explicit ``--duration 120`` (→ 2 hours upstream).
-- Below range (``--duration 0``) → Click usage error.
-- Above range (``--duration 300``) → Click usage error.
-- Unknown client_id → exit 4.
-- Minutes-to-hours conversion uses ceiling division.
+Click-side validation (the IntRange(1, 240) on ``--duration``) still
+runs *before* the verb body, so the below-range / above-range tests
+remain meaningful — they verify Click rejects the input without ever
+reaching the FoyerClient. The minutes→hours rounding tests have been
+removed because the conversion code path no longer fires.
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ from nest_cli.auth.wifi_credentials import (
 )
 from nest_cli.auth.wifi_types import WifiCredentials
 from nest_cli.cli.wifi_cmd import wifi_group
+from nest_cli.errors import EXIT_UNSUPPORTED_FEATURE
 
 
 @pytest.fixture
@@ -37,22 +39,26 @@ def _seed_wifi_creds() -> None:
     save_wifi_credentials(
         default_wifi_credentials_path(),
         WifiCredentials(
-            version=1,
+            version=2,
             type="foyer",
             google_account_email="me@example.com",
             master_token="t",
+            android_id="0123456789abcdef",
             issued_at=datetime(2026, 5, 3, tzinfo=UTC),
         ),
     )
 
 
 # ---------------------------------------------------------------------------
-# Happy path + default duration
+# Phase B exit-5 posture (Click parsed --duration successfully, then verb stub
+# fired). Phase C will reinstate the upstream-arg / rounding tests.
 # ---------------------------------------------------------------------------
 
 
-def test_prioritize_default_duration_60_minutes(isolated_xdg: Path, fake_googlewifi: type) -> None:
-    """No ``--duration`` → default 60 minutes (1 hour upstream)."""
+def test_prioritize_default_duration_exits_5(
+    isolated_xdg: Path, fake_googlewifi: None
+) -> None:
+    """No ``--duration`` → Click defaults 60, then verb exits 5."""
     _seed_wifi_creds()
     runner = CliRunner()
     result = runner.invoke(
@@ -65,27 +71,15 @@ def test_prioritize_default_duration_60_minutes(isolated_xdg: Path, fake_googlew
             "json",
         ],
     )
-    assert result.exit_code == 0, result.output
-    payload = json.loads(result.output)
-    assert payload == {
-        "client_id": "sta-laptop",
-        "action": "prioritize",
-        "duration_minutes": 60,
-        "result": "ok",
-    }
-    last = fake_googlewifi.last_instance
-    assert last is not None
-    prio_calls = [c for c in last.calls if c[0] == "prioritize_device"]
-    assert len(prio_calls) == 1
-    _, args, _ = prio_calls[0]
-    # 60 minutes → 1 hour upstream.
-    assert args == ("group-home-001", "sta-laptop", 1)
+    assert result.exit_code == EXIT_UNSUPPORTED_FEATURE, result.output
+    payload = json.loads(result.stderr or result.output)
+    assert payload["family"] == "wifi"
 
 
-def test_prioritize_explicit_duration_120_minutes(
-    isolated_xdg: Path, fake_googlewifi: type
+def test_prioritize_explicit_duration_exits_5(
+    isolated_xdg: Path, fake_googlewifi: None
 ) -> None:
-    """`--duration 120` → 2 hours upstream."""
+    """`--duration 120` is parsed by Click, then verb exits 5."""
     _seed_wifi_creds()
     runner = CliRunner()
     result = runner.invoke(
@@ -100,21 +94,13 @@ def test_prioritize_explicit_duration_120_minutes(
             "json",
         ],
     )
-    assert result.exit_code == 0, result.output
-    payload = json.loads(result.output)
-    assert payload["duration_minutes"] == 120
-    last = fake_googlewifi.last_instance
-    assert last is not None
-    prio_calls = [c for c in last.calls if c[0] == "prioritize_device"]
-    _, args, _ = prio_calls[0]
-    # 120 minutes → 2 hours upstream.
-    assert args == ("group-home-001", "sta-laptop", 2)
+    assert result.exit_code == EXIT_UNSUPPORTED_FEATURE, result.output
 
 
-def test_prioritize_45_minutes_rounds_up_to_one_hour(
-    isolated_xdg: Path, fake_googlewifi: type
+def test_prioritize_at_max_240_minutes_exits_5(
+    isolated_xdg: Path, fake_googlewifi: None
 ) -> None:
-    """Sub-hour minutes round UP via ceiling division (45min → 1h)."""
+    """`--duration 240` is the inclusive upper bound — Click accepts, verb stubs."""
     _seed_wifi_creds()
     runner = CliRunner()
     result = runner.invoke(
@@ -123,44 +109,16 @@ def test_prioritize_45_minutes_rounds_up_to_one_hour(
             "prioritize",
             "sta-laptop",
             "--duration",
-            "45",
+            "240",
             "--experimental-wifi",
         ],
     )
-    assert result.exit_code == 0, result.output
-    last = fake_googlewifi.last_instance
-    assert last is not None
-    prio_calls = [c for c in last.calls if c[0] == "prioritize_device"]
-    _, args, _ = prio_calls[0]
-    assert args[2] == 1  # 45 minutes → 1 hour
-
-
-def test_prioritize_91_minutes_rounds_up_to_two_hours(
-    isolated_xdg: Path, fake_googlewifi: type
-) -> None:
-    """91 minutes → 2 hours upstream (ceiling division)."""
-    _seed_wifi_creds()
-    runner = CliRunner()
-    result = runner.invoke(
-        wifi_group,
-        [
-            "prioritize",
-            "sta-laptop",
-            "--duration",
-            "91",
-            "--experimental-wifi",
-        ],
-    )
-    assert result.exit_code == 0, result.output
-    last = fake_googlewifi.last_instance
-    assert last is not None
-    prio_calls = [c for c in last.calls if c[0] == "prioritize_device"]
-    _, args, _ = prio_calls[0]
-    assert args[2] == 2
+    assert result.exit_code == EXIT_UNSUPPORTED_FEATURE, result.output
 
 
 # ---------------------------------------------------------------------------
-# Boundary values (FR-WIFI-6: 1..240 minutes)
+# Boundary values (FR-WIFI-6: 1..240 minutes) — Click-side validation fires
+# BEFORE the verb body, so these still produce a Click usage error.
 # ---------------------------------------------------------------------------
 
 
@@ -179,8 +137,10 @@ def test_prioritize_below_range_zero_minutes_rejected(isolated_xdg: Path) -> Non
         ],
     )
     # Click usage error → non-zero exit. Click defaults to exit 2 on
-    # parameter validation.
+    # parameter validation. Critically NOT exit 5 — the verb body never
+    # runs because Click rejected the choice first.
     assert result.exit_code != 0
+    assert result.exit_code != EXIT_UNSUPPORTED_FEATURE
     err = result.stderr or result.output
     assert "0" in err.lower() or "range" in err.lower() or "invalid" in err.lower()
 
@@ -200,39 +160,19 @@ def test_prioritize_above_range_300_minutes_rejected(isolated_xdg: Path) -> None
         ],
     )
     assert result.exit_code != 0
+    assert result.exit_code != EXIT_UNSUPPORTED_FEATURE
     err = result.stderr or result.output
     assert "300" in err or "range" in err.lower() or "invalid" in err.lower()
 
 
-def test_prioritize_at_max_240_minutes_accepted(isolated_xdg: Path, fake_googlewifi: type) -> None:
-    """`--duration 240` is the inclusive upper bound."""
-    _seed_wifi_creds()
-    runner = CliRunner()
-    result = runner.invoke(
-        wifi_group,
-        [
-            "prioritize",
-            "sta-laptop",
-            "--duration",
-            "240",
-            "--experimental-wifi",
-        ],
-    )
-    assert result.exit_code == 0, result.output
-    last = fake_googlewifi.last_instance
-    assert last is not None
-    prio_calls = [c for c in last.calls if c[0] == "prioritize_device"]
-    _, args, _ = prio_calls[0]
-    # 240 minutes → 4 hours upstream (240/60 == 4).
-    assert args[2] == 4
-
-
 # ---------------------------------------------------------------------------
-# Unknown client
+# Unknown client → exit 5 (was 4 pre-Phase-B)
 # ---------------------------------------------------------------------------
 
 
-def test_prioritize_unknown_client_exits_4(isolated_xdg: Path, fake_googlewifi: type) -> None:
+def test_prioritize_unknown_client_exits_5(
+    isolated_xdg: Path, fake_googlewifi: None
+) -> None:
     _seed_wifi_creds()
     runner = CliRunner()
     result = runner.invoke(
@@ -245,6 +185,6 @@ def test_prioritize_unknown_client_exits_4(isolated_xdg: Path, fake_googlewifi: 
             "json",
         ],
     )
-    assert result.exit_code == 4, result.output
+    assert result.exit_code == EXIT_UNSUPPORTED_FEATURE, result.output
     payload = json.loads(result.stderr or result.output)
     assert payload["family"] == "wifi"

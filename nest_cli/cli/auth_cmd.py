@@ -38,6 +38,7 @@ through ``exit_on_structured_error``.
 from __future__ import annotations
 
 import os
+import re
 import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
@@ -78,6 +79,12 @@ from nest_cli.output import OutputMode, add_output_options, emit
 # Android master token without the operator having to pipe stdin or pass
 # a file. Documented in the verb's ``--help`` (FR-CRED-7).
 _ENV_MASTER_TOKEN = "GOOGLE_ANDROID_MASTER_TOKEN"
+
+# Phase B: the Foyer access-token mint path needs the same device's
+# ``android_id`` (16-char hex from /data/data/com.google.android.gsf/
+# databases/gservices.db). Mirrors the master-token UX: flag > env > prompt.
+_ENV_ANDROID_ID = "GOOGLE_ANDROID_ID"
+_ANDROID_ID_PATTERN = re.compile(r"^[0-9a-f]{16}$")
 
 
 def _redact_client_id(client_id: str) -> str:
@@ -481,6 +488,17 @@ def _build_wifi_status_record(output_mode: OutputMode) -> dict[str, object]:
     help="Google account email that owns the Nest Wi-Fi mesh. Prompted if absent.",
 )
 @click.option(
+    "--android-id",
+    "android_id",
+    type=str,
+    default=None,
+    help=(
+        "16-char hex Android device id (from gservices.db on the paired Android "
+        "device). Required for Foyer access-token minting; precedence: "
+        "--android-id > GOOGLE_ANDROID_ID env > stdin prompt."
+    ),
+)
+@click.option(
     "--overwrite",
     is_flag=True,
     default=False,
@@ -491,6 +509,7 @@ def cmd_wifi_setup(
     experimental_wifi: bool,
     master_token_file: Path | None,
     google_account_email: str | None,
+    android_id: str | None,
     overwrite: bool,
     output_mode: OutputMode,
 ) -> None:
@@ -508,9 +527,11 @@ def cmd_wifi_setup(
     2. ``GOOGLE_ANDROID_MASTER_TOKEN`` env var — read the token from env.
     3. stdin — last resort; uses ``getpass`` to avoid shell history.
 
-    The persisted JSON shape is FR-CRED-8: ``{"version": 1, "type":
+    The persisted JSON shape is FR-CRED-8 v2: ``{"version": 2, "type":
     "foyer", "google_account_email": ..., "master_token": ...,
-    "issued_at": <rfc3339>}``. File mode is chmod 0600.
+    "android_id": <16-char hex>, "issued_at": <rfc3339>}``. File mode
+    is chmod 0600. Phase B (2026-05-03) bumped the schema to v2 to
+    persist the ``android_id`` needed by the gpsoauth → Foyer mint path.
 
     SRD §6.4 reminds operators that Foyer has no programmatic revoke
     endpoint; the only way to invalidate this token at Google's end is
@@ -544,12 +565,14 @@ def cmd_wifi_setup(
         google_account_email = click.prompt("Google account email", type=str)
 
     master_token = _resolve_master_token(master_token_file, output_mode)
+    resolved_android_id = _resolve_android_id(android_id, output_mode)
 
     creds = WifiCredentials(
-        version=1,
+        version=2,
         type="foyer",
         google_account_email=google_account_email,
         master_token=master_token,
+        android_id=resolved_android_id,
         issued_at=datetime.now(UTC),
     )
 
@@ -621,6 +644,78 @@ def _resolve_master_token(master_token_file: Path | None, output_mode: OutputMod
             output_mode,
         )
     return token
+
+
+def _resolve_android_id(android_id_flag: str | None, output_mode: OutputMode) -> str:
+    """Resolve a 16-char hex android_id from flag → env → prompt order.
+
+    The Foyer access-token mint path needs the same Android device's
+    ``android_id`` that was used to derive the master token; otherwise
+    Google's auth backend rejects the OAuth call with an opaque
+    "Authorization Error". The value is a 16-char lowercase hex string
+    pulled from ``/data/data/com.google.android.gsf/databases/gservices.db``
+    on the rooted Android device.
+
+    Empty / non-hex / wrong-length sources surface as exit 6
+    (config_error, family=wifi). Same posture as ``_resolve_master_token``:
+    "I don't have a credential" means omit the source entirely (then we
+    exit 2 from load-time, not setup-time); a present-but-bad source is
+    a misconfigured input, not an auth failure.
+    """
+    if android_id_flag is not None:
+        return _validate_android_id(
+            android_id_flag.strip(), source="--android-id", output_mode=output_mode
+        )
+
+    env_value = os.environ.get(_ENV_ANDROID_ID, "").strip()
+    if env_value:
+        return _validate_android_id(env_value, source=_ENV_ANDROID_ID, output_mode=output_mode)
+
+    prompted = click.prompt(
+        "Android android_id (16-char hex from gservices.db)",
+        type=str,
+        default="",
+        show_default=False,
+    )
+    prompted = (prompted or "").strip()
+    if not prompted:
+        exit_on_structured_error(
+            StructuredError(
+                code=EXIT_CONFIG_ERROR,
+                message="no android_id supplied (flag, env, or stdin all empty)",
+                hint=(
+                    f"Pass --android-id <hex>, set the {_ENV_ANDROID_ID} env var, "
+                    "or type the 16-char hex value at the prompt. Extract it from "
+                    "/data/data/com.google.android.gsf/databases/gservices.db on "
+                    "the paired (rooted) Android device."
+                ),
+                family="wifi",
+            ),
+            output_mode,
+        )
+    return _validate_android_id(prompted, source="stdin", output_mode=output_mode)
+
+
+def _validate_android_id(value: str, *, source: str, output_mode: OutputMode) -> str:
+    """Reject non-hex / wrong-length android_id with EXIT_CONFIG_ERROR."""
+    if not _ANDROID_ID_PATTERN.fullmatch(value):
+        exit_on_structured_error(
+            StructuredError(
+                code=EXIT_CONFIG_ERROR,
+                message=(
+                    f"android_id from {source} is not a 16-char lowercase hex string "
+                    f"(got {len(value)} chars)"
+                ),
+                hint=(
+                    "android_id must match ^[0-9a-f]{16}$. Re-extract from "
+                    "/data/data/com.google.android.gsf/databases/gservices.db "
+                    "on the paired (rooted) Android device."
+                ),
+                family="wifi",
+            ),
+            output_mode,
+        )
+    return value
 
 
 @auth_group.command("wifi-revoke")

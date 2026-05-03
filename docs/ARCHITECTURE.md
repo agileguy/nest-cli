@@ -145,26 +145,46 @@ The full threat model lives at SRD §4.7. v0.1.0's relevant defenses:
 - Tokens are never logged or interpolated into stderr error messages. Bearer headers are constructed at request time and not persisted in any structured-error `details` field.
 - The CI workflow has a guard step (first step in the workflow) that fails the build if any of `NEST_CLI_TEST_OAUTH_CREDENTIALS`, `GOOGLE_APPLICATION_CREDENTIALS`, or `NEST_CLI_TEST_FOYER_TOKEN` are present in the runner environment. Real-credential integration tests are operator-side only.
 
-### What v0.3.0 (Phase 3 Part A) ships and what it does NOT
+### Wifi-side implementation (Phase B, 2026-05-03)
 
-**Now shipping (Phase 3 Part A):**
+The wifi side originally wrapped `googlewifi.GoogleWifi` (which itself depends on `glocaltokens`). That path was empirically broken on AAS master tokens: `googlewifi` calls `https://www.googleapis.com/oauth2/v4/token` with `grant_type=refresh_token`, which expects a standard OAuth2 refresh token (`1//09...`) — not the AAS master token (`aas_et/...`) the operator extracts from a paired Android device. Phase B replaces the broken path with a direct call to `googlehomefoyer-pa.googleapis.com:443` over gRPC, with the access token minted via `gpsoauth.perform_oauth(email, master_token, android_id, ...)` against the Google Home Android app's signing constants.
 
-- `auth wifi-setup --experimental-wifi` and `auth wifi-revoke --experimental-wifi` (FR-CRED-7..9).
-- `auth status` extended to emit a 2-element JSON array (cam + wifi) per FR-CRED-10.
-- `wifi list groups`, `wifi list points <group>`, `wifi list clients <group>` (FR-WIFI-1..3) — all `--experimental-wifi` gated.
-- `nest_cli/wifi/` package: `WifiGroup` / `WifiPoint` / `WifiClient` pydantic models; `FoyerClient` lazy-loading sync wrapper around `googlewifi.GoogleWifi`.
-- Optional `[wifi]` install extra wired through `pyproject.toml` (already present from Phase 2; FoyerClient lazy-imports it).
-- `family="wifi"` on the §11.3 error envelope for wifi-side errors.
+**Implemented (read verbs from `GetHomeGraph`):**
+
+- `auth wifi-setup --experimental-wifi --android-id <hex>` (FR-CRED-7) — accepts the 16-char hex `android_id` from the paired Android device's `gservices.db`. Persisted into v2 `credentials-wifi.json`.
+- `auth wifi-revoke --experimental-wifi` (FR-CRED-9) — atomic stub-replace.
+- `auth status` (FR-CRED-10) — emits a 2-element JSON array (cam + wifi).
+- `wifi list groups --experimental-wifi` (FR-WIFI-1).
+- `wifi list points <group> --experimental-wifi` (FR-WIFI-2).
+- `wifi point-health <point> --experimental-wifi` (FR-WIFI-15).
+
+**Action verbs ship with exit-5 (`unsupported_feature`, `family="wifi"`) until Phase C maps the specific Foyer RPCs:**
+
+- `wifi list clients <group>` (FR-WIFI-3).
+- `wifi pause / unpause / prioritize / group-assign` (FR-WIFI-4..7).
+- `wifi speedtest run / history` (FR-WIFI-8..9).
+- `wifi reboot point / group` (FR-WIFI-10..11).
+- `wifi network` (FR-WIFI-13) — `GetHomeGraph` carries no SSID/IPv4/IPv6/DNS data, so returning placeholder `"<unknown>"` records would be misleading.
+- `wifi guest enable / disable` (FR-WIFI-14).
+
+The CLI surface for these verbs is fully wired so operator scripts can be authored today and will start working when Phase C lands without any operator-visible interface change. Each verb returns a structured error with hint pointing at the Phase-C deferral.
+
+**Schema migration:** `WifiCredentials.version` bumped 1 → 2. v1 files (no `android_id`) fail load-time validation with `EXIT_CONFIG_ERROR` and a hint pointing at `auth wifi-setup --overwrite --experimental-wifi`.
+
+**Module map:**
+
+- `nest_cli/wifi/client.py:FoyerClient(creds: WifiCredentials)` — direct gpsoauth + gRPC. Token cache (60s skew before expiry); `_fetch_systems()` calls `StructuresServiceStub.GetHomeGraph()` and projects the protobuf onto the legacy googlewifi-shaped dict that the existing `WifiGroup` / `WifiPoint` model classmethods consume.
+- `nest_cli/wifi/types.py` — pydantic models unchanged from v0.3.x (Phase B reuses the existing `from_googlewifi_response` classmethods on a projected dict shape).
+- `nest_cli/auth/wifi_types.py` — `WifiCredentials` v2 schema with `android_id: str` (16-char hex regex).
+- `nest_cli/cli/auth_cmd.py` — `--android-id` flag + `GOOGLE_ANDROID_ID` env var support.
 
 **Still deferred:**
 
-- **Phase 3 Part B (Engineer B):** `wifi pause`, `wifi unpause`, `wifi prioritize`, `wifi group-assign` (FR-WIFI-4..7).
-- **Phase 3.1:** `wifi speedtest run/history`, `wifi reboot point/group`, `wifi network`, `wifi guest enable/disable`, `wifi point-health` (FR-WIFI-8..15).
-- **Phase 4:** `groups list`, `batch`, `@group` target syntax, parallel target execution.
+- **Phase C:** map Foyer RPCs for the action verbs above (`SetStation`, `RunSpeedTest`, etc.) and replace the exit-5 stubs.
 - **Phase 5+:** Pub/Sub auto-provisioning, ffmpeg snapshot fallback, multi-account, OS keyring, wifi guest password setting.
 - **Cam-side retrofit:** add `family: "cam"` to cam-side error envelopes once a major-version bump can absorb the back-compat break.
 
-The `cam capabilities` verb advertises a `supported_verbs` list — today it includes the Phase 1 + Phase 2 verbs (`info`, `capabilities`, `snapshot`, `chime`, `battery`, `signal`, `stream`, `stream-extend`, `stream-stop`, `events`). Phase 3 Part B's wifi action verbs will need their own per-family-traits derivation since FR-WIFI-4..7 act on stations, not points.
+The `cam capabilities` verb advertises a `supported_verbs` list including the Phase 1 + Phase 2 cam verbs. The wifi side's "what's implemented vs deferred" is not advertised through `capabilities` because every wifi verb registers in Click; verbs that exit-5 do so via the FoyerClient layer, not via missing Click registration.
 
 ---
 
@@ -172,8 +192,8 @@ The `cam capabilities` verb advertises a `supported_verbs` list — today it inc
 
 This document does not cover:
 
-- The wifi-side per-mesh-firmware matrix (deferred — Phase 3 Part A captures only the v1 mesh-AC family that the operator's smoke harness exercised).
+- The wifi-side per-mesh-firmware matrix (deferred — Phase B was validated against a Nest Wifi Pro on the operator's smoke harness).
 - The Pub/Sub events surface beyond Phase 2.1 — Pub/Sub topic provisioning automation is Phase 5+ (SRD §16.7).
-- Wifi action verbs (pause / unpause / prioritize / group-assign / speedtest / reboot / network / guest / point-health) — Phase 3 Part B and Phase 3.1.
+- Wifi action verbs (pause / unpause / prioritize / group-assign / speedtest / reboot / network / guest / list-clients / point-health-mutations) — Phase C will map each Foyer RPC and replace the exit-5 stubs.
 
-Phase 3 Part A's deliverable is the wifi-side foundation (types, FoyerClient, credentials, list verbs, experimental gate, family error envelope) that the Phase 3 Part B action verbs build on without further refactoring.
+Phase B's deliverable is a working wifi-side read inventory (groups, points, point-health) plus a deferred-feature posture (every action verb has a wired CLI path that returns a clean exit-5 with hint). Phase C builds on top by replacing each stub method's body with the real Foyer RPC call — no new constructor wiring or test scaffolding required.

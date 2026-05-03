@@ -1,25 +1,28 @@
 """``nest-cli wifi`` subgroup — Foyer-backed wifi commands (experimental).
 
-Phase 3A shipped read-only ``wifi list`` verbs (FR-WIFI-1..3):
+Implementation status (Phase B, 2026-05-03; see SRD §17):
 
-- ``wifi list groups``        — every mesh group on the operator's account.
-- ``wifi list points <group>``— every router/point in the named group.
-- ``wifi list clients <group>``— every connected station in the named group.
+**Implemented read verbs** (data derives from ``GetHomeGraph``):
 
-Phase 3B (this module's additions) — per-client action verbs (FR-WIFI-4..7):
+- ``wifi list groups``         — every mesh group on the operator's account.
+- ``wifi list points <group>`` — every router/point in the named group.
+- ``wifi point-health <point>``— health snapshot for a single point.
 
-- ``wifi pause <client-id>``         — pause a single client.
-- ``wifi unpause <client-id>``       — unpause a single client.
-- ``wifi prioritize <client-id> --duration <minutes>``
-                                     — boost a single client (1..240 min).
-- ``wifi group-assign <client-id> --group <family|parental|guest|none>``
-                                     — assign a client to a Foyer group.
-                                       Currently exits 5 — upstream
-                                       googlewifi gap; see ``set_station_group``
-                                       in ``nest_cli/wifi/client.py``.
+**Action verbs ship as exit-5 (``unsupported_feature``, ``family="wifi"``)
+until Phase C maps the specific Foyer RPCs:**
 
-The speedtest, reboot, network-info, and point-health verbs land in
-Phase 3.1.
+- ``wifi list clients <group>``                     (FR-WIFI-3)
+- ``wifi pause / unpause <client-id>``              (FR-WIFI-4..5)
+- ``wifi prioritize <client-id> --duration <min>``  (FR-WIFI-6)
+- ``wifi group-assign <client-id> --group <choice>``(FR-WIFI-7)
+- ``wifi speedtest run / history <group>``          (FR-WIFI-8..9)
+- ``wifi reboot point / group``                     (FR-WIFI-10..11)
+- ``wifi network <group>``                          (FR-WIFI-13)
+- ``wifi guest enable / disable <group>``           (FR-WIFI-14)
+
+The CLI surface for these verbs is fully wired so operator scripts can be
+authored today and will start working when Phase C lands without any
+operator-visible interface change.
 
 Experimental gate
 -----------------
@@ -52,6 +55,7 @@ from nest_cli.auth.wifi_credentials import (
     default_wifi_credentials_path,
     load_wifi_credentials,
 )
+from nest_cli.auth.wifi_types import WifiCredentials
 from nest_cli.cli._fanout import FanOutResult, fan_out_verb
 from nest_cli.cli._shared import (
     ResolvedTarget,
@@ -145,12 +149,14 @@ def _confirm_reboot_or_exit(
         sys.exit(0)
 
 
-def _load_wifi_creds_or_exit(output_mode: OutputMode) -> str:
-    """Load the wifi master token from credentials-wifi.json or exit cleanly.
+def _load_wifi_creds_or_exit(output_mode: OutputMode) -> WifiCredentials:
+    """Load the wifi credentials from credentials-wifi.json or exit cleanly.
 
-    Returns just the master token (the FoyerClient only needs that;
-    the email is operator metadata for ``auth status``). Failure paths
-    surface as ``StructuredError(family="wifi")``.
+    Phase B (2026-05-03): returns the full ``WifiCredentials`` record
+    rather than just the master token. The new ``FoyerClient(creds)``
+    needs the email + master_token + android_id triple to mint a Foyer
+    access token via ``gpsoauth.perform_oauth``. Failure paths surface
+    as ``StructuredError(family="wifi")``.
     """
     creds_path = default_wifi_credentials_path()
     try:
@@ -165,7 +171,7 @@ def _load_wifi_creds_or_exit(output_mode: OutputMode) -> str:
             ),
             output_mode,
         )
-    return creds.master_token
+    return creds
 
 
 # ---------------------------------------------------------------------------
@@ -231,9 +237,9 @@ def cmd_list_groups(experimental_wifi: bool, output_mode: OutputMode) -> None:
     Empty inventory exits 0 with empty output (FR-3 mirror).
     """
     experimental_wifi_gate_or_exit(experimental_wifi, output_mode, verb="wifi list groups")
-    master_token = _load_wifi_creds_or_exit(output_mode)
+    creds = _load_wifi_creds_or_exit(output_mode)
     try:
-        client = FoyerClient(master_token=master_token)
+        client = FoyerClient(creds)
         groups = client.list_groups()
     except StructuredError as exc:
         exit_on_structured_error(exc, output_mode)
@@ -261,9 +267,9 @@ def cmd_list_points(group_id: str, experimental_wifi: bool, output_mode: OutputM
     WifiPoint record per point in deterministic id-ascending order.
     """
     experimental_wifi_gate_or_exit(experimental_wifi, output_mode, verb="wifi list points")
-    master_token = _load_wifi_creds_or_exit(output_mode)
+    creds = _load_wifi_creds_or_exit(output_mode)
     try:
-        client = FoyerClient(master_token=master_token)
+        client = FoyerClient(creds)
         points = client.list_points(group_id)
     except StructuredError as exc:
         exit_on_structured_error(exc, output_mode)
@@ -293,9 +299,9 @@ def cmd_list_clients(group_id: str, experimental_wifi: bool, output_mode: Output
     fields are normalized from the upstream Foyer payload.
     """
     experimental_wifi_gate_or_exit(experimental_wifi, output_mode, verb="wifi list clients")
-    master_token = _load_wifi_creds_or_exit(output_mode)
+    creds = _load_wifi_creds_or_exit(output_mode)
     try:
-        client = FoyerClient(master_token=master_token)
+        client = FoyerClient(creds)
         clients = client.list_clients(group_id)
     except StructuredError as exc:
         exit_on_structured_error(exc, output_mode)
@@ -349,9 +355,9 @@ def cmd_pause(
             output_mode=output_mode,
         )
         return
-    master_token = _load_wifi_creds_or_exit(output_mode)
+    creds = _load_wifi_creds_or_exit(output_mode)
     try:
-        client = FoyerClient(master_token=master_token)
+        client = FoyerClient(creds)
         client.pause_station(client_id)
     except StructuredError as exc:
         exit_on_structured_error(exc, output_mode)
@@ -393,8 +399,8 @@ def _wifi_action_fanout(
     except StructuredError as exc:
         exit_on_structured_error(exc, output_mode)
 
-    master_token = _load_wifi_creds_or_exit(output_mode)
-    foyer = FoyerClient(master_token=master_token)
+    creds = _load_wifi_creds_or_exit(output_mode)
+    foyer = FoyerClient(creds)
 
     def _verb_callable(rt: ResolvedTarget) -> FanOutResult:
         bare_id = _strip_wifi_prefix(rt.target)
@@ -451,9 +457,9 @@ def cmd_unpause(client_id: str, experimental_wifi: bool, output_mode: OutputMode
     Idempotent — unpausing an already-unpaused client returns OK.
     """
     experimental_wifi_gate_or_exit(experimental_wifi, output_mode, verb="wifi unpause")
-    master_token = _load_wifi_creds_or_exit(output_mode)
+    creds = _load_wifi_creds_or_exit(output_mode)
     try:
-        client = FoyerClient(master_token=master_token)
+        client = FoyerClient(creds)
         client.unpause_station(client_id)
     except StructuredError as exc:
         exit_on_structured_error(exc, output_mode)
@@ -495,9 +501,9 @@ def cmd_prioritize(
     requests a 1-hour boost rather than rounding to zero).
     """
     experimental_wifi_gate_or_exit(experimental_wifi, output_mode, verb="wifi prioritize")
-    master_token = _load_wifi_creds_or_exit(output_mode)
+    creds = _load_wifi_creds_or_exit(output_mode)
     try:
-        client = FoyerClient(master_token=master_token)
+        client = FoyerClient(creds)
         client.prioritize_station(client_id, duration_minutes)
     except StructuredError as exc:
         exit_on_structured_error(exc, output_mode)
@@ -544,20 +550,20 @@ def cmd_group_assign(
 ) -> None:
     """Assign a client to a Foyer group (FR-WIFI-7).
 
-    Phase 3B status: the upstream ``googlewifi`` library does not
-    currently expose a group-assign method. This verb wires through to
-    the FoyerClient, which raises exit 5 (unsupported_feature, family=wifi)
-    with a hint pointing at the upstream gap. The CLI surface is shipped
-    so operator scripts can target the verb today; once upstream lands
-    a ``set_station_group`` method, this verb starts succeeding without
-    any operator-visible interface change.
+    Phase B status: the specific Foyer RPC for group-assign has not yet
+    been mapped. This verb wires through to the FoyerClient, which
+    raises exit 5 (unsupported_feature, family=wifi) with a hint
+    pointing at the Phase-C deferral. The CLI surface is shipped so
+    operator scripts can target the verb today; once Phase C lands the
+    real RPC, this verb starts succeeding without any operator-visible
+    interface change.
     """
     experimental_wifi_gate_or_exit(experimental_wifi, output_mode, verb="wifi group-assign")
-    master_token = _load_wifi_creds_or_exit(output_mode)
+    creds = _load_wifi_creds_or_exit(output_mode)
     # Click's case_sensitive=False already lowercased the group value.
     requested_group: str | None = None if group == "none" else group
     try:
-        client = FoyerClient(master_token=master_token)
+        client = FoyerClient(creds)
         client.set_station_group(client_id, requested_group)
     except StructuredError as exc:
         exit_on_structured_error(exc, output_mode)
@@ -610,9 +616,9 @@ def cmd_speedtest_run(
     ``{ts, group_id, point_id, download_mbps, upload_mbps, ping_ms, source}``.
     """
     experimental_wifi_gate_or_exit(experimental_wifi, output_mode, verb="wifi speedtest run")
-    master_token = _load_wifi_creds_or_exit(output_mode)
+    creds = _load_wifi_creds_or_exit(output_mode)
     try:
-        client = FoyerClient(master_token=master_token)
+        client = FoyerClient(creds)
         result = client.run_speedtest(group_id, timeout_s=timeout_s)
     except StructuredError as exc:
         exit_on_structured_error(exc, output_mode)
@@ -653,9 +659,9 @@ def cmd_speedtest_history(
     ``ts`` (most recent first). Empty list if the router has no history.
     """
     experimental_wifi_gate_or_exit(experimental_wifi, output_mode, verb="wifi speedtest history")
-    master_token = _load_wifi_creds_or_exit(output_mode)
+    creds = _load_wifi_creds_or_exit(output_mode)
     try:
-        client = FoyerClient(master_token=master_token)
+        client = FoyerClient(creds)
         results = client.get_speedtest_history(group_id, limit=limit)
     except StructuredError as exc:
         exit_on_structured_error(exc, output_mode)
@@ -702,9 +708,9 @@ def cmd_reboot_point(
         output_mode=output_mode,
     )
 
-    master_token = _load_wifi_creds_or_exit(output_mode)
+    creds = _load_wifi_creds_or_exit(output_mode)
     try:
-        client = FoyerClient(master_token=master_token)
+        client = FoyerClient(creds)
         client.reboot_point(point_id)
     except StructuredError as exc:
         exit_on_structured_error(exc, output_mode)
@@ -764,9 +770,9 @@ def cmd_reboot_group(
     # is skipped and the list-resolve happens inside reboot_group below.
     needs_prompt = output_mode != "quiet" and not yes and _stdin_is_tty()
     if needs_prompt:
-        master_token = _load_wifi_creds_or_exit(output_mode)
+        creds = _load_wifi_creds_or_exit(output_mode)
         try:
-            client = FoyerClient(master_token=master_token)
+            client = FoyerClient(creds)
             # Pre-resolve to show the operator what they'll affect.
             # We list points via a separate call so the upstream
             # restart_system isn't invoked yet.
@@ -784,8 +790,8 @@ def cmd_reboot_group(
             output_mode=output_mode,
         )
     else:
-        master_token = _load_wifi_creds_or_exit(output_mode)
-        client = FoyerClient(master_token=master_token)
+        creds = _load_wifi_creds_or_exit(output_mode)
+        client = FoyerClient(creds)
         # Confirm path (skipped via yes/quiet) still runs to enforce the
         # non-tty + no-yes guard.
         _confirm_reboot_or_exit(
@@ -832,9 +838,9 @@ def cmd_network(group_id: str, experimental_wifi: bool, output_mode: OutputMode)
     prefix_len}, dns_servers}``. Group not found → exit 4.
     """
     experimental_wifi_gate_or_exit(experimental_wifi, output_mode, verb="wifi network")
-    master_token = _load_wifi_creds_or_exit(output_mode)
+    creds = _load_wifi_creds_or_exit(output_mode)
     try:
-        client = FoyerClient(master_token=master_token)
+        client = FoyerClient(creds)
         net = client.get_network_info(group_id)
     except StructuredError as exc:
         exit_on_structured_error(exc, output_mode)
@@ -851,21 +857,20 @@ def _guest_toggle(
 ) -> None:
     """Shared body for ``wifi guest enable`` / ``wifi guest disable``.
 
-    The CLI surface ships even though the upstream ``googlewifi``
-    library does not currently expose a guest-network setter. The
-    FoyerClient.set_guest_enabled raises EXIT_UNSUPPORTED_FEATURE
-    with a hint pointing at the upstream gap; once a setter method
-    lands upstream, this verb starts succeeding without an interface
-    change.
+    The CLI surface ships even though the specific Foyer RPC for guest-
+    network mutation has not yet been mapped. The FoyerClient.
+    set_guest_enabled raises EXIT_UNSUPPORTED_FEATURE with a hint
+    pointing at the Phase-C deferral; once the RPC lands, this verb
+    starts succeeding without an interface change.
     """
     experimental_wifi_gate_or_exit(
         experimental_wifi,
         output_mode,
         verb=f"wifi guest {'enable' if enabled else 'disable'}",
     )
-    master_token = _load_wifi_creds_or_exit(output_mode)
+    creds = _load_wifi_creds_or_exit(output_mode)
     try:
-        client = FoyerClient(master_token=master_token)
+        client = FoyerClient(creds)
         client.set_guest_enabled(group_id, enabled=enabled)
     except StructuredError as exc:
         exit_on_structured_error(exc, output_mode)
@@ -894,8 +899,8 @@ def _guest_toggle(
 def cmd_guest_enable(group_id: str, experimental_wifi: bool, output_mode: OutputMode) -> None:
     """Enable the guest network on ``group_id`` (FR-WIFI-14).
 
-    Phase 3.1 status: exits 5 (unsupported_feature, family=wifi) because
-    upstream googlewifi does not yet expose a guest-network setter.
+    Phase B status: exits 5 (unsupported_feature, family=wifi) — the
+    specific Foyer RPC has not yet been mapped (deferred to Phase C).
     """
     _guest_toggle(
         group_id=group_id,
@@ -947,9 +952,9 @@ def cmd_point_health(point_id: str, experimental_wifi: bool, output_mode: Output
     node to measure against).
     """
     experimental_wifi_gate_or_exit(experimental_wifi, output_mode, verb="wifi point-health")
-    master_token = _load_wifi_creds_or_exit(output_mode)
+    creds = _load_wifi_creds_or_exit(output_mode)
     try:
-        client = FoyerClient(master_token=master_token)
+        client = FoyerClient(creds)
         health = client.get_point_health(point_id)
     except StructuredError as exc:
         exit_on_structured_error(exc, output_mode)

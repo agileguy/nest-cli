@@ -33,10 +33,11 @@ def test_loose_mode_exits_2(isolated_xdg: Path, fake_googlewifi: type) -> None:
     save_wifi_credentials(
         path,
         WifiCredentials(
-            version=1,
+            version=2,
             type="foyer",
             google_account_email="me@example.com",
             master_token="t",
+            android_id="0123456789abcdef",
             issued_at=datetime(2026, 5, 3, tzinfo=UTC),
         ),
     )

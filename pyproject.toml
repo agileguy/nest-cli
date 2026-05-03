@@ -39,12 +39,19 @@ dependencies = [
 
 [project.optional-dependencies]
 # Wi-Fi extras are gated behind --experimental-wifi at runtime (SRD §13.2).
-# These libraries are single-maintainer with a history of upstream rotations
-# (SRD §15 Decision 23), so we pin tight. Rolling forward is an explicit
-# nest-cli release.
+# Phase B (2026-05-03) replaces googlewifi + glocaltokens with a direct gRPC
+# path: gpsoauth mints an access token from (master_token, android_id), then
+# we talk to googlehomefoyer-pa.googleapis.com:443 via the protobuf stubs
+# in ghome-foyer-api. googlewifi is dropped entirely (its OAuth
+# refresh-token path is incompatible with AAS master tokens). glocaltokens
+# is dropped because v0.7.x has a bug where get_master_token() ignores a
+# pre-set master_token if username/password aren't also set (we bypass it
+# via direct gpsoauth.perform_oauth calls).
 wifi = [
-    "googlewifi>=0.0.21,<0.1",
-    "glocaltokens>=0.7,<0.8",
+    "gpsoauth>=1.0,<3",
+    "grpcio>=1.60,<2",
+    "googleapis-common-protos>=1.60,<2",
+    "ghome-foyer-api>=1.0,<2",
 ]
 dev = [
     "pytest>=8",

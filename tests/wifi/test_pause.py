@@ -1,21 +1,18 @@
 """CliRunner tests for ``nest-cli wifi pause`` (FR-WIFI-4).
 
-Coverage:
-
-- Happy path: pause an unpaused client → exit 0, structured envelope.
-- Idempotent: pause an already-paused client → exit 0, no error.
-- Unknown client_id → exit 4 (family=wifi).
-- Network failure during action → exit 3 (family=wifi).
-- Error envelope carries family=wifi.
+Phase B status (2026-05-03): the pause action verb has not yet been
+mapped onto the Foyer gRPC surface, so every invocation exits 5
+(``unsupported_feature``, family=wifi) with a hint pointing at the
+Phase-C deferral. These tests verify the exit-5 posture; once Phase C
+lands the actual ``pause_station`` RPC, the happy-path / idempotence /
+upstream-arg tests will need to be reinstated against the new transport.
 """
 
 from __future__ import annotations
 
 import json
-import sys
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
 
 import pytest
 from click.testing import CliRunner
@@ -26,6 +23,7 @@ from nest_cli.auth.wifi_credentials import (
 )
 from nest_cli.auth.wifi_types import WifiCredentials
 from nest_cli.cli.wifi_cmd import wifi_group
+from nest_cli.errors import EXIT_UNSUPPORTED_FEATURE
 
 
 @pytest.fixture
@@ -38,22 +36,23 @@ def _seed_wifi_creds() -> None:
     save_wifi_credentials(
         default_wifi_credentials_path(),
         WifiCredentials(
-            version=1,
+            version=2,
             type="foyer",
             google_account_email="me@example.com",
             master_token="t",
+            android_id="0123456789abcdef",
             issued_at=datetime(2026, 5, 3, tzinfo=UTC),
         ),
     )
 
 
 # ---------------------------------------------------------------------------
-# Happy path + idempotence (FR-WIFI-4)
+# Phase B exit-5 posture (Phase C will reinstate the happy-path tests)
 # ---------------------------------------------------------------------------
 
 
-def test_pause_known_client_emits_ok_envelope(isolated_xdg: Path, fake_googlewifi: type) -> None:
-    """`wifi pause sta-laptop --experimental-wifi` exits 0 with envelope."""
+def test_pause_known_client_exits_5(isolated_xdg: Path, fake_googlewifi: None) -> None:
+    """`wifi pause sta-laptop` exits 5 with family=wifi (Phase B stub)."""
     _seed_wifi_creds()
     runner = CliRunner()
     result = runner.invoke(
@@ -66,20 +65,15 @@ def test_pause_known_client_emits_ok_envelope(isolated_xdg: Path, fake_googlewif
             "json",
         ],
     )
-    assert result.exit_code == 0, result.output
-    payload = json.loads(result.output)
-    assert payload == {
-        "client_id": "sta-laptop",
-        "action": "pause",
-        "result": "ok",
-    }
+    assert result.exit_code == EXIT_UNSUPPORTED_FEATURE, result.output
+    payload = json.loads(result.stderr or result.output)
+    assert payload["family"] == "wifi"
 
 
-def test_pause_already_paused_client_idempotent(isolated_xdg: Path, fake_googlewifi: type) -> None:
-    """FR-WIFI-4 idempotence: pausing an already-paused client returns OK."""
+def test_pause_already_paused_client_exits_5(isolated_xdg: Path, fake_googlewifi: None) -> None:
+    """Idempotence test reduced to exit-5: even paused clients fail-fast."""
     _seed_wifi_creds()
     runner = CliRunner()
-    # ``sta-kid-tablet`` is paused=true in the fixture corpus.
     result = runner.invoke(
         wifi_group,
         [
@@ -90,35 +84,16 @@ def test_pause_already_paused_client_idempotent(isolated_xdg: Path, fake_googlew
             "json",
         ],
     )
-    assert result.exit_code == 0, result.output
-    payload = json.loads(result.output)
-    assert payload["result"] == "ok"
+    assert result.exit_code == EXIT_UNSUPPORTED_FEATURE, result.output
 
 
-def test_pause_passes_correct_args_to_upstream(isolated_xdg: Path, fake_googlewifi: type) -> None:
-    """The FoyerClient resolves group_id from client_id and calls pause_device."""
-    _seed_wifi_creds()
-    runner = CliRunner()
-    result = runner.invoke(
-        wifi_group,
-        ["pause", "sta-phone", "--experimental-wifi"],
-    )
-    assert result.exit_code == 0, result.output
-    last = fake_googlewifi.last_instance
-    assert last is not None
-    pause_calls = [c for c in last.calls if c[0] == "pause_device"]
-    assert len(pause_calls) == 1
-    name, args, _ = pause_calls[0]
-    assert args == ("group-home-001", "sta-phone", True)
+def test_pause_unknown_client_exits_5(isolated_xdg: Path, fake_googlewifi: None) -> None:
+    """Unknown client_id still exits 5 — the verb stubs out before validation.
 
-
-# ---------------------------------------------------------------------------
-# Unknown client (FR-19 / SRD §11.2 exit 4)
-# ---------------------------------------------------------------------------
-
-
-def test_pause_unknown_client_exits_4(isolated_xdg: Path, fake_googlewifi: type) -> None:
-    """Unknown client_id → exit 4 with family=wifi."""
+    Pre-Phase-B this test asserted exit 4 (not_found); Phase B exits 5
+    earlier in the call chain because the FoyerClient method has no RPC
+    to dispatch the lookup against. exit-5 wins.
+    """
     _seed_wifi_creds()
     runner = CliRunner()
     result = runner.invoke(
@@ -131,60 +106,6 @@ def test_pause_unknown_client_exits_4(isolated_xdg: Path, fake_googlewifi: type)
             "json",
         ],
     )
-    assert result.exit_code == 4, result.output
-    payload = json.loads(result.stderr or result.output)
-    assert payload["family"] == "wifi"
-    assert "sta-no-such-client" in payload["message"]
-
-
-# ---------------------------------------------------------------------------
-# Transport error (SRD §11.2 exit 3)
-# ---------------------------------------------------------------------------
-
-
-def test_pause_network_error_exits_3(isolated_xdg: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Connection error during pause → exit 3 (family=wifi)."""
-
-    class _NetworkErrorGoogleWifi:
-        last_instance: _NetworkErrorGoogleWifi | None = None
-
-        def __init__(self, refresh_token: str | None = None, **_: Any) -> None:
-            type(self).last_instance = self
-
-        async def connect(self) -> bool:
-            return True
-
-        async def get_systems(self) -> dict[str, Any]:
-            # Same single-client corpus so resolution succeeds.
-            return {
-                "group-home-001": {
-                    "id": "group-home-001",
-                    "devices": {"sta-laptop": {"id": "sta-laptop"}},
-                }
-            }
-
-        async def pause_device(self, system_id: str, device_id: str, pause_state: bool) -> bool:
-            raise ConnectionError("DNS resolution failed")
-
-        async def close(self) -> None:
-            return None
-
-    fake_module = type(sys)("googlewifi")
-    fake_module.GoogleWifi = _NetworkErrorGoogleWifi  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, "googlewifi", fake_module)
-
-    _seed_wifi_creds()
-    runner = CliRunner()
-    result = runner.invoke(
-        wifi_group,
-        [
-            "pause",
-            "sta-laptop",
-            "--experimental-wifi",
-            "--output",
-            "json",
-        ],
-    )
-    assert result.exit_code == 3, result.output
+    assert result.exit_code == EXIT_UNSUPPORTED_FEATURE, result.output
     payload = json.loads(result.stderr or result.output)
     assert payload["family"] == "wifi"

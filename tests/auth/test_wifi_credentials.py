@@ -40,10 +40,11 @@ def _make_creds(
     master_token: str = "android-master-token-xyz",
 ) -> WifiCredentials:
     return WifiCredentials(
-        version=1,
+        version=2,
         type="foyer",
         google_account_email=email,
         master_token=master_token,
+        android_id="0123456789abcdef",
         issued_at=datetime(2026, 5, 3, 12, 0, 0, tzinfo=UTC),
     )
 

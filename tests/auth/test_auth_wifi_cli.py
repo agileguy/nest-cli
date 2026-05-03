@@ -47,10 +47,11 @@ def isolated_xdg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 def _make_wifi_creds() -> WifiCredentials:
     return WifiCredentials(
-        version=1,
+        version=2,
         type="foyer",
         google_account_email="operator@example.com",
         master_token="android-master-token-xyz",
+        android_id="0123456789abcdef",
         issued_at=datetime(2026, 5, 3, 12, 0, 0, tzinfo=UTC),
     )
 
@@ -92,12 +93,15 @@ class TestExperimentalGate:
 # ---------------------------------------------------------------------------
 
 
+_TEST_ANDROID_ID = "0123456789abcdef"
+
+
 class TestWifiSetup:
     def test_stdin_path_persists_credentials_chmod_0600(self, isolated_xdg: Path) -> None:
         runner = CliRunner()
         result = runner.invoke(
             auth_group,
-            ["wifi-setup", "--experimental-wifi"],
+            ["wifi-setup", "--experimental-wifi", "--android-id", _TEST_ANDROID_ID],
             # email prompt + master-token stdin (hidden).
             input="me@example.com\nthe-master-token\n",
         )
@@ -109,8 +113,10 @@ class TestWifiSetup:
         assert mode == 0o600
         on_disk = json.loads(path.read_text())
         assert on_disk["type"] == "foyer"
+        assert on_disk["version"] == 2
         assert on_disk["google_account_email"] == "me@example.com"
         assert on_disk["master_token"] == "the-master-token"
+        assert on_disk["android_id"] == _TEST_ANDROID_ID
 
     def test_master_token_file_path(self, isolated_xdg: Path, tmp_path: Path) -> None:
         token_file = tmp_path / "token.txt"
@@ -126,14 +132,18 @@ class TestWifiSetup:
                 str(token_file),
                 "--google-account-email",
                 "me@example.com",
+                "--android-id",
+                _TEST_ANDROID_ID,
             ],
         )
         assert result.exit_code == 0, result.output
         on_disk = json.loads(default_wifi_credentials_path().read_text())
         assert on_disk["master_token"] == "token-from-file"
+        assert on_disk["android_id"] == _TEST_ANDROID_ID
 
     def test_env_var_path(self, isolated_xdg: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("GOOGLE_ANDROID_MASTER_TOKEN", "token-from-env")
+        monkeypatch.setenv("GOOGLE_ANDROID_ID", _TEST_ANDROID_ID)
         runner = CliRunner()
         result = runner.invoke(
             auth_group,
@@ -147,6 +157,7 @@ class TestWifiSetup:
         assert result.exit_code == 0, result.output
         on_disk = json.loads(default_wifi_credentials_path().read_text())
         assert on_disk["master_token"] == "token-from-env"
+        assert on_disk["android_id"] == _TEST_ANDROID_ID
 
     def test_refuses_overwrite_without_flag(self, isolated_xdg: Path) -> None:
         path = default_wifi_credentials_path()
@@ -155,7 +166,7 @@ class TestWifiSetup:
         runner = CliRunner()
         result = runner.invoke(
             auth_group,
-            ["wifi-setup", "--experimental-wifi"],
+            ["wifi-setup", "--experimental-wifi", "--android-id", _TEST_ANDROID_ID],
             input="me@example.com\nnew-token\n",
         )
         assert result.exit_code == 2, result.output
@@ -168,13 +179,46 @@ class TestWifiSetup:
         runner = CliRunner()
         result = runner.invoke(
             auth_group,
-            ["wifi-setup", "--experimental-wifi", "--overwrite"],
+            [
+                "wifi-setup",
+                "--experimental-wifi",
+                "--overwrite",
+                "--android-id",
+                _TEST_ANDROID_ID,
+            ],
             input="me2@example.com\nnew-token\n",
         )
         assert result.exit_code == 0, result.output
         on_disk = json.loads(path.read_text())
         assert on_disk["google_account_email"] == "me2@example.com"
         assert on_disk["master_token"] == "new-token"
+        assert on_disk["android_id"] == _TEST_ANDROID_ID
+
+    def test_invalid_android_id_exits_6(self, isolated_xdg: Path) -> None:
+        """Non-hex / wrong-length --android-id surfaces as EXIT_CONFIG_ERROR."""
+        runner = CliRunner()
+        result = runner.invoke(
+            auth_group,
+            [
+                "wifi-setup",
+                "--experimental-wifi",
+                "--android-id",
+                "not-hex-not-16chars",
+            ],
+            input="me@example.com\nthe-master-token\n",
+        )
+        assert result.exit_code == 6, result.output
+        msg = (result.stderr or result.output).lower()
+        assert "android_id" in msg
+
+    def test_short_android_id_exits_6(self, isolated_xdg: Path) -> None:
+        runner = CliRunner()
+        result = runner.invoke(
+            auth_group,
+            ["wifi-setup", "--experimental-wifi", "--android-id", "0123"],
+            input="me@example.com\nthe-master-token\n",
+        )
+        assert result.exit_code == 6, result.output
 
 
 # ---------------------------------------------------------------------------

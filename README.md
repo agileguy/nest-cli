@@ -3,7 +3,7 @@
 Deterministic, scriptable command-line tool for two distinct Google device families:
 
 - **Google Nest cameras and doorbells** via the Smart Device Management (SDM) API.
-- **Google Nest Wi-Fi mesh routers** via the reverse-engineered Foyer service (**experimental**, not in v0.1.0).
+- **Google Nest Wi-Fi mesh routers** via the reverse-engineered Foyer service (**experimental**, gated behind `--experimental-wifi`).
 
 Sibling of [`kasa-cli`](https://github.com/agileguy/kasa-cli), [`tapo-cli`](https://github.com/agileguy/tapo-cli), and [`hue-cli`](https://github.com/agileguy/hue-cli): single binary, one verb per invocation, JSON/JSONL on stdout, deterministic exit codes, no GUI, no daemon.
 
@@ -32,7 +32,7 @@ uv tool install git+https://github.com/agileguy/nest-cli.git
 
 (Once published to PyPI, simply `uv tool install nest-cli`.)
 
-Optional Wi-Fi extras (experimental, deferred to a later release; the deps install but no `wifi` verbs are wired up in v0.1.0):
+Optional Wi-Fi extras (experimental). The `[wifi]` extra adds `gpsoauth`, `grpcio`, `googleapis-common-protos`, and `ghome-foyer-api` for direct Foyer gRPC access — see Status above for which verbs are implemented:
 
 ```bash
 uv tool install 'git+https://github.com/agileguy/nest-cli.git#egg=nest-cli[wifi]'

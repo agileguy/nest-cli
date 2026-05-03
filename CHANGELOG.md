@@ -7,6 +7,89 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Phase B — wifi side rebuilt on direct gpsoauth + gRPC (2026-05-03)
+
+The wifi side originally wrapped `googlewifi.GoogleWifi` (which itself
+depends on `glocaltokens`). Both libraries are dropped in Phase B:
+`googlewifi`'s OAuth2 refresh-token flow is incompatible with the AAS
+master tokens operators extract from paired Android devices, and
+`glocaltokens` 0.7.x has a `get_master_token()` early-return bug that
+defeats reuse of an already-populated token. Phase B replaces the path
+with a direct call to `googlehomefoyer-pa.googleapis.com:443` over
+gRPC, with the access token minted via
+`gpsoauth.perform_oauth(email, master_token, android_id, ...)`.
+
+### Added
+
+- `WifiCredentials` schema bumped 1 → 2 with required `android_id: str`
+  field (16-char hex, regex-validated). The Foyer access-token mint
+  needs the same Android device's `android_id` (from
+  `/data/data/com.google.android.gsf/databases/gservices.db` on the
+  rooted Android device) alongside the master token.
+- `auth wifi-setup --android-id <hex>` flag + `GOOGLE_ANDROID_ID` env
+  var. Precedence: flag > env > stdin prompt. Non-hex / wrong-length
+  values exit 6 (`config_error`, `family=wifi`) with a hint pointing
+  at the bootstrap flow.
+- `FoyerClient(creds: WifiCredentials)` — direct gRPC client. Lazy-
+  imports `gpsoauth` + `grpc` + `ghome_foyer_api`; cam-only installs
+  see exit 5 with install hint. Access-token cache with 60s skew
+  before expiry.
+- 22 new tests under `tests/wifi/test_client.py` covering token-mint
+  happy path, token caching, expiry-and-refresh, skew window,
+  missing-`Auth`-key auth-failure (exit 2), gpsoauth network errors
+  (exit 3), and exit-5 posture parametrized over all 10 deferred
+  action verbs.
+
+### Changed
+
+- `pyproject.toml` `[wifi]` extras: dropped `googlewifi` + `glocaltokens`,
+  added `gpsoauth>=1.0,<3`, `grpcio>=1.60,<2`,
+  `googleapis-common-protos>=1.60,<2`, `ghome-foyer-api>=1.0,<2`.
+- `FoyerClient` constructor signature: `FoyerClient(creds: WifiCredentials)`
+  instead of `FoyerClient(master_token=...)`. All 16 construction
+  sites in `nest_cli/cli/wifi_cmd.py` updated; `_load_wifi_creds_or_exit`
+  now returns the full `WifiCredentials` record.
+- `nest_cli/wifi/client.py` `_fetch_systems()` now projects the
+  `GetHomeGraphResponse` protobuf onto the legacy googlewifi-shaped
+  dict that the existing `WifiGroup` / `WifiPoint` model classmethods
+  consume. Models, the structured-error envelope, and `family="wifi"`
+  discriminator are preserved unchanged.
+- `tests/wifi/conftest.py` — fakes patch `FoyerClient._fetch_systems`
+  directly (the gRPC seam) instead of `googlewifi.GoogleWifi`. Old
+  fixture names (`fake_googlewifi`, `empty_googlewifi`,
+  `missing_googlewifi`) aliased to the new fixtures so action-verb
+  test files don't need per-signature rewrites.
+
+### Wifi action verbs deferred to Phase C (exit 5, `family="wifi"`)
+
+The `GetHomeGraph` projection covers read inventory (groups, points,
+point-health) but not connected-station records, configuration
+mutations, or speed-test invocations. Each verb's CLI path is wired
+fully so operator scripts can be authored today; the FoyerClient
+method body raises `EXIT_UNSUPPORTED_FEATURE` with a hint pointing
+at the Phase-C deferral until the specific Foyer RPC is mapped:
+
+- `wifi list clients <group>` (FR-WIFI-3)
+- `wifi pause / unpause <client-id>` (FR-WIFI-4..5)
+- `wifi prioritize <client-id> --duration <minutes>` (FR-WIFI-6)
+- `wifi group-assign <client-id> --group <choice>` (FR-WIFI-7)
+- `wifi speedtest run <group> --timeout <s>` (FR-WIFI-8)
+- `wifi speedtest history <group> --limit <N>` (FR-WIFI-9)
+- `wifi reboot point <point>` (FR-WIFI-10)
+- `wifi reboot group <group>` (FR-WIFI-11)
+- `wifi network <group>` (FR-WIFI-13) — `GetHomeGraph` carries no
+  SSID/IPv4/IPv6/DNS data, so returning placeholder `"<unknown>"`
+  records would mislead operators piping output through `jq`. Verb
+  exits 5 instead.
+- `wifi guest enable / disable <group>` (FR-WIFI-14)
+
+### Migration
+
+Operators with an existing v1 `credentials-wifi.json` will see exit 6
+(`config_error`, `family=wifi`) on first wifi command after Phase B.
+Re-run `auth wifi-setup --overwrite --experimental-wifi --android-id <hex>`
+to write a v2 file.
+
 ## [0.4.0] - 2026-05-03
 
 ### Added

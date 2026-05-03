@@ -27,10 +27,11 @@ def _seed_wifi_creds() -> None:
     save_wifi_credentials(
         default_wifi_credentials_path(),
         WifiCredentials(
-            version=1,
+            version=2,
             type="foyer",
             google_account_email="me@example.com",
             master_token="t",
+            android_id="0123456789abcdef",
             issued_at=datetime(2026, 5, 3, tzinfo=UTC),
         ),
     )
@@ -77,29 +78,23 @@ def test_unknown_group_exits_4(isolated_xdg: Path, fake_googlewifi: type) -> Non
 
 
 def test_upstream_shape_rotation_exits_1(
-    isolated_xdg: Path, monkeypatch: pytest.MonkeyPatch
+    isolated_xdg: Path, rotated_foyer_client: None
 ) -> None:
-    """If googlewifi returns a non-dict, exit 1 (device_error, family=wifi)."""
-    import sys
+    """If Foyer returns a non-dict shape, exit 1 (device_error, family=wifi).
 
-    class _RotatedGoogleWifi:
-        def __init__(self, refresh_token: str | None = None, **_: object) -> None:
-            pass
-
-        async def get_systems(self) -> list[str]:
-            return ["wrong", "shape"]
-
-        async def close(self) -> None:
-            return None
-
-    fake_module = type(sys)("googlewifi")
-    fake_module.GoogleWifi = _RotatedGoogleWifi  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, "googlewifi", fake_module)
-
+    Phase B injects the rotation via the ``rotated_foyer_client`` fixture,
+    which patches ``FoyerClient._fetch_systems`` to return a list. The
+    explicit ``isinstance(systems, dict)`` guard in ``list_groups`` then
+    maps the shape error onto exit 1 with family=wifi (SRD §3.2.3
+    upstream rotation handling). We exercise the rotation through
+    ``list groups`` because that read verb runs the shape guard before
+    routing into per-group lookup; ``list points`` would short-circuit
+    on the not-found path before the shape guard fires.
+    """
     _seed_wifi_creds()
     runner = CliRunner()
     result = runner.invoke(
         wifi_group,
-        ["list", "points", "group-home-001", "--experimental-wifi", "--output", "json"],
+        ["list", "groups", "--experimental-wifi", "--output", "json"],
     )
     assert result.exit_code == 1, result.output

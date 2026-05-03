@@ -5,9 +5,9 @@ Coverage:
 - Each of the four group choices (family / parental / guest / none) is accepted.
 - Case-insensitive `--group FAMILY` works.
 - Missing `--group` flag → Click usage error.
-- Upstream googlewifi gap: until upstream supports group-assign, the verb
-  exits 5 (unsupported_feature, family=wifi) with a hint pointing at the gap.
-  This is the documented Phase 3B posture (see ARCHITECTURE / commit body).
+- Phase B status: the action verb has not yet been mapped onto the
+  Foyer gRPC surface, so the verb exits 5 (unsupported_feature,
+  family=wifi) with a hint pointing at the Phase-C deferral.
 """
 
 from __future__ import annotations
@@ -37,10 +37,11 @@ def _seed_wifi_creds() -> None:
     save_wifi_credentials(
         default_wifi_credentials_path(),
         WifiCredentials(
-            version=1,
+            version=2,
             type="foyer",
             google_account_email="me@example.com",
             master_token="t",
+            android_id="0123456789abcdef",
             issued_at=datetime(2026, 5, 3, tzinfo=UTC),
         ),
     )
@@ -76,13 +77,16 @@ def test_group_assign_accepts_each_choice_value(
             "json",
         ],
     )
-    # Phase 3B status: googlewifi has no group-assign endpoint.
-    # Exit 5 (EXIT_UNSUPPORTED_FEATURE) is the documented posture.
+    # Phase B status (2026-05-03): the FoyerClient action verb has not
+    # yet been mapped onto a Foyer gRPC RPC; exit 5
+    # (EXIT_UNSUPPORTED_FEATURE) is the documented posture, deferred to
+    # Phase C.
     assert result.exit_code == 5, f"got {result.exit_code}: {result.output}"
     payload = json.loads(result.stderr or result.output)
     assert payload["family"] == "wifi"
-    # Hint should mention the upstream gap.
-    assert "googlewifi" in (payload.get("hint") or "").lower()
+    # Hint should reference the Phase-C deferral (was: "googlewifi" gap).
+    hint = (payload.get("hint") or "").lower()
+    assert "phase" in hint or "foyer" in hint or "deferred" in hint
 
 
 def test_group_assign_case_insensitive(isolated_xdg: Path, fake_googlewifi: type) -> None:
