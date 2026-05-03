@@ -40,12 +40,12 @@ events. Importing inside the verb body keeps ``cam list`` /
 
 from __future__ import annotations
 
-import contextlib
 import os
 import sys
 from typing import Any
 
 import click
+import google.api_core.exceptions
 
 from nest_cli.cli._shared import exit_on_structured_error
 from nest_cli.config import default_config_path, load_config, resolve_alias
@@ -165,15 +165,23 @@ def cam_events(
         emit(event, output_mode)
 
     if ack_ids:
-        # Failing to ack is non-fatal — Pub/Sub redelivers and the next
-        # drain picks them up. Stay silent in --json/--jsonl mode so
-        # the structured stream is clean.
-        with contextlib.suppress(Exception):
+        # Reviewer feedback (C3): catch a narrower exception family and
+        # surface failures on stderr. Persistent ack failures cause
+        # infinite redelivery + duplicates; silently suppressing them
+        # leaves the operator with no diagnostic. Failure here remains
+        # non-fatal — Pub/Sub will redeliver and the next drain picks
+        # them up — but the operator now sees the warning.
+        try:
             subscriber.acknowledge(
                 request={
                     "subscription": subscription,
                     "ack_ids": ack_ids,
                 }
+            )
+        except (google.api_core.exceptions.GoogleAPICallError, OSError, TimeoutError) as exc:
+            click.echo(
+                f"warning: ack failed for {len(ack_ids)} message(s): {type(exc).__name__}: {exc}",
+                err=True,
             )
 
 

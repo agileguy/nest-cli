@@ -315,6 +315,48 @@ class TestMaxMessages:
             assert req["max_messages"] == 7
 
 
+class TestAckFailureSurfaced:
+    def test_ack_failure_writes_warning_to_stderr(self, fake_paths: dict[str, Path]) -> None:
+        """Reviewer feedback (C3): ack failure must not be silent.
+
+        Prior behaviour wrapped subscriber.acknowledge in
+        contextlib.suppress(Exception); persistent ack failures caused
+        infinite redelivery + duplicates with zero operator visibility.
+        Fix logs a warning to stderr including the exception type and
+        the count of un-acked messages.
+        """
+        import google.api_core.exceptions
+
+        fake_paths["config"].write_text(
+            '[pubsub]\nsubscription_name = "projects/proj/subscriptions/sdm-events"\n',
+            encoding="utf-8",
+        )
+        msg_time = datetime(2026, 5, 3, 0, 30, 0, tzinfo=UTC)
+        target_id = "enterprises/proj/devices/aaa"
+        with patch("nest_cli.cli.cam_events_cmd._build_subscriber") as mk:
+            subscriber = MagicMock()
+            pull_response = MagicMock()
+            pull_response.received_messages = [
+                _make_received_message(
+                    ack_id="ack-zzz",
+                    inner_payload=_make_motion_event(target_id=target_id, publish_time=msg_time),
+                    publish_time=msg_time,
+                ),
+            ]
+            subscriber.pull.return_value = pull_response
+            subscriber.acknowledge.side_effect = google.api_core.exceptions.ServiceUnavailable(
+                "ack endpoint down"
+            )
+            mk.return_value = subscriber
+            runner = CliRunner()
+            result = runner.invoke(cli_root, ["cam", "events", "--jsonl"])
+            # Drain itself succeeds (stdout JSONL still emits the event);
+            # ack failure is non-fatal but surfaced.
+            assert result.exit_code == 0
+            assert "warning: ack failed" in result.stderr
+            assert "ServiceUnavailable" in result.stderr
+
+
 class TestPullFailureExitCode:
     def test_pull_failure_exits_3_via_constant(self, fake_paths: dict[str, Path]) -> None:
         """Reviewer feedback (C1): exit 3 must come from EXIT_NETWORK_ERROR constant.
