@@ -1,12 +1,16 @@
-"""Click subgroup ``auth`` — OAuth credentials management for the cam side.
+"""Click subgroup ``auth`` — credentials management for cam and wifi families.
 
-Verbs (per SRD §5.5.1):
+Verbs (per SRD §5.5):
 
-- ``auth setup`` — interactive OAuth Desktop flow (FR-CRED-1, FR-CRED-2).
-- ``auth refresh`` — force-rotate the access token (FR-CRED-4).
-- ``auth revoke`` — invalidate at Google + scrub local file (FR-CRED-5).
-- ``auth status`` — read credentials and emit a redacted summary
-  (FR-CRED-10 cam-only subset).
+- ``auth setup``        — interactive OAuth Desktop flow (FR-CRED-1, FR-CRED-2).
+- ``auth refresh``      — force-rotate the access token (FR-CRED-4).
+- ``auth revoke``       — invalidate at Google + scrub local file (FR-CRED-5).
+- ``auth wifi-setup``   — derive Foyer master token from Android master token
+  (FR-CRED-7, FR-CRED-8). Requires ``--experimental-wifi``.
+- ``auth wifi-revoke``  — atomically scrub local wifi credentials and emit a
+  stderr reminder (FR-CRED-9). Requires ``--experimental-wifi``.
+- ``auth status``       — read both credential families and emit redacted
+  summary (FR-CRED-10 — array of two records: cam and wifi).
 
 Public surface
 --------------
@@ -35,6 +39,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+from datetime import UTC, datetime
 from pathlib import Path
 
 import click
@@ -48,13 +53,36 @@ from nest_cli.auth.credentials import (
     save_credentials,
 )
 from nest_cli.auth.oauth import run_oauth_flow
+from nest_cli.auth.wifi_credentials import (
+    WIFI_REVOCATION_REMINDER,
+    WifiCredentialError,
+    default_wifi_credentials_path,
+    load_wifi_credentials,
+    revoke_wifi_credentials,
+    save_wifi_credentials,
+)
+from nest_cli.auth.wifi_types import WifiCredentials
 from nest_cli.cli._shared import exit_on_structured_error
 from nest_cli.errors import (
     EXIT_AUTH_ERROR,
+    EXIT_CONFIG_ERROR,
     EXIT_USAGE_ERROR,
     StructuredError,
 )
 from nest_cli.output import OutputMode, add_output_options, emit
+
+# Environment variable that ``auth wifi-setup`` can read to receive an
+# Android master token without the operator having to pipe stdin or pass
+# a file. Documented in the verb's ``--help`` (FR-CRED-7).
+_ENV_MASTER_TOKEN = "GOOGLE_ANDROID_MASTER_TOKEN"
+
+# Hint pointing operators at the SRD section that explains the wifi
+# experimental-flag posture. Used by FR-WIFI-0 + the auth wifi-* verbs.
+_EXPERIMENTAL_WIFI_HINT = (
+    "Pass --experimental-wifi to acknowledge SRD §3.2.3 — the wifi side "
+    "wraps single-maintainer reverse-engineered libraries that break when "
+    "Google rotates Foyer endpoints. The flag's friction is the feature."
+)
 
 
 def _redact_client_id(client_id: str) -> str:
@@ -65,16 +93,32 @@ def _redact_client_id(client_id: str) -> str:
 
 
 def _credential_error_to_structured(exc: CredentialError) -> StructuredError:
-    """Convert a CredentialError into the SRD §11.3 StructuredError envelope.
+    """Convert a cam-side CredentialError into a StructuredError envelope.
 
-    The ``family`` discriminator does not belong in the §11.3 error
-    envelope (the closed enum + exit_code carry the disambiguation). It
-    surfaces in the ``auth status`` payload instead.
+    Cam-side errors do NOT carry the ``family`` discriminator on the
+    wire — the v0.1.0 / v0.2.x envelope shipped without it and we keep
+    that bit-identical for back-compat (documented deviation in
+    ARCHITECTURE.md).
     """
     return StructuredError(
         code=exc.exit_code,
         message=str(exc),
         hint=exc.hint,
+    )
+
+
+def _wifi_credential_error_to_structured(exc: WifiCredentialError) -> StructuredError:
+    """Convert a wifi-side WifiCredentialError into a StructuredError envelope.
+
+    Wifi-side errors DO carry ``family="wifi"`` on the SRD §11.3
+    envelope (per the audit's recommendation that the wifi family ships
+    SRD-aligned). Cam-side stays without ``family`` for back-compat.
+    """
+    return StructuredError(
+        code=exc.exit_code,
+        message=str(exc),
+        hint=exc.hint,
+        family="wifi",
     )
 
 
@@ -282,33 +326,50 @@ def _scrub_credentials(path: Path) -> None:
 @auth_group.command("status")
 @add_output_options
 def cmd_status(output_mode: OutputMode) -> None:
-    """Print the cam credentials status with secrets redacted.
+    """Print cam + wifi credentials status with secrets redacted.
 
-    Implements the cam-only subset of FR-CRED-10. Output is a JSON array
-    in ``--json`` mode (FR-CRED-10): v0.1.0 emits one element (cam family);
-    Phase 3 will add the wifi element to the same array.
+    Implements FR-CRED-10. Output is a JSON array in ``--json`` mode:
+    Phase 3 emits TWO elements (one per family — cam first, then wifi)
+    so operators have a single place to see "what is this CLI authorized
+    to do" (Decision 22).
 
-    Redaction (FR-CRED-10, §6.7): the refresh token, access token, and
-    OAuth client secret are NEVER emitted. ``oauth_client_id`` is
+    Each family record includes ``configured`` and ``credentials_path``
+    unconditionally. Configured records additionally carry the redacted
+    metadata for that family (cam: project id, redacted client id,
+    access-token expiry; wifi: account email, issued-at timestamp).
+    Unconfigured records carry a ``note`` distinguishing
+    "never set up" from "previously revoked".
+
+    Redaction (§6.7): refresh token, access token, OAuth client secret,
+    and Foyer master token are NEVER emitted. ``oauth_client_id`` is
     truncated to its trailing 8 characters.
+    """
+    cam_record = _build_cam_status_record(output_mode)
+    wifi_record = _build_wifi_status_record(output_mode)
+    emit([cam_record, wifi_record], output_mode)
+
+
+def _build_cam_status_record(output_mode: OutputMode) -> dict[str, object]:
+    """Compose the cam-side ``auth status`` record (mirrors v0.1.0/v0.2.x).
+
+    Branches:
+
+    1. File missing → ``configured=false``.
+    2. File present, ``{}`` stub (post-revoke) → ``configured=false`` +
+       ``note="credentials previously revoked"``.
+    3. File present, schema-valid → ``configured=true`` + redacted fields.
+
+    Schema-violation or chmod-violation paths surface via
+    ``exit_on_structured_error`` (operator sees exit 2 / 6).
     """
     creds_path = default_credentials_path()
     if not creds_path.exists():
-        emit(
-            [
-                {
-                    "family": "cam",
-                    "configured": False,
-                    "credentials_path": str(creds_path),
-                }
-            ],
-            output_mode,
-        )
-        return
+        return {
+            "family": "cam",
+            "configured": False,
+            "credentials_path": str(creds_path),
+        }
 
-    # Detect the post-revoke empty-stub state ahead of full validation so
-    # the operator gets a clean "not configured" message rather than a
-    # schema-violation crash.
     try:
         raw = creds_path.read_text(encoding="utf-8")
     except OSError as exc:
@@ -321,42 +382,349 @@ def cmd_status(output_mode: OutputMode) -> None:
         )
 
     if raw.strip() in ("{}", ""):
-        emit(
-            [
-                {
-                    "family": "cam",
-                    "configured": False,
-                    "credentials_path": str(creds_path),
-                    "note": "credentials previously revoked",
-                }
-            ],
-            output_mode,
-        )
-        return
+        return {
+            "family": "cam",
+            "configured": False,
+            "credentials_path": str(creds_path),
+            "note": "credentials previously revoked",
+        }
 
     try:
         creds = load_credentials(creds_path)
     except CredentialError as exc:
         exit_on_structured_error(_credential_error_to_structured(exc), output_mode)
 
-    # ``time_until_expiry_seconds`` is computed at emit time so the
-    # operator sees a fresh delta even if the file was written long ago.
-    from datetime import UTC, datetime
-
     now = datetime.now(UTC)
     seconds_until_expiry = int((creds.expires_at.astimezone(UTC) - now).total_seconds())
 
-    emit(
-        [
-            {
-                "family": "cam",
-                "configured": True,
-                "credentials_path": str(creds_path),
-                "google_cloud_project_id": creds.google_cloud_project_id,
-                "oauth_client_id_redacted": _redact_client_id(creds.oauth_client_id),
-                "expires_at": creds.expires_at,
-                "time_until_expiry_seconds": seconds_until_expiry,
-            }
-        ],
+    return {
+        "family": "cam",
+        "configured": True,
+        "credentials_path": str(creds_path),
+        "google_cloud_project_id": creds.google_cloud_project_id,
+        "oauth_client_id_redacted": _redact_client_id(creds.oauth_client_id),
+        "expires_at": creds.expires_at,
+        "time_until_expiry_seconds": seconds_until_expiry,
+    }
+
+
+def _build_wifi_status_record(output_mode: OutputMode) -> dict[str, object]:
+    """Compose the wifi-side ``auth status`` record (FR-CRED-10).
+
+    Same three-branch shape as the cam record. Configured records emit
+    ``google_account_email`` and ``issued_at`` (per AuthRecord §10.12);
+    the master token is NEVER surfaced (§6.7 redaction).
+    """
+    creds_path = default_wifi_credentials_path()
+    if not creds_path.exists():
+        return {
+            "family": "wifi",
+            "configured": False,
+            "credentials_path": str(creds_path),
+        }
+
+    try:
+        raw = creds_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        exit_on_structured_error(
+            StructuredError(
+                code=EXIT_AUTH_ERROR,
+                message=f"could not read {creds_path}: {exc}",
+                family="wifi",
+            ),
+            output_mode,
+        )
+
+    if raw.strip() in ("{}", ""):
+        return {
+            "family": "wifi",
+            "configured": False,
+            "credentials_path": str(creds_path),
+            "note": "credentials previously revoked",
+        }
+
+    try:
+        wifi_creds = load_wifi_credentials(creds_path)
+    except WifiCredentialError as exc:
+        exit_on_structured_error(_wifi_credential_error_to_structured(exc), output_mode)
+
+    return {
+        "family": "wifi",
+        "configured": True,
+        "credentials_path": str(creds_path),
+        "google_account_email": wifi_creds.google_account_email,
+        "issued_at": wifi_creds.issued_at,
+    }
+
+
+# ---------------------------------------------------------------------------
+# auth wifi-setup / auth wifi-revoke (Phase 3)
+# ---------------------------------------------------------------------------
+
+
+def _experimental_wifi_gate_or_exit(
+    experimental_wifi: bool, output_mode: OutputMode, *, verb: str
+) -> None:
+    """Exit 64 unless ``--experimental-wifi`` was passed (FR-WIFI-0).
+
+    SRD §11.2 also names exit 5 for this case, but FR-WIFI-0 is more
+    specific (says exit 64 with a hint). We follow the FR-WIFI-0
+    wording — the verb exists, the operator is opting into a known-
+    fragile surface, and 64 (usage error) reads more honestly than 5
+    (unsupported feature). The ARCHITECTURE.md notes this resolution.
+    """
+    if experimental_wifi:
+        return
+    exit_on_structured_error(
+        StructuredError(
+            code=EXIT_USAGE_ERROR,
+            message=(
+                f"`auth {verb}` requires --experimental-wifi (FR-WIFI-0). "
+                "The wifi side wraps reverse-engineered single-maintainer "
+                "libraries that break when Google rotates Foyer endpoints; "
+                "every invocation must explicitly opt in."
+            ),
+            hint=_EXPERIMENTAL_WIFI_HINT,
+            family="wifi",
+        ),
         output_mode,
     )
+
+
+@auth_group.command("wifi-setup")
+@click.option(
+    "--experimental-wifi",
+    is_flag=True,
+    default=False,
+    help="Required acknowledgement that the wifi side is experimental (FR-WIFI-0).",
+)
+@click.option(
+    "--master-token-file",
+    type=click.Path(exists=True, dir_okay=False, readable=True, path_type=Path),
+    default=None,
+    help=(
+        "Read the Android master token from a file (one line). Mutually "
+        "exclusive with stdin and the GOOGLE_ANDROID_MASTER_TOKEN env var "
+        "(precedence: file > env > stdin)."
+    ),
+)
+@click.option(
+    "--google-account-email",
+    type=str,
+    default=None,
+    help="Google account email that owns the Nest Wi-Fi mesh. Prompted if absent.",
+)
+@click.option(
+    "--overwrite",
+    is_flag=True,
+    default=False,
+    help="Overwrite an existing wifi credentials file. Required if one already exists.",
+)
+@add_output_options
+def cmd_wifi_setup(
+    experimental_wifi: bool,
+    master_token_file: Path | None,
+    google_account_email: str | None,
+    overwrite: bool,
+    output_mode: OutputMode,
+) -> None:
+    """Persist a Foyer master token to credentials-wifi.json (FR-CRED-7).
+
+    Bootstrap (out-of-band, per SRD §6.3): the operator first extracts
+    an Android master token from a paired Android device using a
+    community tool such as ``gpsoauth``, the Android ``Auth`` library
+    impersonation, or the ``aiohomekit-google-companion`` script. The
+    CLI does NOT perform this Android-side extraction.
+
+    Token sources, in precedence order:
+
+    1. ``--master-token-file <path>`` — read the token from a file.
+    2. ``GOOGLE_ANDROID_MASTER_TOKEN`` env var — read the token from env.
+    3. stdin — last resort; uses ``getpass`` to avoid shell history.
+
+    The persisted JSON shape is FR-CRED-8: ``{"version": 1, "type":
+    "foyer", "google_account_email": ..., "master_token": ...,
+    "issued_at": <rfc3339>}``. File mode is chmod 0600.
+
+    SRD §6.4 reminds operators that Foyer has no programmatic revoke
+    endpoint; the only way to invalidate this token at Google's end is
+    to log out the paired Android session at
+    ``myaccount.google.com/permissions``. ``auth wifi-revoke`` only
+    scrubs the local file.
+    """
+    _experimental_wifi_gate_or_exit(experimental_wifi, output_mode, verb="wifi-setup")
+
+    creds_path = default_wifi_credentials_path()
+    if creds_path.exists() and not overwrite:
+        # FR-CRED-2 mirror: refuse to clobber. Empty stub from a prior
+        # revoke also counts as "exists" — operator must pass --overwrite
+        # to recreate the file with fresh credentials.
+        raw = creds_path.read_text(encoding="utf-8").strip()
+        if raw not in ("", "{}"):
+            exit_on_structured_error(
+                StructuredError(
+                    code=EXIT_AUTH_ERROR,
+                    message=f"wifi credentials already exist at {creds_path}",
+                    hint=(
+                        "Pass --overwrite to replace them, or run "
+                        "`nest-cli auth wifi-revoke --experimental-wifi` first."
+                    ),
+                    family="wifi",
+                ),
+                output_mode,
+            )
+
+    if google_account_email is None:
+        google_account_email = click.prompt("Google account email", type=str)
+
+    master_token = _resolve_master_token(master_token_file, output_mode)
+
+    creds = WifiCredentials(
+        version=1,
+        type="foyer",
+        google_account_email=google_account_email,
+        master_token=master_token,
+        issued_at=datetime.now(UTC),
+    )
+
+    try:
+        save_wifi_credentials(creds_path, creds)
+    except WifiCredentialError as exc:
+        exit_on_structured_error(_wifi_credential_error_to_structured(exc), output_mode)
+
+    payload = {
+        "status": "ok",
+        "credentials_path": str(creds_path),
+        "google_account_email": creds.google_account_email,
+        "issued_at": creds.issued_at,
+    }
+    emit(payload, output_mode)
+
+
+def _resolve_master_token(master_token_file: Path | None, output_mode: OutputMode) -> str:
+    """Resolve a master token from file → env → stdin in precedence order.
+
+    Returns the trimmed token string. Empty / whitespace-only sources
+    surface as exit 6 (config_error, family=wifi) — the operator passed
+    a real source but it was empty, which is a misconfigured input not
+    an auth failure. The SRD-aligned way to say "I don't have a
+    credential" is to omit the source entirely (then we exit 2 from
+    load-time, not setup-time).
+    """
+    if master_token_file is not None:
+        text = master_token_file.read_text(encoding="utf-8").strip()
+        if not text:
+            exit_on_structured_error(
+                StructuredError(
+                    code=EXIT_CONFIG_ERROR,
+                    message=f"--master-token-file at {master_token_file} is empty",
+                    hint="Re-extract the Android master token and re-write the file.",
+                    family="wifi",
+                ),
+                output_mode,
+            )
+        return text
+
+    env_value = os.environ.get(_ENV_MASTER_TOKEN, "").strip()
+    if env_value:
+        return env_value
+
+    # stdin fallback. ``click.prompt(hide_input=True)`` runs ``getpass``
+    # under the hood, so the token doesn't echo and doesn't end up in
+    # shell history. CliRunner.invoke(input=...) populates this path
+    # for tests.
+    token = click.prompt(
+        "Android master token (hidden)",
+        type=str,
+        hide_input=True,
+        default="",
+        show_default=False,
+    )
+    token = (token or "").strip()
+    if not token:
+        exit_on_structured_error(
+            StructuredError(
+                code=EXIT_CONFIG_ERROR,
+                message="no master token supplied (file, env, or stdin all empty)",
+                hint=(
+                    f"Pipe the token into stdin, set the {_ENV_MASTER_TOKEN} env "
+                    "var, or pass --master-token-file."
+                ),
+                family="wifi",
+            ),
+            output_mode,
+        )
+    return token
+
+
+@auth_group.command("wifi-revoke")
+@click.option(
+    "--experimental-wifi",
+    is_flag=True,
+    default=False,
+    help="Required acknowledgement that the wifi side is experimental (FR-WIFI-0).",
+)
+@click.option(
+    "--yes",
+    is_flag=True,
+    default=False,
+    help="Skip the interactive confirmation prompt (required in non-tty contexts).",
+)
+@add_output_options
+def cmd_wifi_revoke(
+    experimental_wifi: bool,
+    yes: bool,
+    output_mode: OutputMode,
+) -> None:
+    """Atomically scrub the wifi credentials file + remind operator (FR-CRED-9).
+
+    Foyer has NO programmatic revoke endpoint. This verb only scrubs the
+    local file (atomic empty-stub replacement) and emits a stderr
+    reminder that the only true revocation path is the Google account
+    security panel (``myaccount.google.com/permissions``) or a Google
+    account password change (SRD §6.4). Operators are expected to weigh
+    that blast radius before invoking either.
+    """
+    _experimental_wifi_gate_or_exit(experimental_wifi, output_mode, verb="wifi-revoke")
+
+    creds_path = default_wifi_credentials_path()
+    if not creds_path.exists():
+        # Nothing to scrub. Exit 0 — idempotency is more useful than
+        # erroring out on a no-op.
+        click.echo(f"No wifi credentials at {creds_path}; nothing to revoke.", err=True)
+        click.echo(WIFI_REVOCATION_REMINDER, err=True)
+        emit({"status": "noop", "credentials_path": str(creds_path)}, output_mode)
+        return
+
+    if not yes:
+        try:
+            confirmed = click.confirm(
+                "Scrub local wifi credentials? (Foyer has no programmatic revoke; "
+                "this only removes the local file.)",
+                default=False,
+            )
+        except click.exceptions.Abort:
+            exit_on_structured_error(
+                StructuredError(
+                    code=EXIT_USAGE_ERROR,
+                    message="auth wifi-revoke requires --yes when no stdin is attached",
+                    family="wifi",
+                ),
+                output_mode,
+            )
+        if not confirmed:
+            click.echo("Aborted.", err=True)
+            return
+
+    try:
+        revoke_wifi_credentials(creds_path)
+    except WifiCredentialError as exc:
+        exit_on_structured_error(_wifi_credential_error_to_structured(exc), output_mode)
+
+    # FR-CRED-9: emit the stderr reminder. The reminder is operator
+    # guidance, not a structured-error path — it lands as a plain stderr
+    # line so it's visible in any output mode.
+    click.echo(WIFI_REVOCATION_REMINDER, err=True)
+
+    payload = {"status": "revoked", "credentials_path": str(creds_path)}
+    emit(payload, output_mode)

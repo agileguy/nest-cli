@@ -262,8 +262,10 @@ def test_status_json_redacts_client_id(
 ) -> None:
     """JSON output emits redacted client_id; never the secret/refresh/access tokens.
 
-    FR-CRED-10: ``auth status --json`` emits a JSON array. v0.1.0 holds one
-    element (cam family); Phase 3 will append a wifi element.
+    FR-CRED-10: ``auth status --json`` emits a JSON array of two records
+    (one per family) so the operator has a single place to see "what is
+    this CLI authorized to do" (Decision 22). The wifi entry reports
+    ``configured=false`` when no wifi credentials file exists.
     """
     save_credentials(
         isolated_xdg,
@@ -274,12 +276,13 @@ def test_status_json_redacts_client_id(
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
     assert isinstance(payload, list), "FR-CRED-10: --json output must be an array"
-    assert len(payload) == 1
-    record = payload[0]
-    assert record["family"] == "cam"
-    assert record["configured"] is True
+    assert len(payload) == 2
+    cam_record = next(r for r in payload if r["family"] == "cam")
+    wifi_record = next(r for r in payload if r["family"] == "wifi")
+    assert cam_record["configured"] is True
+    assert wifi_record["configured"] is False  # never set up in this test
     # Client id ends in the trailing 8 chars of the input.
-    assert record["oauth_client_id_redacted"].endswith(
+    assert cam_record["oauth_client_id_redacted"].endswith(
         "abcdefgh12345678.apps.googleusercontent.com"[-8:]
     )
     # Critical: never leak the real secrets in the rendered output.
@@ -310,10 +313,11 @@ def test_status_no_credentials(isolated_xdg: Path) -> None:
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
     assert isinstance(payload, list)
-    assert len(payload) == 1
-    record = payload[0]
-    assert record["family"] == "cam"
-    assert record["configured"] is False
+    assert len(payload) == 2
+    cam_record = next(r for r in payload if r["family"] == "cam")
+    wifi_record = next(r for r in payload if r["family"] == "wifi")
+    assert cam_record["configured"] is False
+    assert wifi_record["configured"] is False
 
 
 def test_status_after_revoke_reads_empty_stub(
@@ -328,26 +332,24 @@ def test_status_after_revoke_reads_empty_stub(
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
     assert isinstance(payload, list)
-    record = payload[0]
-    assert record["configured"] is False
-    assert "revoked" in record.get("note", "")
+    cam_record = next(r for r in payload if r["family"] == "cam")
+    assert cam_record["configured"] is False
+    assert "revoked" in cam_record.get("note", "")
 
 
 def test_status_jsonl_emits_one_object_per_line(isolated_xdg: Path) -> None:
     """``--jsonl`` mode emits the array elements one per line.
 
-    Newly enabled by the migration to ``add_output_options``; the previous
-    local Click choice rejected this flag entirely.
+    Phase 3 emits two records (cam + wifi). Each lands on its own line.
     """
     save_credentials(isolated_xdg, _make_creds())
     runner = CliRunner()
     result = runner.invoke(auth_group, ["status", "--jsonl"])
     assert result.exit_code == 0, result.output
     lines = [line for line in result.output.strip().splitlines() if line]
-    assert len(lines) == 1
-    record = json.loads(lines[0])
-    assert record["family"] == "cam"
-    assert record["configured"] is True
+    assert len(lines) == 2
+    families = {json.loads(line)["family"] for line in lines}
+    assert families == {"cam", "wifi"}
 
 
 def test_status_quiet_suppresses_stdout(isolated_xdg: Path) -> None:
