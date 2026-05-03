@@ -389,6 +389,14 @@ def _wifi_action_fanout(
     ``StructuredError`` on failure. Each per-target call produces an
     FR-9a envelope; the helper computes the FR-8a aggregate exit code
     and ``sys.exit``s with it.
+
+    Shared client across workers (PR #9 review fix #2): the
+    ``FoyerClient`` is constructed ONCE here, and the ``_verb_callable``
+    closure captures it so every fan-out worker thread reuses the same
+    instance. This makes the per-instance OnHub token cache + lock and
+    the resolved-default-group cache do their job — without sharing,
+    each worker would mint its own OnHub token and resolve its own
+    default group, wasting refresh-token quota and gRPC round-trips.
     """
     try:
         config = load_config(default_config_path())
@@ -400,6 +408,9 @@ def _wifi_action_fanout(
         exit_on_structured_error(exc, output_mode)
 
     creds = _load_wifi_creds_or_exit(output_mode)
+    # Construct the FoyerClient ONCE; the closure below captures it so
+    # all fan-out worker threads share the OnHub token cache + lock and
+    # the resolved-default-group cache (PR #9 review fix #2).
     foyer = FoyerClient(creds)
 
     def _verb_callable(rt: ResolvedTarget) -> FanOutResult:

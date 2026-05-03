@@ -205,6 +205,13 @@ class TestOnHubTokenRefresh:
     def test_expired_cache_forces_remint(
         self, v3_client: FoyerClient, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        """With both step1 and OnHub caches expired, the full chain reruns.
+
+        After PR #9 review fix #2 (Step 1 token caching), expiring only
+        the OnHub token re-runs Step 2 alone. Test the both-expired path
+        here; the Step-2-only path is exercised by
+        ``test_step2_failure_preserves_step1_cache``.
+        """
         session = MagicMock()
         session.post.side_effect = [
             _mock_response(200, {"access_token": "ya29.web1"}),
@@ -215,8 +222,9 @@ class TestOnHubTokenRefresh:
         monkeypatch.setattr(v3_client, "_get_rest_session", lambda: session)
 
         first = v3_client._ensure_onhub_token()
-        # Force expiry
+        # Force expiry on BOTH caches so Step 1 + Step 2 both re-run.
         v3_client._onhub_token_expiry = time.time() - 1.0
+        v3_client._step1_web_token_expiry = time.time() - 1.0
         second = v3_client._ensure_onhub_token()
 
         assert first == "onhub-1"
@@ -258,6 +266,136 @@ class TestOnHubTokenRefresh:
         with pytest.raises(StructuredError) as exc_info:
             v3_client._refresh_onhub_access_token()
         assert exc_info.value.code == EXIT_AUTH_ERROR
+
+    # ------------------------------------------------------------------
+    # PR #9 review fix #2 — Step 1 web-token caching
+    # ------------------------------------------------------------------
+
+    def test_step1_token_cached_after_success(
+        self, v3_client: FoyerClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """First call mints both steps; second call within window mints only Step 2.
+
+        Force the OnHub token to expire so the second call re-enters the
+        refresh path, but leave the Step 1 cache intact. The second call
+        should skip Step 1 entirely and only POST to issuetoken.
+        """
+        session = MagicMock()
+        session.post.side_effect = [
+            _mock_response(200, {"access_token": "ya29.web", "expires_in": 3600}),
+            _mock_response(200, {"token": "onhub-1", "expiresIn": 3600}),
+            # Second call: only Step 2 fires.
+            _mock_response(200, {"token": "onhub-2", "expiresIn": 3600}),
+        ]
+        monkeypatch.setattr(v3_client, "_get_rest_session", lambda: session)
+
+        first = v3_client._ensure_onhub_token()
+        # Expire OnHub but NOT Step 1.
+        v3_client._onhub_token_expiry = time.time() - 1.0
+        second = v3_client._ensure_onhub_token()
+
+        assert first == "onhub-1"
+        assert second == "onhub-2"
+        # Three POSTs total: Step 1 + Step 2 (first call), Step 2 (second).
+        assert session.post.call_count == 3
+        # Confirm Step 1 cache is populated.
+        assert v3_client._step1_web_token == "ya29.web"
+
+    def test_step2_failure_preserves_step1_cache(
+        self, v3_client: FoyerClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Step 1 succeeds, Step 2 503s; retry only re-runs Step 2.
+
+        The whole point of the Step 1 cache: don't waste refresh-token
+        quota when Step 2 is what's flaky.
+        """
+        session = MagicMock()
+        session.post.side_effect = [
+            _mock_response(200, {"access_token": "ya29.web", "expires_in": 3600}),
+            _mock_response(503, text="upstream busy"),
+            # Retry — only Step 2 should fire.
+            _mock_response(200, {"token": "onhub-after-retry", "expiresIn": 3600}),
+        ]
+        monkeypatch.setattr(v3_client, "_get_rest_session", lambda: session)
+
+        with pytest.raises(StructuredError) as exc_info:
+            v3_client._refresh_onhub_access_token()
+        assert exc_info.value.code == EXIT_AUTH_ERROR
+        # Step 1 cache was populated before Step 2 fired.
+        assert v3_client._step1_web_token == "ya29.web"
+
+        # Now the retry — Step 1 should be skipped.
+        token = v3_client._refresh_onhub_access_token()
+        assert token == "onhub-after-retry"
+        # Three POSTs total: Step 1 + Step 2-fail (first call), Step 2-success (retry).
+        assert session.post.call_count == 3
+
+    def test_step1_cache_expires_with_skew(
+        self, v3_client: FoyerClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Once the Step 1 cache expires, both steps re-run on the next call."""
+        session = MagicMock()
+        session.post.side_effect = [
+            _mock_response(200, {"access_token": "ya29.web1", "expires_in": 3600}),
+            _mock_response(200, {"token": "onhub-1", "expiresIn": 3600}),
+            _mock_response(200, {"access_token": "ya29.web2", "expires_in": 3600}),
+            _mock_response(200, {"token": "onhub-2", "expiresIn": 3600}),
+        ]
+        monkeypatch.setattr(v3_client, "_get_rest_session", lambda: session)
+
+        first = v3_client._ensure_onhub_token()
+        # Fast-forward time past BOTH the OnHub and Step 1 expiries.
+        v3_client._onhub_token_expiry = time.time() - 1.0
+        v3_client._step1_web_token_expiry = time.time() - 1.0
+        second = v3_client._ensure_onhub_token()
+
+        assert first == "onhub-1"
+        assert second == "onhub-2"
+        # Four POSTs total: full chain on both calls.
+        assert session.post.call_count == 4
+
+    def test_concurrent_refresh_serializes(
+        self, v3_client: FoyerClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Two threads racing on cold-cache refresh mint exactly once.
+
+        ``threading.Barrier(2)`` releases both threads at the same instant.
+        The OnHub lock + double-check-inside-lock pattern guarantees only
+        one of them runs the OAuth chain; the other reads the cache. So
+        ``session.post.call_count`` must equal 2 (Step 1 + Step 2), NOT 4.
+        """
+        import threading
+
+        barrier = threading.Barrier(2)
+
+        def _post(*args: Any, **kwargs: Any) -> Any:
+            # Make all responses succeed; we only care about the count.
+            url = args[0] if args else kwargs.get("url", "")
+            if "issuetoken" in url:
+                return _mock_response(200, {"token": "onhub-shared", "expiresIn": 3600})
+            return _mock_response(200, {"access_token": "ya29.shared", "expires_in": 3600})
+
+        session = MagicMock()
+        session.post.side_effect = _post
+        monkeypatch.setattr(v3_client, "_get_rest_session", lambda: session)
+
+        results: list[str] = []
+
+        def _worker() -> None:
+            barrier.wait(timeout=2.0)
+            results.append(v3_client._ensure_onhub_token())
+
+        t1 = threading.Thread(target=_worker)
+        t2 = threading.Thread(target=_worker)
+        t1.start()
+        t2.start()
+        t1.join(timeout=5.0)
+        t2.join(timeout=5.0)
+
+        assert results == ["onhub-shared", "onhub-shared"]
+        # Exactly 2 POSTs: Step 1 + Step 2, served once. The lock + cache
+        # check inside the lock prevents the second thread from re-running.
+        assert session.post.call_count == 2
 
 
 # ---------------------------------------------------------------------------

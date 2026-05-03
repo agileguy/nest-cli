@@ -798,9 +798,12 @@ class FoyerClient:
         djtimca/googlewifi-api both use; the gRPC HomeGraph token cannot
         be substituted (different scopes).
 
-        Caches with the same 60-second skew window the gRPC path uses.
-        Serialized via ``_onhub_token_lock`` so two action verbs racing
-        don't both pay the round-trip.
+        Caches each step's token separately with the same 60-second skew
+        window. The Step 1 web token is cached so a Step 2 failure
+        (4xx/5xx/timeout) doesn't force the next attempt to re-burn
+        refresh-token quota by re-running Step 1. Serialized via
+        ``_onhub_token_lock`` so two action verbs racing don't both pay
+        the round-trips.
         """
         with self._onhub_token_lock:
             # Re-check inside the lock — another thread may have just
@@ -824,52 +827,72 @@ class FoyerClient:
             session = self._get_rest_session()
 
             # --- Step 1: refresh-token → web access token ----------------
-            try:
-                step1 = session.post(
-                    ONHUB_OAUTH2_TOKEN_URL,
-                    data={
-                        "client_id": ONHUB_WEB_CLIENT_ID,
-                        "grant_type": "refresh_token",
-                        "refresh_token": self._creds.refresh_token,
-                    },
-                    timeout=20,
-                )
-            except (requests.ConnectionError, requests.Timeout, OSError) as exc:
-                raise StructuredError(
-                    code=EXIT_NETWORK_ERROR,
-                    message=(
-                        f"network error contacting oauth2/v4/token: {type(exc).__name__}: {exc}"
-                    ),
-                    hint="Check your internet connection and retry.",
-                    family=WIFI_FAMILY,
-                ) from exc
-            if step1.status_code >= 400:
-                raise StructuredError(
-                    code=EXIT_AUTH_ERROR,
-                    message=(
-                        "oauth2/v4/token rejected the refresh token "
-                        f"(HTTP {step1.status_code}): {step1.text[:200]}"
-                    ),
-                    hint=(
-                        "The OAuth refresh token is invalid, expired, or "
-                        "revoked. Re-run `nest-cli auth wifi-refresh-bootstrap "
-                        "--experimental-wifi --refresh-token <1//...>` with a "
-                        "freshly minted token."
-                    ),
-                    family=WIFI_FAMILY,
-                )
-            try:
-                web_token = str(step1.json()["access_token"])
-            except (ValueError, KeyError) as exc:
-                raise StructuredError(
-                    code=EXIT_AUTH_ERROR,
-                    message=(
-                        f"oauth2/v4/token response missing access_token (body={step1.text[:200]})"
-                    ),
-                    family=WIFI_FAMILY,
-                ) from exc
+            # Skip Step 1 if we already have a non-expired web token cached
+            # from a previous call where Step 2 failed (or where Step 2
+            # succeeded and the OnHub token has since expired but the web
+            # token hasn't). This is the PR #9 review fix #2: don't waste
+            # refresh-token quota re-running Step 1 when Step 2 is what
+            # failed.
+            if self._step1_web_token is not None and time.time() < self._step1_web_token_expiry:
+                web_token = self._step1_web_token
+            else:
+                try:
+                    step1 = session.post(
+                        ONHUB_OAUTH2_TOKEN_URL,
+                        data={
+                            "client_id": ONHUB_WEB_CLIENT_ID,
+                            "grant_type": "refresh_token",
+                            "refresh_token": self._creds.refresh_token,
+                        },
+                        timeout=20,
+                    )
+                except (requests.ConnectionError, requests.Timeout, OSError) as exc:
+                    raise StructuredError(
+                        code=EXIT_NETWORK_ERROR,
+                        message=(
+                            f"network error contacting oauth2/v4/token: {type(exc).__name__}: {exc}"
+                        ),
+                        hint="Check your internet connection and retry.",
+                        family=WIFI_FAMILY,
+                    ) from exc
+                if step1.status_code >= 400:
+                    raise StructuredError(
+                        code=EXIT_AUTH_ERROR,
+                        message=(
+                            "oauth2/v4/token rejected the refresh token "
+                            f"(HTTP {step1.status_code}): {step1.text[:200]}"
+                        ),
+                        hint=(
+                            "The OAuth refresh token is invalid, expired, or "
+                            "revoked. Re-run `nest-cli auth wifi-refresh-bootstrap "
+                            "--experimental-wifi --refresh-token <1//...>` with a "
+                            "freshly minted token."
+                        ),
+                        family=WIFI_FAMILY,
+                    )
+                try:
+                    step1_body = step1.json()
+                    web_token = str(step1_body["access_token"])
+                    step1_expires_in = int(step1_body.get("expires_in", ACCESS_TOKEN_DURATION_S))
+                except (ValueError, KeyError) as exc:
+                    raise StructuredError(
+                        code=EXIT_AUTH_ERROR,
+                        message=(
+                            "oauth2/v4/token response missing access_token "
+                            f"(body={step1.text[:200]})"
+                        ),
+                        family=WIFI_FAMILY,
+                    ) from exc
+
+                # Cache the Step 1 token with the same skew window so
+                # subsequent Step 2 retries don't re-burn refresh-token quota.
+                self._step1_web_token = web_token
+                self._step1_web_token_expiry = time.time() + step1_expires_in - ACCESS_TOKEN_SKEW_S
 
             # --- Step 2: web token → OnHub-scoped token ------------------
+            # NOTE: any failure here (4xx/5xx/timeout) leaves
+            # ``_step1_web_token`` cached so the next call re-runs Step 2
+            # only, conserving refresh-token quota.
             try:
                 step2 = session.post(
                     ONHUB_ISSUETOKEN_URL,
