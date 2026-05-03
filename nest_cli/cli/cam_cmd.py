@@ -267,6 +267,48 @@ def cam_battery(target: str, output_mode: OutputMode) -> None:
     emit(payload, output_mode)
 
 
+@cam_group.command("signal")
+@click.argument("target")
+@add_output_options
+def cam_signal(target: str, output_mode: OutputMode) -> None:
+    """Emit signal-strength (RSSI dBm) and last-online timestamp.
+
+    Implements FR-CAM-27. Cameras with a non-null ``signal_strength``
+    emit ``{target, target_id, signal_strength_dbm, last_online_ts?}``
+    at exit 0. Cameras whose SDM response does not expose RSSI exit 5.
+
+    SDM does not currently expose a documented trait for signal strength;
+    this verb gates on the parsed ``Camera.signal_strength`` field. The
+    last-online timestamp is sourced from ``Camera.last_event_ts`` when
+    present, since the camera is provably online at the moment its last
+    event was captured.
+    """
+    camera = _fetch_camera(target, output_mode)
+    if camera.signal_strength is None:
+        err = StructuredError(
+            code=EXIT_UNSUPPORTED_FEATURE,
+            message=(
+                f"camera {target!r} does not expose a signal-strength "
+                "surface (no signal_strength in SDM response)"
+            ),
+            hint=(
+                "SDM only surfaces signal_strength for hardware that exposes it. "
+                "Run `nest-cli cam info <target>` to inspect the raw record."
+            ),
+            details={"target": target, "has_signal_strength": False},
+        )
+        exit_on_structured_error(err, output_mode)
+
+    payload: dict[str, Any] = {
+        "target": target,
+        "target_id": camera.target_id,
+        "signal_strength_dbm": camera.signal_strength,
+    }
+    if camera.last_event_ts is not None:
+        payload["last_online_ts"] = camera.last_event_ts
+    emit(payload, output_mode)
+
+
 # ---------------------------------------------------------------------------
 # Internals
 # ---------------------------------------------------------------------------
