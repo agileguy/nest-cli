@@ -1,0 +1,34 @@
+{
+  "group-home-001": {
+    "ap-master-living-room": {
+      "id": "ap-master-living-room",
+      "isMaster": true,
+      "displayName": "Living Room",
+      "model": "AC-1304",
+      "firmwareVersion": "13371.95.84",
+      "status": {"apState": "ONLINE", "uptimeSeconds": 86400}
+    },
+    "ap-sat-office": {
+      "id": "ap-sat-office",
+      "isMaster": false,
+      "displayName": "Office",
+      "model": "AC-1304",
+      "firmwareVersion": "13371.95.84",
+      "status": {
+        "apState": "ONLINE",
+        "uptimeSeconds": 43200,
+        "signalStrengthDbm": -52
+      }
+    }
+  },
+  "group-cottage-002": {
+    "ap-master-cottage": {
+      "id": "ap-master-cottage",
+      "isMaster": true,
+      "displayName": "Cottage",
+      "model": "AC-1304",
+      "firmwareVersion": "13371.95.84",
+      "status": {"apState": "ONLINE", "uptimeSeconds": 1800}
+    }
+  }
+}
