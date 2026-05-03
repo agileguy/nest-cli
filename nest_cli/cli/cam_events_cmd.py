@@ -224,16 +224,18 @@ def _exit_subscription_not_configured(output_mode: OutputMode) -> None:
 def _decode_message_data(data: bytes | None) -> dict[str, Any] | None:
     """Decode a Pub/Sub message payload (bytes JSON) to a dict.
 
-    Returns ``None`` on decode failure — caller skips the message.
+    Returns ``None`` on decode failure or when the top-level JSON value
+    is not an object — caller skips the message either way.
     """
     if not data:
         return None
     try:
         import json
 
-        return json.loads(data.decode("utf-8"))
+        parsed = json.loads(data.decode("utf-8"))
     except (UnicodeDecodeError, ValueError):
         return None
+    return parsed if isinstance(parsed, dict) else None
 
 
 def _build_subscriber() -> Any:

@@ -12,6 +12,7 @@ are CLI-internals, not intended for external import.
 from __future__ import annotations
 
 import sys
+from typing import NoReturn
 
 from nest_cli.auth.credentials import (
     CredentialError,
@@ -50,7 +51,7 @@ def load_credentials_or_exit(output_mode: OutputMode) -> CamCredentials:
         sys.exit(err.code)
 
 
-def exit_on_structured_error(exc: StructuredError, output_mode: OutputMode) -> None:
+def exit_on_structured_error(exc: StructuredError, output_mode: OutputMode) -> NoReturn:
     """Emit a structured error to stderr and exit with the mapped code.
 
     The verb modules call this in ``except StructuredError`` handlers to

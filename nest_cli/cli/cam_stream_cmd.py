@@ -35,6 +35,7 @@ Exit codes (SRD §11.1):
 from __future__ import annotations
 
 import sys
+from typing import NoReturn
 
 import click
 
@@ -279,7 +280,7 @@ def _exit_missing_required(
     flag: str,
     hint: str,
     output_mode: OutputMode,
-) -> None:
+) -> NoReturn:
     """Emit a structured error for a missing-required-arg condition (exit 64)."""
     exit_on_structured_error(
         StructuredError(
