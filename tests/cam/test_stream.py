@@ -262,3 +262,82 @@ class TestCamStreamQuiet:
         result = runner.invoke(cli_root, ["cam", "stream", _RTSP_TARGET, "--quiet"])
         assert result.exit_code == 0
         assert result.output == ""
+
+
+# ---------------------------------------------------------------------------
+# C2 reviewer feedback: protocol-detection failure modes
+# ---------------------------------------------------------------------------
+
+
+def _bare_cam_payload(name: str) -> dict:
+    """A camera with NO CameraLiveStream trait at all."""
+    return {
+        "name": name,
+        "type": "sdm.devices.types.CAMERA",
+        "traits": {
+            "sdm.devices.traits.Info": {"customName": "bare"},
+        },
+    }
+
+
+def _live_stream_unknown_protos_payload(name: str) -> dict:
+    """A camera whose CameraLiveStream trait carries protocols we don't grok."""
+    return {
+        "name": name,
+        "type": "sdm.devices.types.CAMERA",
+        "traits": {
+            "sdm.devices.traits.Info": {"customName": "weird"},
+            "sdm.devices.traits.CameraLiveStream": {
+                "videoCodecs": ["H264"],
+                "audioCodecs": ["AAC"],
+                "supportedProtocols": ["FUTURE_PROTO"],
+            },
+        },
+    }
+
+
+class TestCamStreamProtocolDetectFailures:
+    """Reviewer feedback (C2): trait-absent vs trait-malformed.
+
+    Prior behaviour silently defaulted to ``webrtc`` when the trait was
+    missing OR when ``supportedProtocols`` was empty/unrecognized, and
+    then exited 64 with a misleading "missing --offer-sdp" hint. The
+    fix distinguishes the two cases:
+
+    - trait absent → exit 5 (UNSUPPORTED_FEATURE)
+    - trait present but protocols unrecognized → exit 1 (DEVICE_ERROR)
+    """
+
+    @responses.activate
+    def test_no_camera_live_stream_trait_exits_5(self, fake_paths: dict[str, Path]) -> None:
+        target = "enterprises/proj/devices/bare-cam"
+        responses.add(
+            responses.GET,
+            f"{SDM_API_ROOT}/{target}",
+            json=_bare_cam_payload(target),
+            status=200,
+        )
+        runner = CliRunner()
+        result = runner.invoke(cli_root, ["cam", "stream", target, "--json"])
+        assert result.exit_code == 5
+        envelope = json.loads(result.stderr)
+        assert envelope["error"] == "unsupported_feature"
+        assert "CameraLiveStream" in envelope["message"]
+
+    @responses.activate
+    def test_unrecognized_supported_protocols_exits_1(self, fake_paths: dict[str, Path]) -> None:
+        target = "enterprises/proj/devices/weird-cam"
+        responses.add(
+            responses.GET,
+            f"{SDM_API_ROOT}/{target}",
+            json=_live_stream_unknown_protos_payload(target),
+            status=200,
+        )
+        runner = CliRunner()
+        result = runner.invoke(cli_root, ["cam", "stream", target, "--json"])
+        assert result.exit_code == 1
+        envelope = json.loads(result.stderr)
+        assert envelope["error"] == "device_error"
+        # Trait list surfaced in details for the bug report.
+        traits = envelope["details"]["traits"]
+        assert "sdm.devices.traits.CameraLiveStream" in traits

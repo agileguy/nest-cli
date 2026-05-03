@@ -44,7 +44,12 @@ from nest_cli.cli._shared import (
     load_credentials_or_exit,
 )
 from nest_cli.config import default_config_path, load_config, resolve_alias
-from nest_cli.errors import EXIT_USAGE_ERROR, StructuredError
+from nest_cli.errors import (
+    EXIT_DEVICE_ERROR,
+    EXIT_UNSUPPORTED_FEATURE,
+    EXIT_USAGE_ERROR,
+    StructuredError,
+)
 from nest_cli.output import OutputMode, add_output_options, emit
 from nest_cli.sdm.client import SdmClient
 from nest_cli.sdm.stream_types import Stream
@@ -91,12 +96,12 @@ def cam_stream(
     (ffmpeg/mpv for RTSP; a WebRTC-capable peer for WebRTC).
     """
     camera, client = _fetch_camera(target, output_mode)
-    protocol = _detect_stream_protocol(camera)
 
     # FR-CAM-7 does not forbid --offer-sdp on RTSP cameras; we ignore
     # it silently rather than rejecting the operator's harmless mistake.
 
     try:
+        protocol = _detect_stream_protocol(camera)
         if protocol == "rtsp":
             rtsp = client.generate_rtsp_stream(camera.target_id)
             stream = Stream.from_rtsp_result(target=target, result=rtsp)
@@ -223,9 +228,18 @@ def _detect_stream_protocol(camera: Camera) -> str:
     Reads the camera's ``CameraLiveStream`` trait's ``supportedProtocols``
     array. If both are listed, prefer RTSP (operator can override by
     invoking against a target that explicitly negotiates WebRTC — out
-    of scope for v0.2.0). If neither is listed (the SDM trait shape
-    changed), default to WebRTC and let the request fail at the SDM
-    layer with a structured error.
+    of scope for v0.2.0).
+
+    Reviewer feedback (C2): distinguish "trait absent" from "trait
+    present but malformed" instead of silently defaulting to WebRTC and
+    failing later with a misleading exit-64 hint asking for ``--offer-sdp``.
+
+    - Trait absent → exit 5 (UNSUPPORTED_FEATURE) — this camera cannot
+      stream at all from the CLI's perspective; the operator should
+      consult ``cam capabilities``.
+    - Trait present but ``supportedProtocols`` neither RTSP nor WEB_RTC
+      → exit 1 (DEVICE_ERROR) — the SDM payload shape is unrecognized;
+      surface the trait list in details for the bug report.
     """
     for trait in camera.traits:
         if trait.name == _TRAIT_LIVE_STREAM:
@@ -236,9 +250,20 @@ def _detect_stream_protocol(camera: Camera) -> str:
                     return "rtsp"
                 if _PROTO_WEBRTC in protos:
                     return "webrtc"
-    # Defensive default — if the trait shape ever loses the field we
-    # still emit a request and let SDM tell us no.
-    return "webrtc"
+            raise StructuredError(
+                code=EXIT_DEVICE_ERROR,
+                message=(
+                    f"camera trait shape unrecognized; cannot determine "
+                    f"stream protocol for {camera.target_id}"
+                ),
+                hint="Run `nest-cli cam capabilities <target>` to inspect raw traits.",
+                details={"traits": [t.name for t in camera.traits]},
+            )
+    raise StructuredError(
+        code=EXIT_UNSUPPORTED_FEATURE,
+        message=f"camera {camera.target_id} has no CameraLiveStream trait",
+        hint="Use `nest-cli cam capabilities <target>` to confirm the trait set.",
+    )
 
 
 def _read_offer_sdp(source: str | None, output_mode: OutputMode) -> str:
