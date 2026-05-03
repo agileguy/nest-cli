@@ -126,7 +126,13 @@ Error envelopes are uniform across all verbs:
 
 The `error` field is the closed enum string from SRD §11.3 (one of `device_error`, `auth_failed`, `network_error`, `not_found`, `unsupported_feature`, `config_error`, `partial_failure`, `usage_error`, `interrupted`); `exit_code` is the integer mirror of the §11.1 table. Tooling MAY pattern-match on either field; both are guaranteed-consistent. Optional `details` field for additional context (status code, target id, etc.).
 
-**No `family` discriminator in the error envelope** — the family of the originating verb is implicit in the verb path; only payloads (e.g. `auth status`) carry it. This is a deliberate Phase 1 deviation from SRD §11.3, which lists `family` and `credential` fields on the envelope. The as-shipped envelope omits both; future SRD revisions should reconcile.
+**`family` discriminator policy is per-family in v0.3.0** (Phase 3A):
+
+- **Wifi-side errors carry `family: "wifi"`** on the envelope per SRD §11.3. The post-audit recommendation was that the wifi side ships SRD-aligned, since the family is the operator's only filter for "is this a Foyer rotation or an SDM hiccup?" Operators piping JSONL through `jq 'select(.family == "wifi")'` can filter cleanly.
+- **Cam-side errors omit `family`** for v0.1.0 / v0.2.x back-compat. Operator scripts pinned to the v0.1.0 envelope shape would fail equality assertions if we added `family` retroactively. A follow-up retrofit (cam-side `family: "cam"`) is tracked here as TODO.
+- Implementation: `StructuredError` (in `nest_cli/errors.py`) gained an optional `family: Literal["cam", "wifi", "shared"] | None` field. `emit_structured_error_to_stderr` serializes the field only when set. Wifi verbs construct errors with `family="wifi"`; cam verbs leave it unset.
+
+**FR-WIFI-0 vs §11.2 — exit code for missing `--experimental-wifi`:** SRD §11.2 names exit 5 (unsupported feature) for the case where an operator runs a wifi verb without `--experimental-wifi`. SRD FR-WIFI-0 names exit 64 (usage error) for the same case. The implementation follows FR-WIFI-0 (exit 64) — the verb exists, the operator opted for the verb, and a usage-error reads more honestly than "this feature is unsupported." A future SRD revision should reconcile §11.2 to match FR-WIFI-0 explicitly.
 
 ### Threat model (excerpt)
 
@@ -139,18 +145,26 @@ The full threat model lives at SRD §4.7. v0.1.0's relevant defenses:
 - Tokens are never logged or interpolated into stderr error messages. Bearer headers are constructed at request time and not persisted in any structured-error `details` field.
 - The CI workflow has a guard step (first step in the workflow) that fails the build if any of `NEST_CLI_TEST_OAUTH_CREDENTIALS`, `GOOGLE_APPLICATION_CREDENTIALS`, or `NEST_CLI_TEST_FOYER_TOKEN` are present in the runner environment. Real-credential integration tests are operator-side only.
 
-### What v0.1.0 deliberately does NOT include
+### What v0.3.0 (Phase 3 Part A) ships and what it does NOT
 
-Per SRD §16:
+**Now shipping (Phase 3 Part A):**
 
-- **Phase 2:** `cam snapshot/stream/stream-extend/stream-stop/chime/battery/signal/events`
-- **Phase 2.1:** `cam events --follow`
-- **Phase 3:** all `wifi` subcommands (`--experimental-wifi` gated)
-- **Phase 3.1:** `wifi speedtest/reboot/network/guest/point-health`
-- **Phase 4:** `groups list`, `batch`, `@group` target syntax, parallel target execution
-- **Phase 5+:** Pub/Sub auto-provisioning, ffmpeg snapshot fallback, multi-account, OS keyring, wifi guest password setting
+- `auth wifi-setup --experimental-wifi` and `auth wifi-revoke --experimental-wifi` (FR-CRED-7..9).
+- `auth status` extended to emit a 2-element JSON array (cam + wifi) per FR-CRED-10.
+- `wifi list groups`, `wifi list points <group>`, `wifi list clients <group>` (FR-WIFI-1..3) — all `--experimental-wifi` gated.
+- `nest_cli/wifi/` package: `WifiGroup` / `WifiPoint` / `WifiClient` pydantic models; `FoyerClient` lazy-loading sync wrapper around `googlewifi.GoogleWifi`.
+- Optional `[wifi]` install extra wired through `pyproject.toml` (already present from Phase 2; FoyerClient lazy-imports it).
+- `family="wifi"` on the §11.3 error envelope for wifi-side errors.
 
-The `cam capabilities` verb already advertises a `supported_verbs` list — today it includes only `info` and `capabilities`. Phase 2's verbs slot into the `_TRAIT_TO_VERBS` table in `cli/cam_cmd.py` without further refactoring.
+**Still deferred:**
+
+- **Phase 3 Part B (Engineer B):** `wifi pause`, `wifi unpause`, `wifi prioritize`, `wifi group-assign` (FR-WIFI-4..7).
+- **Phase 3.1:** `wifi speedtest run/history`, `wifi reboot point/group`, `wifi network`, `wifi guest enable/disable`, `wifi point-health` (FR-WIFI-8..15).
+- **Phase 4:** `groups list`, `batch`, `@group` target syntax, parallel target execution.
+- **Phase 5+:** Pub/Sub auto-provisioning, ffmpeg snapshot fallback, multi-account, OS keyring, wifi guest password setting.
+- **Cam-side retrofit:** add `family: "cam"` to cam-side error envelopes once a major-version bump can absorb the back-compat break.
+
+The `cam capabilities` verb advertises a `supported_verbs` list — today it includes the Phase 1 + Phase 2 verbs (`info`, `capabilities`, `snapshot`, `chime`, `battery`, `signal`, `stream`, `stream-extend`, `stream-stop`, `events`). Phase 3 Part B's wifi action verbs will need their own per-family-traits derivation since FR-WIFI-4..7 act on stations, not points.
 
 ---
 
@@ -158,7 +172,8 @@ The `cam capabilities` verb already advertises a `supported_verbs` list — toda
 
 This document does not cover:
 
-- The wifi-side per-mesh-firmware matrix (deferred until the wifi slice lands in Phase 3 — SRD §16.4).
-- The Pub/Sub events surface (separate routing concern; deferred until Phase 2 — SRD §16.2 / §3.1.3).
+- The wifi-side per-mesh-firmware matrix (deferred — Phase 3 Part A captures only the v1 mesh-AC family that the operator's smoke harness exercised).
+- The Pub/Sub events surface beyond Phase 2.1 — Pub/Sub topic provisioning automation is Phase 5+ (SRD §16.7).
+- Wifi action verbs (pause / unpause / prioritize / group-assign / speedtest / reboot / network / guest / point-health) — Phase 3 Part B and Phase 3.1.
 
-All of those are intentional Phase 1 omissions. v0.1.0's deliverable is the cam-side foundation that everything later builds on.
+Phase 3 Part A's deliverable is the wifi-side foundation (types, FoyerClient, credentials, list verbs, experimental gate, family error envelope) that the Phase 3 Part B action verbs build on without further refactoring.
